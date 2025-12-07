@@ -28,7 +28,9 @@ pub async fn get_access_token(command: Commands) -> Result<String> {
         .expect("Hard-coded redirect URI should always be valid");
 
     if let Ok(refresh_token) = env::var("SPOTIFY_REFRESH_TOKEN") {
-        return get_access_token_from_refresh_token(&refresh_token).await;
+        if !refresh_token.is_empty() {
+            return get_access_token_from_refresh_token(&refresh_token).await;
+        }
     }
 
     let client_id = env::var("SPOTIFY_CLIENT_ID").context("SPOTIFY_CLIENT_ID not set")?;
@@ -54,13 +56,21 @@ pub async fn get_access_token(command: Commands) -> Result<String> {
         ("client_secret", &client_secret),
     ];
 
-    let response: AccessTokenResponse = client
+    let response = client
         .post("https://accounts.spotify.com/api/token")
         .headers(headers)
         .form(&params)
         .send()
         .await
-        .context("Failed to send request")?
+        .context("Failed to send request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_else(|_| "Could not read response text".to_string());
+        anyhow::bail!("Spotify API request failed with status: {}. Response: {}", status, text);
+    }
+
+    let response: AccessTokenResponse = response
         .json()
         .await
         .context("Failed to parse response")?;
@@ -94,13 +104,21 @@ pub async fn get_access_token_from_refresh_token(refresh_token: &str) -> Result<
         ("client_secret", &client_secret),
     ];
 
-    let response: AccessTokenResponse = client
+    let response = client
         .post("https://accounts.spotify.com/api/token")
         .headers(headers)
         .form(&params)
         .send()
         .await
-        .context("Failed to send request")?
+        .context("Failed to send request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_else(|_| "Could not read response text".to_string());
+        anyhow::bail!("Spotify API request failed with status: {}. Response: {}", status, text);
+    }
+
+    let response: AccessTokenResponse = response
         .json()
         .await
         .context("Failed to parse response")?;
