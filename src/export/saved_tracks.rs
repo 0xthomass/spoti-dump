@@ -13,10 +13,14 @@ struct SavedTrack {
 }
 
 pub async fn export_saved_tracks(access_token: &String, force: bool) -> Result<()> {
-    let tracks: Vec<SavedTrack> = utils::get_all_items(access_token, "https://api.spotify.com/v1/me/tracks").await?;
+    let tracks: Vec<SavedTrack> =
+        utils::get_all_items(access_token, "https://api.spotify.com/v1/me/tracks").await?;
 
     if !force {
-        println!("Dry run: would have exported {} saved tracks.", tracks.len());
+        println!(
+            "Dry run: would have exported {} saved tracks.",
+            tracks.len()
+        );
         return Ok(());
     }
 
@@ -39,7 +43,12 @@ pub async fn export_saved_tracks(access_token: &String, force: bool) -> Result<(
 
     for track in tracks {
         if let Some(track_data) = track.track {
-            let Track { id, name, artists, album } = track_data;
+            let Track {
+                id,
+                name,
+                artists,
+                album,
+            } = track_data;
 
             if let Some(track_id) = id {
                 let added_at = track

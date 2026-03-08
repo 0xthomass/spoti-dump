@@ -1,5 +1,5 @@
-use spoti_dump::export;
 use spoti_dump::access_token;
+use spoti_dump::export;
 use std::env;
 
 async fn get_test_access_token() -> String {
@@ -9,7 +9,9 @@ async fn get_test_access_token() -> String {
         panic!("Skipping test: SPOTIFY_REFRESH_TOKEN not set.");
     }
     let refresh_token = refresh_token.unwrap();
-    access_token::get_access_token_from_refresh_token(&refresh_token).await.unwrap()
+    access_token::get_access_token_from_refresh_token(&refresh_token)
+        .await
+        .unwrap()
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # spoti-dump
 
-`spoti-dump` is a small command-line app that backs up, restores, or wipes the saved tracks and playlists attached to a Spotify account. You just authorize once in your browser and the tool handles the rest.
+`spoti-dump` is a small command-line app that backs up, restores, or wipes the saved tracks and playlists attached to a Spotify account. It requests one combined Spotify permission grant so the same refresh token can be reused across export, import, and purge.
 
 ## Quick Start (no coding required)
 
@@ -80,7 +80,7 @@ Deletes every liked song and unfollows every playlist in the authorized account.
 ## Advanced: build from source
 
 ```sh
-git clone https://github.com/thomas192/spoti-dump.git
+git clone https://github.com/0xthomass/spoti-dump.git
 cd spoti-dump
 cargo run --release -- export
 ```
@@ -102,3 +102,4 @@ If you just need a fresh `.exe`, run the **`build-windows-release`** workflow on
 - **“Invalid redirect URI” error?** Double-check the Spotify dashboard lists `http://127.0.0.1:8000/callback` and nothing else.
 - **Ran out of time during authorization?** Just re-run the command; a new link/state will be generated.
 - **Need to move to another PC?** Copy the `dump` folder and `.env` (with refresh token) along with the executable.
+- **`403` during `import` or `purge` after previously running `export`?** Your saved refresh token may be read-only from an older version of the app. Clear `SPOTIFY_REFRESH_TOKEN` once and run `import` or `purge` again so Spotify can issue a token with the newer combined scopes.

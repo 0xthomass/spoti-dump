@@ -16,11 +16,13 @@ struct Playlist {
 #[derive(Debug, serde::Deserialize)]
 struct PlaylistItem {
     added_at: Option<String>,
-    track: Option<Track>,
+    #[serde(alias = "track")]
+    item: Option<Track>,
 }
 
 pub async fn export_playlists(access_token: &String, force: bool) -> Result<()> {
-    let playlists: Vec<Playlist> = utils::get_all_items(access_token, "https://api.spotify.com/v1/me/playlists").await?;
+    let playlists: Vec<Playlist> =
+        utils::get_all_items(access_token, "https://api.spotify.com/v1/me/playlists").await?;
     let mut total_skipped_tracks = 0;
 
     let dump_dir = Path::new("dump");
@@ -29,7 +31,8 @@ pub async fn export_playlists(access_token: &String, force: bool) -> Result<()> 
     }
 
     for playlist in playlists {
-        total_skipped_tracks += export_playlist(access_token, &playlist.id, &playlist.name, dump_dir, force).await?;
+        total_skipped_tracks +=
+            export_playlist(access_token, &playlist.id, &playlist.name, dump_dir, force).await?;
     }
 
     if force {
@@ -48,10 +51,7 @@ async fn export_playlist(
     dump_dir: &Path,
     force: bool,
 ) -> Result<u32> {
-    let url = format!(
-        "https://api.spotify.com/v1/playlists/{}/tracks",
-        playlist_id
-    );
+    let url = format!("https://api.spotify.com/v1/playlists/{}/items", playlist_id);
     let tracks: Vec<PlaylistItem> = utils::get_all_items(access_token, &url).await?;
 
     if !force {
@@ -73,8 +73,13 @@ async fn export_playlist(
     let mut skipped_tracks_count = 0;
 
     for item in tracks {
-        if let Some(track_data) = item.track {
-            let Track { id, name, artists, album } = track_data;
+        if let Some(track_data) = item.item {
+            let Track {
+                id,
+                name,
+                artists,
+                album,
+            } = track_data;
 
             if let Some(track_id) = id {
                 let added_at = item

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -18,7 +19,7 @@ pub async fn get_user_id(access_token: &str) -> Result<String> {
         .await?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!("Failed to get user profile"));
+        return Err(response_error("Failed to get user profile", response).await);
     }
 
     let user_profile: Value = response.json().await?;
@@ -43,7 +44,11 @@ pub async fn get_all_items<T: DeserializeOwned>(access_token: &str, url: &str) -
         let response = client.get(&url).headers(headers.clone()).send().await?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Failed to get items from Spotify"));
+            return Err(response_error(
+                &format!("Failed to get items from Spotify: {url}"),
+                response,
+            )
+            .await);
         }
 
         let mut data: Value = response.json().await?;
@@ -57,6 +62,10 @@ pub async fn get_all_items<T: DeserializeOwned>(access_token: &str, url: &str) -
 }
 
 pub async fn delete_spotify(access_token: &str, url: &str) -> Result<()> {
+    request_spotify(access_token, Method::DELETE, url).await
+}
+
+pub async fn request_spotify(access_token: &str, method: Method, url: &str) -> Result<()> {
     let client = reqwest::Client::new();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -64,14 +73,20 @@ pub async fn delete_spotify(access_token: &str, url: &str) -> Result<()> {
         HeaderValue::from_str(&format!("Bearer {}", access_token))?,
     );
 
-    let response = client.delete(url).headers(headers).send().await?;
+    let response = client.request(method, url).headers(headers).send().await?;
 
     if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to delete from Spotify: {}",
-            response.text().await?
-        ));
+        return Err(response_error("Spotify request failed", response).await);
     }
 
     Ok(())
+}
+
+pub async fn response_error(context: &str, response: reqwest::Response) -> anyhow::Error {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "Could not read response body".to_string());
+    anyhow::anyhow!("{context} ({status}): {body}")
 }

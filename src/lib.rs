@@ -55,12 +55,9 @@ pub async fn run() -> Result<()> {
                     println!("This is a dry run. No tracks will be imported.");
                     println!("Use the --force flag to import tracks.");
                 }
-                let user_id = utils::get_user_id(&access_token).await?;
-                println!("Retrieved user ID: {}", user_id);
-
                 println!("Importing tracks and playlists...");
                 import::saved_tracks::import_saved_tracks(&access_token, *force).await?;
-                import::playlists::import_playlists(&access_token, &user_id, *force).await?;
+                import::playlists::import_playlists(&access_token, *force).await?;
                 if *force {
                     println!("Import completed successfully.");
                 }
