@@ -31,6 +31,7 @@ const LIBRARY_LANDING_BROWSE_ID: &str = "FEmusic_library_landing";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
 const MAX_LIBRARY_PLAYLIST_PAGES: usize = 1_000;
 const UNBOUNDED_TRACK_LIMIT: u32 = u32::MAX;
+const UNSUPPORTED_LIBRARY_RESET_MESSAGE: &str = "YouTube Music does not support account-wide library reset in this app. Normal pull, push, and targeted canonical deletes are supported.";
 
 #[derive(Clone)]
 struct YoutubeMusicPlaylistSummary {
@@ -828,45 +829,8 @@ impl StreamingProvider for YoutubeMusicProvider {
     }
 
     async fn purge_library(&self, force: bool) -> Result<PurgeReport> {
-        self.verify_connection().await?;
-        let liked = self
-            .client
-            .get_liked_songs(Some(UNBOUNDED_TRACK_LIMIT))
-            .await?;
-        let playlists = self.list_library_playlists().await?;
-        let video_ids = liked
-            .tracks
-            .iter()
-            .filter_map(|track| track.video_id.clone())
-            .collect::<Vec<_>>();
-        let playlist_ids = playlists
-            .into_iter()
-            .filter(|playlist| playlist.playlist_id != "LM")
-            .map(|playlist| playlist.playlist_id)
-            .collect::<Vec<_>>();
-
-        let report = PurgeReport {
-            saved_tracks: video_ids.len(),
-            playlists: playlist_ids.len(),
-        };
-
-        if !force {
-            println!(
-                "Dry run: would unlike {} tracks and delete {} YouTube Music playlists.",
-                report.saved_tracks, report.playlists
-            );
-            return Ok(report);
-        }
-
-        for video_id in video_ids {
-            self.client.unlike_song(&video_id).await?;
-        }
-
-        for playlist_id in playlist_ids {
-            self.client.delete_playlist(&playlist_id).await?;
-        }
-
-        Ok(report)
+        let _ = force;
+        anyhow::bail!(UNSUPPORTED_LIBRARY_RESET_MESSAGE)
     }
 
     async fn remove_saved_track(&self, provider_track_id: &str) -> Result<()> {
@@ -1149,7 +1113,7 @@ mod tests {
 
     use super::{
         collect_continuation_tokens, collect_library_playlists, contains_key_recursive,
-        youtube_music_cleanup_warning,
+        youtube_music_cleanup_warning, UNSUPPORTED_LIBRARY_RESET_MESSAGE,
     };
 
     #[test]
@@ -1234,5 +1198,12 @@ mod tests {
         assert!(warning.contains("old-playlist"));
         assert!(warning.contains("new-playlist"));
         assert!(warning.contains("permission denied"));
+    }
+
+    #[test]
+    fn account_wide_reset_is_explicitly_unsupported() {
+        assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("does not support"));
+        assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("Normal pull, push"));
+        assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("targeted canonical deletes"));
     }
 }
