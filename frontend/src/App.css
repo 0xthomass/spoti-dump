@@ -1025,6 +1025,16 @@ code {
   font-size: 13px;
 }
 
+.operation-warning-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: rgba(247, 245, 240, 0.72);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .confirm-warning--danger {
   background: rgba(255, 102, 124, 0.08);
   border-color: rgba(255, 102, 124, 0.24);

@@ -2648,7 +2648,11 @@ function OperationModal({
           {operation.warnings.length ? (
             <div className="confirm-warning confirm-warning--warning">
               <strong>Warnings</strong>
-              <span>{operation.warnings.join(' ')}</span>
+              <ul className="operation-warning-list">
+                {operation.warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
             </div>
           ) : null}
 
