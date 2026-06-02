@@ -1,5 +1,10 @@
 /target
 .env
+/dump/
+/.tools/
+/frontend/dist/
+/frontend/node_modules/
+ytmusic_headers.json
 *.csv
 *.py
 *.txt
