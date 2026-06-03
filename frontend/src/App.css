@@ -21,6 +21,7 @@
 .hero-copy h2,
 .panel-head h2,
 .provider-card h3,
+.conflict-card h3,
 .modal-head h2 {
   margin: 0;
   font-family: 'Fraunces', Georgia, serif;
@@ -471,6 +472,11 @@
   border: 1px solid rgba(255, 190, 105, 0.2);
 }
 
+.provider-callout a {
+  color: #94e8e4;
+  font-weight: 800;
+}
+
 .preflight-list {
   display: grid;
   gap: 6px;
@@ -791,6 +797,84 @@ code {
 
 .track-row:hover {
   background: rgba(255, 255, 255, 0.03);
+}
+
+.conflict-list {
+  display: grid;
+  gap: 16px;
+  padding: 20px 24px 0;
+}
+
+.conflict-card {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.conflict-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+}
+
+.conflict-card h3 {
+  font-size: 26px;
+}
+
+.conflict-track-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.conflict-track-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 14px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.conflict-track-main {
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.conflict-track-card .track-text {
+  display: grid;
+  gap: 4px;
+}
+
+.conflict-track-card .track-text > span:not(.eyebrow) {
+  color: rgba(247, 245, 240, 0.62);
+  font-size: 13px;
+}
+
+.conflict-track-card .ghost-button {
+  justify-self: start;
+}
+
+.conflict-detail {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 18px;
+  background: rgba(255, 190, 105, 0.08);
+  border: 1px solid rgba(255, 190, 105, 0.16);
+}
+
+.conflict-detail p {
+  margin: 0;
+  color: rgba(247, 245, 240, 0.72);
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 .track-row-main {

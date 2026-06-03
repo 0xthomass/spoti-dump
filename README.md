@@ -167,6 +167,7 @@ The main interface is an editable source-of-truth console for:
 - connecting Spotify and YouTube Music directly from the app
 - starting provider imports into the canonical database from the app
 - resolving provider identities and deduplicating canonical track rows from a dedicated library-wide maintenance action
+- reviewing identity conflicts in a queue before explicitly merging rows and choosing which provider IDs win
 - starting outward syncs from the canonical database into connected providers
 - reviewing provider coverage and unmatched pressure
 - backfilling missing track artwork into the database from provider-backed identifiers
@@ -203,6 +204,8 @@ When it does not, run `resolve-identities` or use Overview → Resolve Missing I
 - duration when available
 
 This is what makes cross-provider sync possible, but it also means mismatches are still possible when catalogs differ or metadata is inconsistent. Those misses are written back into `dump/library.db` so they can be retried or inspected later instead of disappearing after the run.
+
+If a discovered provider ID already belongs to another canonical row and both rows also contain conflicting IDs on another provider, the app does not auto-merge. Use the Conflicts page in the web app to compare the source row and candidate owner row, then explicitly merge while keeping either the source provider IDs or the candidate provider IDs. This canonical repair does not mutate Spotify or YouTube Music accounts.
 
 ## Current Semantics
 

@@ -8,6 +8,7 @@ import {
 } from 'react'
 import type { CSSProperties, FormEvent, ReactNode } from 'react'
 import {
+  Link,
   NavLink,
   Navigate,
   Route,
@@ -52,6 +53,7 @@ type Overview = {
   canonical_only: number
   multi_provider: number
   unmatched_tracks: number
+  identity_conflicts: number
   provider_only_counts: ProviderOnlyCount[]
   provider_metrics: ProviderMetric[]
 }
@@ -315,6 +317,11 @@ type MergeTrackResponse = {
   }[]
 }
 
+type IdentityConflictQueueItem = {
+  source_track: ConflictTrack
+  conflict: TrackIdentityConflict
+}
+
 type PlaylistSummary = {
   playlist_id: string
   name: string
@@ -556,6 +563,7 @@ function App() {
             <Route path="/overview" element={<OverviewPage />} />
             <Route path="/saved-tracks" element={<SavedTracksPage />} />
             <Route path="/tracks" element={<TracksPage />} />
+            <Route path="/identity-conflicts" element={<IdentityConflictsPage />} />
             <Route path="/playlists" element={<PlaylistsPage />} />
             <Route path="/playlists/:playlistId" element={<PlaylistsPage />} />
             <Route path="/safety" element={<SafetyPage />} />
@@ -589,6 +597,8 @@ function Shell({ children }: { children: ReactNode }) {
   const heroMetric =
     location.pathname.indexOf('/playlists') >= 0
       ? `${overview?.playlists ?? 0} playlists`
+      : location.pathname.indexOf('/identity-conflicts') >= 0
+        ? `${overview?.identity_conflicts ?? 0} conflicts`
       : location.pathname.indexOf('/tracks') >= 0
         ? `${overview?.tracks ?? 0} tracks`
         : `${overview?.saved_tracks ?? 0} saved tracks`
@@ -619,6 +629,11 @@ function Shell({ children }: { children: ReactNode }) {
             copy="Fix matches"
           />
           <SidebarLink
+            to="/identity-conflicts"
+            label="Conflicts"
+            copy="Review merges"
+          />
+          <SidebarLink
             to="/overview"
             label="Overview"
             copy="Providers and sync"
@@ -641,6 +656,7 @@ function Shell({ children }: { children: ReactNode }) {
             <SidebarMetric label="Multi-provider" value={overview.multi_provider} />
             <SidebarMetric label="Canonical only" value={overview.canonical_only} />
             <SidebarMetric label="Unmatched" value={overview.unmatched_tracks} />
+            <SidebarMetric label="Conflicts" value={overview.identity_conflicts} />
           </div>
         ) : null}
       </aside>
@@ -897,6 +913,9 @@ function OverviewPage() {
         <DashboardCard label="Canonical Only" value={data.canonical_only}>
           Local only for now.
         </DashboardCard>
+        <DashboardCard label="Identity Conflicts" value={data.identity_conflicts}>
+          Rows needing explicit merge review.
+        </DashboardCard>
       </div>
 
       <section className="panel">
@@ -927,10 +946,22 @@ function OverviewPage() {
             <DashboardCard label="Provider ID Gaps" value={providerIdentityGaps}>
               Missing IDs across both providers.
             </DashboardCard>
+            <DashboardCard label="Conflict Queue" value={data.identity_conflicts}>
+              Explicit merge decisions left.
+            </DashboardCard>
             <DashboardCard label="Blocked Providers" value={blockedConnectedProviderCount}>
               Skipped until relinked, checked, or cooled down.
             </DashboardCard>
           </div>
+          {data.identity_conflicts > 0 ? (
+            <div className="provider-callout provider-callout--warning">
+              <strong>{formatNumber(data.identity_conflicts)} identity conflicts need review</strong>
+              <span>
+                Resolve these before a final migration push so Spotify and YouTube Music IDs are
+                consolidated onto one canonical row. <Link to="/identity-conflicts">Open review queue.</Link>
+              </span>
+            </div>
+          ) : null}
         </div>
       </section>
 
@@ -1810,6 +1841,245 @@ function TracksPage() {
         />
       ) : null}
     </section>
+  )
+}
+
+function IdentityConflictsPage() {
+  const { revision, refresh, notify } = useRuntime()
+  const confirm = useConfirm()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [draft, setDraft] = useState(searchParams.get('q') ?? '')
+  const [editingTrackId, setEditingTrackId] = useState<string | null>(null)
+  const [mergingConflict, setMergingConflict] = useState<string | null>(null)
+  const page = parsePage(searchParams.get('page'))
+  const query = searchParams.get('q') ?? ''
+
+  useEffect(() => {
+    setDraft(query)
+  }, [query])
+
+  const resource = useApiResource<PageResponse<IdentityConflictQueueItem>>(
+    `/identity/conflicts?page=${page}${query ? `&q=${encodeURIComponent(query)}` : ''}`,
+    revision,
+  )
+
+  function submitSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const next = new URLSearchParams()
+    if (draft.trim()) {
+      next.set('q', draft.trim())
+    }
+    next.set('page', '1')
+    startTransition(() => setSearchParams(next))
+  }
+
+  async function mergeConflict(
+    item: IdentityConflictQueueItem,
+    conflictResolution: 'keep_source' | 'keep_target',
+  ) {
+    const keepSource = conflictResolution === 'keep_source'
+    const accepted = await confirm({
+      title: keepSource ? 'Merge and keep source IDs?' : 'Merge and keep candidate IDs?',
+      message: `This will merge "${item.source_track.title}" into "${item.conflict.owner_track.title}".`,
+      details: keepSource
+        ? 'Saved tracks and playlist entries move to the candidate row. For conflicting providers, source row provider IDs win. Provider accounts are not changed.'
+        : 'Saved tracks and playlist entries move to the candidate row. For conflicting providers, candidate row provider IDs win. Provider accounts are not changed.',
+      confirmLabel: keepSource ? 'Merge, keep source' : 'Merge, keep candidate',
+      tone: 'danger',
+    })
+    if (!accepted) {
+      return
+    }
+
+    const mergeKey = `${item.source_track.track_id}:${item.conflict.provider}:${item.conflict.provider_id}:${conflictResolution}`
+    setMergingConflict(mergeKey)
+    try {
+      const payload = await apiRequest<MergeTrackResponse>(
+        `/tracks/${item.source_track.track_id}/merge`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            target_track_id: item.conflict.owner_track.track_id,
+            conflict_resolution: conflictResolution,
+          }),
+        },
+      )
+      notify(payload.message)
+      refresh()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Merge failed.')
+    } finally {
+      setMergingConflict(null)
+    }
+  }
+
+  return (
+    <section className="page-stack">
+      <PageHero
+        eyebrow="Identity Conflicts"
+        title="Merge review queue."
+        copy="Resolve ambiguous Spotify and YouTube Music matches without touching provider accounts."
+      >
+        <HeroStat
+          label="Queue"
+          value={
+            resource.data
+              ? `${resource.data.items.length} of ${formatNumber(resource.data.total)}`
+              : '...'
+          }
+        />
+      </PageHero>
+
+      <section className="panel">
+        <div className="panel-head panel-head--row">
+          <div>
+            <span className="eyebrow">Review</span>
+            <h2>Identity Conflict Queue</h2>
+          </div>
+          <form className="searchbar" onSubmit={submitSearch}>
+            <input
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Search title, artist, album, provider ID"
+              type="search"
+            />
+            <button type="submit">Search</button>
+          </form>
+        </div>
+
+        {resource.loading && !resource.data ? (
+          <LoadingState label="Loading identity conflicts" compact />
+        ) : resource.error || !resource.data ? (
+          <ErrorState
+            message={resource.error ?? 'Failed to load identity conflicts.'}
+            compact
+          />
+        ) : resource.data.items.length === 0 ? (
+          <EmptyState
+            title="No conflicts matched"
+            copy="Run Resolve Missing IDs again after reviewing current conflicts or broaden the search."
+          />
+        ) : (
+          <>
+            <div className="conflict-list">
+              {resource.data.items.map((item) => {
+                const mergeKey = `${item.source_track.track_id}:${item.conflict.provider}:${item.conflict.provider_id}`
+                return (
+                  <article className="conflict-card" key={mergeKey}>
+                    <div className="conflict-card-head">
+                      <div>
+                        <span className="eyebrow">{item.conflict.provider_name} conflict</span>
+                        <h3>{item.source_track.title}</h3>
+                      </div>
+                      <span className="status-chip status-chip--warning">
+                        Candidate {item.conflict.provider_id}
+                      </span>
+                    </div>
+
+                    <div className="conflict-track-grid">
+                      <ConflictTrackCard
+                        label="Source row"
+                        onEdit={() => setEditingTrackId(item.source_track.track_id)}
+                        track={item.source_track}
+                      />
+                      <ConflictTrackCard
+                        label="Candidate owner"
+                        onEdit={() =>
+                          setEditingTrackId(item.conflict.owner_track.track_id)
+                        }
+                        track={item.conflict.owner_track}
+                      />
+                    </div>
+
+                    <div className="conflict-detail">
+                      <p>{item.conflict.message}</p>
+                      {item.conflict.conflicting_provider_links.map((link) => (
+                        <p key={link.provider}>
+                          {link.provider_name}: source {link.source_provider_id} · candidate{' '}
+                          {link.target_provider_id}
+                        </p>
+                      ))}
+                    </div>
+
+                    <div className="modal-actions modal-actions--inline">
+                      <button
+                        className="provider-action-button provider-action-button--secondary"
+                        disabled={mergingConflict !== null}
+                        onClick={() => void mergeConflict(item, 'keep_source')}
+                        type="button"
+                      >
+                        {mergingConflict === `${mergeKey}:keep_source`
+                          ? 'Merging…'
+                          : 'Merge, keep source IDs'}
+                      </button>
+                      <button
+                        className="provider-action-button provider-action-button--secondary"
+                        disabled={mergingConflict !== null}
+                        onClick={() => void mergeConflict(item, 'keep_target')}
+                        type="button"
+                      >
+                        {mergingConflict === `${mergeKey}:keep_target`
+                          ? 'Merging…'
+                          : 'Merge, keep candidate IDs'}
+                      </button>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+            <Pagination
+              page={resource.data.page}
+              totalPages={resource.data.total_pages}
+              onPageChange={(nextPage) => {
+                const next = new URLSearchParams(searchParams)
+                next.set('page', String(nextPage))
+                startTransition(() => setSearchParams(next))
+              }}
+            />
+          </>
+        )}
+      </section>
+
+      {editingTrackId ? (
+        <TrackEditorModal
+          trackId={editingTrackId}
+          onClose={() => setEditingTrackId(null)}
+        />
+      ) : null}
+    </section>
+  )
+}
+
+function ConflictTrackCard({
+  label,
+  track,
+  onEdit,
+}: {
+  label: string
+  track: ConflictTrack
+  onEdit: () => void
+}) {
+  return (
+    <div className="conflict-track-card">
+      <div className="conflict-track-main">
+        <Artwork image={track.artwork_url} seed={track.track_id} size="row" title={track.title} />
+        <div className="track-text">
+          <span className="eyebrow">{label}</span>
+          <strong>{track.title}</strong>
+          <span>{track.artist_summary}</span>
+          {track.album ? <span>{track.album}</span> : null}
+        </div>
+      </div>
+      <div className="chip-row">
+        <span className="meta-badge meta-badge--coverage">{track.coverage.short_label}</span>
+        <span className="mini-chip">{track.saved_count} saved</span>
+        <span className="mini-chip">{track.playlist_refs} playlist refs</span>
+      </div>
+      <ProviderChipRow providers={track.providers} />
+      <button className="ghost-button" onClick={onEdit} type="button">
+        Open row
+      </button>
+    </div>
   )
 }
 

@@ -468,6 +468,12 @@ struct TracksQuery {
 }
 
 #[derive(Default, Deserialize)]
+struct IdentityConflictsQuery {
+    q: Option<String>,
+    page: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
 struct PlaylistsQuery {
     q: Option<String>,
     page: Option<usize>,
@@ -546,6 +552,7 @@ struct OverviewResponse {
     canonical_only: usize,
     multi_provider: usize,
     unmatched_tracks: usize,
+    identity_conflicts: usize,
     provider_only_counts: Vec<ProviderOnlyCountDto>,
     provider_metrics: Vec<ProviderStatsDto>,
 }
@@ -674,7 +681,7 @@ struct TrackDetailDto {
     artwork_url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct TrackIdentityConflictDto {
     provider: String,
     provider_name: String,
@@ -684,7 +691,7 @@ struct TrackIdentityConflictDto {
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ConflictTrackDto {
     track_id: String,
     title: String,
@@ -697,12 +704,18 @@ struct ConflictTrackDto {
     artwork_url: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ProviderLinkConflictDto {
     provider: String,
     provider_name: String,
     source_provider_id: String,
     target_provider_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TrackIdentityConflictQueueItemDto {
+    source_track: ConflictTrackDto,
+    conflict: TrackIdentityConflictDto,
 }
 
 #[derive(Serialize)]
@@ -981,6 +994,7 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
             post(api_start_provider_identity),
         )
         .route("/identity/start", post(api_start_library_identity))
+        .route("/identity/conflicts", get(api_identity_conflicts))
         .route(
             "/providers/:provider/sync/start",
             post(api_start_provider_sync),
@@ -1975,6 +1989,39 @@ async fn api_tracks(
     if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
         write_state(state.clone()).await?;
         rows = track_rows(&state, query.q.as_deref(), query.coverage.as_deref());
+        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+    }
+
+    Ok(Json(PageResponse::new(
+        page_rows,
+        rows.len(),
+        page,
+        PAGE_SIZE,
+    )))
+}
+
+async fn api_identity_conflicts(
+    State(context): State<Arc<AppContext>>,
+    Query(query): Query<IdentityConflictsQuery>,
+) -> Result<Json<PageResponse<TrackIdentityConflictQueueItemDto>>, ApiError> {
+    let _state_guard = context.state_mutation.lock().await;
+    let mut state = read_state().await?;
+    let page = normalized_page(query.page);
+    let mut rows = identity_conflict_rows(&state, query.q.as_deref());
+    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+    let track_ids = page_rows
+        .iter()
+        .flat_map(|item| {
+            [
+                item.source_track.track_id.clone(),
+                item.conflict.owner_track.track_id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
+        write_state(state.clone()).await?;
+        rows = identity_conflict_rows(&state, query.q.as_deref());
         page_rows = paginate_vec(&rows, page, PAGE_SIZE);
     }
 
@@ -3238,6 +3285,7 @@ fn overview_payload(state: &LibraryState) -> OverviewResponse {
         canonical_only,
         multi_provider,
         unmatched_tracks,
+        identity_conflicts: identity_conflict_rows(state, None).len(),
         provider_only_counts,
         provider_metrics,
     }
@@ -3361,6 +3409,60 @@ fn track_rows(
                 left.artist_summary
                     .to_lowercase()
                     .cmp(&right.artist_summary.to_lowercase())
+            })
+    });
+    rows
+}
+
+fn identity_conflict_rows(
+    state: &LibraryState,
+    query: Option<&str>,
+) -> Vec<TrackIdentityConflictQueueItemDto> {
+    let query_filter = normalized_query(query);
+    let mut rows = Vec::new();
+
+    for track in &state.tracks {
+        let source_track = conflict_track_dto(state, track);
+        for conflict in identity_conflicts_for_track(state, track) {
+            if query_matches(
+                query_filter.as_deref(),
+                &[
+                    &source_track.title,
+                    &source_track.artist_summary,
+                    source_track.album.as_deref().unwrap_or(""),
+                    &conflict.provider_name,
+                    &conflict.provider_id,
+                    &conflict.owner_track.title,
+                    &conflict.owner_track.artist_summary,
+                    conflict.owner_track.album.as_deref().unwrap_or(""),
+                    &conflict.message,
+                ],
+            ) {
+                rows.push(TrackIdentityConflictQueueItemDto {
+                    source_track: source_track.clone(),
+                    conflict,
+                });
+            }
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        left.source_track
+            .title
+            .to_lowercase()
+            .cmp(&right.source_track.title.to_lowercase())
+            .then_with(|| {
+                left.source_track
+                    .artist_summary
+                    .to_lowercase()
+                    .cmp(&right.source_track.artist_summary.to_lowercase())
+            })
+            .then_with(|| left.conflict.provider.cmp(&right.conflict.provider))
+            .then_with(|| {
+                left.conflict
+                    .owner_track
+                    .track_id
+                    .cmp(&right.conflict.owner_track.track_id)
             })
     });
     rows
@@ -4373,9 +4475,9 @@ mod tests {
     };
 
     use super::{
-        coverage_matches, extract_retry_after_seconds, normalize_manual_provider_track_id,
-        provider_cooldown_from_error, provider_health_failed, provider_preflight_payload,
-        raw_table_value_to_string,
+        coverage_matches, extract_retry_after_seconds, identity_conflict_rows,
+        normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
+        provider_preflight_payload, raw_table_value_to_string,
     };
 
     #[test]
@@ -4537,6 +4639,68 @@ mod tests {
             &spotify_only,
             Some("missing-spotify")
         ));
+    }
+
+    #[test]
+    fn identity_conflict_queue_includes_source_owner_and_provider_id_differences() {
+        let now = Utc::now();
+        let mut source = test_track_with_link(
+            "track-source",
+            "Conflict",
+            ProviderKind::Spotify,
+            "spotify-source",
+            now,
+        );
+        source.provider_state.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            SyncStatusRecord::error_with_provider_item_id(
+                "Skipped YouTube Music identity 'youtube-owner' because it would merge tracks with conflicting provider IDs.",
+                "youtube-owner",
+                Some(0.97),
+                now,
+            ),
+        );
+
+        let mut owner = test_track_with_link(
+            "track-owner",
+            "Conflict",
+            ProviderKind::Spotify,
+            "spotify-owner",
+            now,
+        );
+        owner.provider_links.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: "youtube-owner".to_string(),
+                source: LinkSource::Export,
+                confidence: Some(1.0),
+                linked_at: now,
+                last_seen_at: Some(now),
+            },
+        );
+
+        let mut state = LibraryState::new();
+        state.tracks.push(source);
+        state.tracks.push(owner);
+
+        let rows = identity_conflict_rows(&state, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].source_track.track_id, "track-source");
+        assert_eq!(
+            rows[0].conflict.provider,
+            ProviderKind::YoutubeMusic.as_key()
+        );
+        assert_eq!(rows[0].conflict.provider_id, "youtube-owner");
+        assert_eq!(rows[0].conflict.owner_track.track_id, "track-owner");
+        assert_eq!(rows[0].conflict.conflicting_provider_links.len(), 1);
+        assert_eq!(
+            rows[0].conflict.conflicting_provider_links[0].source_provider_id,
+            "spotify-source"
+        );
+        assert_eq!(
+            rows[0].conflict.conflicting_provider_links[0].target_provider_id,
+            "spotify-owner"
+        );
     }
 
     #[test]
