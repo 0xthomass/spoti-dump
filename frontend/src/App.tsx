@@ -171,6 +171,7 @@ type ProviderPreflight = {
   can_push: boolean
   can_reset_push: boolean
   blockers: string[]
+  reset_blockers: string[]
   warnings: string[]
   saved_tracks_total: number
   saved_tracks_pushable: number
@@ -993,6 +994,8 @@ function OverviewPage() {
               !provider.connected || pendingAction !== null || cooldownActive
             const preflightTitle =
               provider.preflight.blockers[0] ?? provider.cooldown_reason ?? undefined
+            const resetPreflightTitle =
+              provider.preflight.reset_blockers[0] ?? preflightTitle
             const savedPushable = provider.preflight.saved_tracks_pushable
             const savedMissingIdentity = provider.preflight.saved_tracks_missing_identity
             const playlistEntriesPushable = provider.preflight.playlist_entries_pushable
@@ -1108,6 +1111,13 @@ function OverviewPage() {
                       ))}
                     </ul>
                   ) : null}
+                  {provider.preflight.reset_blockers.length > 0 ? (
+                    <ul className="preflight-list preflight-list--blockers">
+                      {provider.preflight.reset_blockers.map((blocker) => (
+                        <li key={blocker}>{blocker}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                   {cooldownCopy ? (
                     <div className="provider-callout provider-callout--warning">
                       <strong>Provider rate limit respected</strong>
@@ -1188,7 +1198,7 @@ function OverviewPage() {
                       disabled={providerActionDisabled || !provider.preflight.can_reset_push}
                       onClick={() => void runProviderAction(provider, 'reset-sync')}
                       type="button"
-                      title={preflightTitle}
+                      title={resetPreflightTitle}
                     >
                       {pendingAction === `${provider.key}:reset-sync`
                         ? 'Resetting…'

@@ -587,6 +587,7 @@ struct ProviderPreflightDto {
     can_push: bool,
     can_reset_push: bool,
     blockers: Vec<String>,
+    reset_blockers: Vec<String>,
     warnings: Vec<String>,
     saved_tracks_total: usize,
     saved_tracks_pushable: usize,
@@ -3095,17 +3096,37 @@ fn provider_preflight_payload(
         );
     }
 
+    let identity_conflicts = identity_conflict_rows(state, None).len();
+    let mut reset_blockers = Vec::new();
+    if provider.supports_library_reset() {
+        if saved_tracks_missing_identity > 0 || playlist_entries_missing_identity > 0 {
+            reset_blockers.push(format!(
+                "Reset & Push is blocked because {} saved tracks and {} playlist entries would be skipped after purging {}.",
+                saved_tracks_missing_identity,
+                playlist_entries_missing_identity,
+                provider.display_name()
+            ));
+        }
+        if identity_conflicts > 0 {
+            reset_blockers.push(format!(
+                "Reset & Push is blocked while {identity_conflicts} identity conflicts need merge review."
+            ));
+        }
+    }
+
     let can_pull = connection.is_some()
         && cooldown.is_none()
         && health.map(|health| health.ok).unwrap_or(true);
     let can_push = can_pull
         && blockers.is_empty()
         && (saved_tracks_pushable > 0 || playlist_entries_pushable > 0);
+    let can_reset_push = can_push && provider.supports_library_reset() && reset_blockers.is_empty();
     ProviderPreflightDto {
         can_pull,
         can_push,
-        can_reset_push: can_push && provider.supports_library_reset(),
+        can_reset_push,
         blockers,
+        reset_blockers,
         warnings,
         saved_tracks_total: state.saved_tracks.len(),
         saved_tracks_pushable,
@@ -4776,6 +4797,7 @@ mod tests {
         );
 
         assert!(preflight.can_push);
+        assert!(!preflight.can_reset_push);
         assert_eq!(preflight.saved_tracks_total, 2);
         assert_eq!(preflight.saved_tracks_pushable, 1);
         assert_eq!(preflight.saved_tracks_missing_identity, 1);
@@ -4788,6 +4810,10 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("saved tracks")));
+        assert!(preflight
+            .reset_blockers
+            .iter()
+            .any(|blocker| blocker.contains("would be skipped after purging Spotify")));
 
         let failed_health =
             provider_health_failed(ProviderKind::Spotify, "Stored Spotify token is invalid.");

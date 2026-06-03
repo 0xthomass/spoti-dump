@@ -117,6 +117,7 @@ spoti-dump import --provider spotify --reset --force
 ```
 
 `--reset` first removes saved tracks and playlists from the Spotify destination, then pushes the canonical database into it. Use it only when the destination account is meant to become a clean copy of the source of truth. YouTube Music pull and push are supported, but account-wide purge/reset is not exposed because this app only enables destructive reset paths with verified provider semantics.
+The web app blocks Spotify reset-and-push while provider identity gaps or identity conflicts remain, because purging first and then skipping unresolved rows would create an incomplete destination account.
 
 ### Resolve provider identities
 
@@ -212,7 +213,7 @@ If a discovered provider ID already belongs to another canonical row and both ro
 - Spotify saved tracks map directly to Spotify library tracks.
 - YouTube Music currently realizes canonical saved tracks as liked songs.
 - Normal Spotify push does not purge unrelated account data. It adds saved tracks and replaces the contents of linked or name-matched canonical playlists.
-- Spotify reset-and-push purges the destination account first, then pushes the canonical saved tracks and playlists.
+- Spotify reset-and-push purges the destination account first, then pushes the canonical saved tracks and playlists. The web app only enables it when the push can cover the canonical library without known identity skips or unresolved conflict rows.
 - Provider pushes do not search catalogs. They only apply identities already resolved into the canonical database.
 - YouTube Music playlist sync fills a replacement playlist before switching the canonical link and deleting the old playlist.
 
