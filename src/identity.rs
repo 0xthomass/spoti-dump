@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 
 use crate::matching::cleaned_title;
-use crate::model::{LibraryState, LinkSource, ProviderKind, SyncStatusRecord, TrackMetadata};
+use crate::model::{
+    LibraryState, LinkSource, ProviderKind, SyncState, SyncStatusRecord, TrackMetadata,
+    REJECTED_IDENTITY_CANDIDATE_MARKER,
+};
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 use crate::state::TrackIdentityApplyResult;
 
@@ -180,6 +183,11 @@ pub async fn reconcile_provider_identities_with_options(
 
         match resolved {
             Some((provider_id, confidence)) => {
+                if has_rejected_identity_candidate(state, &track_id, provider_kind, &provider_id) {
+                    summary.unmatched += 1;
+                    continue;
+                }
+
                 let result = match state.apply_track_identity(
                     &track_id,
                     provider_kind,
@@ -342,6 +350,29 @@ fn is_identity_merge_conflict(error: &anyhow::Error) -> bool {
     })
 }
 
+fn has_rejected_identity_candidate(
+    state: &LibraryState,
+    track_id: &str,
+    provider: ProviderKind,
+    provider_id: &str,
+) -> bool {
+    state
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .and_then(|track| track.provider_state.get(provider.as_key()))
+        .map(|status| {
+            status.state == SyncState::Unmatched
+                && status.provider_item_id.as_deref() == Some(provider_id)
+                && status
+                    .message
+                    .as_deref()
+                    .map(|message| message.contains(REJECTED_IDENTITY_CANDIDATE_MARKER))
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 fn is_invalid_argument_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -364,7 +395,8 @@ mod tests {
     };
     use crate::model::{
         LibraryState, LinkSource, ProviderKind, ProviderLibrarySnapshot, PurgeReport, SyncState,
-        SyncSummary, TrackEntity, TrackMetadata,
+        SyncStatusRecord, SyncSummary, TrackEntity, TrackMetadata,
+        REJECTED_IDENTITY_CANDIDATE_MARKER,
     };
     use crate::provider::{ProgressHandler, StreamingProvider};
 
@@ -553,6 +585,83 @@ mod tests {
                 .map(|status| status.state),
             Some(SyncState::Error)
         );
+        state.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_reconcile_respects_rejected_conflict_candidate() {
+        let mut state = LibraryState::new();
+        state.tracks.push(track_entity("owner", "Conflict Track"));
+        state
+            .tracks
+            .push(track_entity("candidate", "Conflict Track"));
+        let now = Utc::now();
+        state.upsert_track_link(
+            "owner",
+            ProviderKind::Spotify,
+            "spotify-owner",
+            LinkSource::Export,
+            Some(1.0),
+            now,
+        );
+        state.upsert_track_link(
+            "owner",
+            ProviderKind::YoutubeMusic,
+            "youtube-shared",
+            LinkSource::Export,
+            Some(1.0),
+            now,
+        );
+        state.upsert_track_link(
+            "candidate",
+            ProviderKind::Spotify,
+            "spotify-candidate",
+            LinkSource::Export,
+            Some(1.0),
+            now,
+        );
+        state.set_track_status(
+            "candidate",
+            ProviderKind::YoutubeMusic,
+            SyncStatusRecord::unmatched_with_provider_item_id(
+                format!(
+                    "{REJECTED_IDENTITY_CANDIDATE_MARKER}: youtube-shared was marked not same track."
+                ),
+                "youtube-shared",
+                Some(0.99),
+                now,
+            ),
+        );
+
+        let provider = StaticIdentityProvider {
+            provider: ProviderKind::YoutubeMusic,
+            provider_id: "youtube-shared".to_string(),
+        };
+        let summary = reconcile_provider_identities(&provider, &mut state, None)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.unmatched, 1);
+        assert_eq!(summary.merge_conflicts, 0);
+        let candidate = state
+            .tracks
+            .iter()
+            .find(|track| track.id == "candidate")
+            .unwrap();
+        assert!(!candidate
+            .provider_links
+            .contains_key(ProviderKind::YoutubeMusic.as_key()));
+        let status = candidate
+            .provider_state
+            .get(ProviderKind::YoutubeMusic.as_key())
+            .unwrap();
+        assert_eq!(status.state, SyncState::Unmatched);
+        assert_eq!(status.provider_item_id.as_deref(), Some("youtube-shared"));
+        assert!(status
+            .message
+            .as_deref()
+            .unwrap()
+            .contains(REJECTED_IDENTITY_CANDIDATE_MARKER));
         state.validate().unwrap();
     }
 

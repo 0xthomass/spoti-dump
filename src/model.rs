@@ -7,6 +7,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 pub const LIBRARY_STATE_FORMAT_VERSION: u32 = 4;
+pub const REJECTED_IDENTITY_CANDIDATE_MARKER: &str = "Rejected identity candidate";
 
 #[derive(
     Clone,
@@ -454,6 +455,23 @@ impl SyncStatusRecord {
             message: Some(message.into()),
             confidence: None,
             provider_item_id: None,
+            last_attempt_at: Some(at),
+            last_success_at: None,
+            last_seen_at: None,
+        }
+    }
+
+    pub fn unmatched_with_provider_item_id(
+        message: impl Into<String>,
+        provider_item_id: impl Into<String>,
+        confidence: Option<f64>,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            state: SyncState::Unmatched,
+            message: Some(message.into()),
+            confidence,
+            provider_item_id: Some(provider_item_id.into()),
             last_attempt_at: Some(at),
             last_success_at: None,
             last_seen_at: None,

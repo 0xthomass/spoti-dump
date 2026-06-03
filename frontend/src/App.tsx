@@ -1861,6 +1861,7 @@ function IdentityConflictsPage() {
   const [draft, setDraft] = useState(searchParams.get('q') ?? '')
   const [editingTrackId, setEditingTrackId] = useState<string | null>(null)
   const [mergingConflict, setMergingConflict] = useState<string | null>(null)
+  const [rejectingConflict, setRejectingConflict] = useState<string | null>(null)
   const page = parsePage(searchParams.get('page'))
   const query = searchParams.get('q') ?? ''
 
@@ -1920,6 +1921,42 @@ function IdentityConflictsPage() {
       notify(error instanceof Error ? error.message : 'Merge failed.')
     } finally {
       setMergingConflict(null)
+    }
+  }
+
+  async function rejectConflict(item: IdentityConflictQueueItem) {
+    const accepted = await confirm({
+      title: 'Mark candidate as not same track?',
+      message: `This will reject ${item.conflict.provider_name} candidate ${item.conflict.provider_id} for "${item.source_track.title}".`,
+      details:
+        'The rows will not be merged. Provider accounts are not changed. The source row will stay missing that provider ID until you link the correct identity or a different match is found.',
+      confirmLabel: 'Mark not same',
+      tone: 'warning',
+    })
+    if (!accepted) {
+      return
+    }
+
+    const rejectKey = `${item.source_track.track_id}:${item.conflict.provider}:${item.conflict.provider_id}:reject`
+    setRejectingConflict(rejectKey)
+    try {
+      const payload = await apiRequest<ActionResponse>(
+        `/tracks/${item.source_track.track_id}/identity-conflicts/reject`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: item.conflict.provider,
+            provider_id: item.conflict.provider_id,
+            owner_track_id: item.conflict.owner_track.track_id,
+          }),
+        },
+      )
+      notify(actionMessage(payload))
+      refresh()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Reject failed.')
+    } finally {
+      setRejectingConflict(null)
     }
   }
 
@@ -2014,7 +2051,7 @@ function IdentityConflictsPage() {
                     <div className="modal-actions modal-actions--inline">
                       <button
                         className="provider-action-button provider-action-button--secondary"
-                        disabled={mergingConflict !== null}
+                        disabled={mergingConflict !== null || rejectingConflict !== null}
                         onClick={() => void mergeConflict(item, 'keep_source')}
                         type="button"
                       >
@@ -2024,13 +2061,23 @@ function IdentityConflictsPage() {
                       </button>
                       <button
                         className="provider-action-button provider-action-button--secondary"
-                        disabled={mergingConflict !== null}
+                        disabled={mergingConflict !== null || rejectingConflict !== null}
                         onClick={() => void mergeConflict(item, 'keep_target')}
                         type="button"
                       >
                         {mergingConflict === `${mergeKey}:keep_target`
                           ? 'Merging…'
                           : 'Merge, keep candidate IDs'}
+                      </button>
+                      <button
+                        className="ghost-button"
+                        disabled={mergingConflict !== null || rejectingConflict !== null}
+                        onClick={() => void rejectConflict(item)}
+                        type="button"
+                      >
+                        {rejectingConflict === `${mergeKey}:reject`
+                          ? 'Marking…'
+                          : 'Mark not same track'}
                       </button>
                     </div>
                   </article>
@@ -2557,6 +2604,7 @@ function TrackEditorModal({
   const [saving, setSaving] = useState(false)
   const [linkingIdentity, setLinkingIdentity] = useState(false)
   const [mergingConflict, setMergingConflict] = useState<string | null>(null)
+  const [rejectingConflict, setRejectingConflict] = useState<string | null>(null)
 
   useEffect(() => {
     if (!resource.data) {
@@ -2682,6 +2730,46 @@ function TrackEditorModal({
       notify(error instanceof Error ? error.message : 'Merge failed.')
     } finally {
       setMergingConflict(null)
+    }
+  }
+
+  async function rejectConflict(conflict: TrackIdentityConflict) {
+    if (!resource.data) {
+      return
+    }
+
+    const accepted = await confirm({
+      title: 'Mark candidate as not same track?',
+      message: `This will reject ${conflict.provider_name} candidate ${conflict.provider_id} for "${resource.data.title}".`,
+      details:
+        'The rows will not be merged. Provider accounts are not changed. This track will stay missing that provider ID until you link the correct identity or a different match is found.',
+      confirmLabel: 'Mark not same',
+      tone: 'warning',
+    })
+    if (!accepted) {
+      return
+    }
+
+    const rejectKey = `${conflict.provider}:${conflict.provider_id}:reject`
+    setRejectingConflict(rejectKey)
+    try {
+      const payload = await apiRequest<ActionResponse>(
+        `/tracks/${trackId}/identity-conflicts/reject`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: conflict.provider,
+            provider_id: conflict.provider_id,
+            owner_track_id: conflict.owner_track.track_id,
+          }),
+        },
+      )
+      notify(actionMessage(payload))
+      refresh()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Reject failed.')
+    } finally {
+      setRejectingConflict(null)
     }
   }
 
@@ -2823,7 +2911,7 @@ function TrackEditorModal({
                       <div className="modal-actions modal-actions--inline">
                         <button
                           className="provider-action-button provider-action-button--secondary"
-                          disabled={mergingConflict !== null}
+                          disabled={mergingConflict !== null || rejectingConflict !== null}
                           onClick={() => void mergeConflict(conflict, 'keep_source')}
                           type="button"
                         >
@@ -2833,13 +2921,23 @@ function TrackEditorModal({
                         </button>
                         <button
                           className="provider-action-button provider-action-button--secondary"
-                          disabled={mergingConflict !== null}
+                          disabled={mergingConflict !== null || rejectingConflict !== null}
                           onClick={() => void mergeConflict(conflict, 'keep_target')}
                           type="button"
                         >
                           {mergingConflict === `${mergeKey}:keep_target`
                             ? 'Merging…'
                             : 'Merge, keep candidate IDs'}
+                        </button>
+                        <button
+                          className="ghost-button"
+                          disabled={mergingConflict !== null || rejectingConflict !== null}
+                          onClick={() => void rejectConflict(conflict)}
+                          type="button"
+                        >
+                          {rejectingConflict === `${mergeKey}:reject`
+                            ? 'Marking…'
+                            : 'Mark not same track'}
                         </button>
                       </div>
                     </div>

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::model::{
     LibraryState, LinkSource, ProviderConnection, ProviderConnectionConfig, ProviderCooldown,
     ProviderHealth, ProviderKind, ProviderTrackArtwork, SyncState, SyncStatusRecord, TrackEntity,
-    TrackMetadata, YoutubeMusicConnectionConfig,
+    TrackMetadata, YoutubeMusicConnectionConfig, REJECTED_IDENTITY_CANDIDATE_MARKER,
 };
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 use crate::providers::spotify::SpotifyProvider;
@@ -752,6 +752,13 @@ struct MergeTrackRequest {
     conflict_resolution: MergeConflictResolutionChoice,
 }
 
+#[derive(Deserialize)]
+struct RejectTrackIdentityConflictRequest {
+    provider: ProviderKind,
+    provider_id: String,
+    owner_track_id: String,
+}
+
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MergeConflictResolutionChoice {
@@ -1027,6 +1034,10 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
             post(api_apply_track_identity),
         )
         .route("/tracks/:track_id/merge", post(api_merge_track))
+        .route(
+            "/tracks/:track_id/identity-conflicts/reject",
+            post(api_reject_track_identity_conflict),
+        )
         .route("/playlists", get(api_playlists))
         .route(
             "/playlists/:playlist_id",
@@ -2199,6 +2210,62 @@ async fn api_merge_track(
         target_track_id: result.target_track_id,
         resolved_conflicts,
     }))
+}
+
+async fn api_reject_track_identity_conflict(
+    State(context): State<Arc<AppContext>>,
+    Path(track_id): Path<String>,
+    Json(request): Json<RejectTrackIdentityConflictRequest>,
+) -> Result<Json<MessageResponse>, ApiError> {
+    let provider_id = request.provider_id.trim().to_string();
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("Provider ID cannot be empty."));
+    }
+
+    let _state_guard = context.state_mutation.lock().await;
+    let mut state = read_state().await?;
+    let track = state
+        .tracks
+        .iter()
+        .find(|track| track.id == track_id)
+        .ok_or_else(|| ApiError::not_found(format!("Unknown track '{track_id}'.")))?;
+    let conflict = identity_conflicts_for_track(&state, track)
+        .into_iter()
+        .find(|conflict| {
+            conflict.provider == request.provider.as_key()
+                && conflict.provider_id == provider_id
+                && conflict.owner_track.track_id == request.owner_track_id
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "That identity conflict is no longer active for this track.".to_string(),
+            )
+        })?;
+    let now = Utc::now();
+    let message = format!(
+        "{REJECTED_IDENTITY_CANDIDATE_MARKER}: rejected {} ID '{}' for {} because candidate row '{}' was marked not the same track. The track still needs a different {} ID before a complete push.",
+        conflict.provider_name,
+        conflict.provider_id,
+        track.metadata.display_label(),
+        conflict.owner_track.title,
+        conflict.provider_name
+    );
+    state.set_track_status(
+        &track_id,
+        request.provider,
+        SyncStatusRecord::unmatched_with_provider_item_id(
+            message,
+            conflict.provider_id.clone(),
+            None,
+            now,
+        ),
+    );
+    write_state(state).await?;
+
+    Ok(Json(MessageResponse::new(format!(
+        "Marked {} candidate {} as not the same track. The source row remains unresolved for that provider.",
+        conflict.provider_name, conflict.provider_id
+    ))))
 }
 
 async fn api_delete_track(
@@ -4493,6 +4560,7 @@ mod tests {
         LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
         ProviderConnectionConfig, ProviderKind, ProviderTrackLink, SavedTrackEntry,
         SpotifyConnectionConfig, SyncStatusRecord, TrackEntity, TrackMetadata,
+        REJECTED_IDENTITY_CANDIDATE_MARKER,
     };
 
     use super::{
@@ -4722,6 +4790,63 @@ mod tests {
             rows[0].conflict.conflicting_provider_links[0].target_provider_id,
             "spotify-owner"
         );
+    }
+
+    #[test]
+    fn identity_conflict_queue_omits_rejected_candidates() {
+        let now = Utc::now();
+        let mut source = test_track_with_link(
+            "track-source",
+            "Conflict",
+            ProviderKind::Spotify,
+            "spotify-source",
+            now,
+        );
+        source.provider_state.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            SyncStatusRecord::unmatched_with_provider_item_id(
+                format!(
+                    "{REJECTED_IDENTITY_CANDIDATE_MARKER}: youtube-owner was marked not same track."
+                ),
+                "youtube-owner",
+                None,
+                now,
+            ),
+        );
+
+        let mut owner = test_track_with_link(
+            "track-owner",
+            "Conflict",
+            ProviderKind::Spotify,
+            "spotify-owner",
+            now,
+        );
+        owner.provider_links.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: "youtube-owner".to_string(),
+                source: LinkSource::Export,
+                confidence: Some(1.0),
+                linked_at: now,
+                last_seen_at: Some(now),
+            },
+        );
+
+        let mut state = LibraryState::new();
+        state.tracks.push(source);
+        state.tracks.push(owner);
+
+        assert!(identity_conflict_rows(&state, None).is_empty());
+        assert!(coverage_matches(
+            "spotify-only",
+            &state.tracks[0],
+            Some("unmatched")
+        ));
+        assert!(!coverage_matches(
+            "spotify-only",
+            &state.tracks[0],
+            Some("identity-conflicts")
+        ));
     }
 
     #[test]
