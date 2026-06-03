@@ -268,9 +268,51 @@ type TrackDetail = {
   coverage: Coverage
   providers: ProviderBadge[]
   provider_status: ProviderStatusDetail[]
+  identity_conflicts: TrackIdentityConflict[]
   saved_count: number
   playlist_refs: number
   artwork_url: string | null
+}
+
+type TrackIdentityConflict = {
+  provider: string
+  provider_name: string
+  provider_id: string
+  owner_track: ConflictTrack
+  conflicting_provider_links: ProviderLinkConflict[]
+  message: string
+}
+
+type ConflictTrack = {
+  track_id: string
+  title: string
+  artist_summary: string
+  album: string | null
+  coverage: Coverage
+  providers: ProviderBadge[]
+  saved_count: number
+  playlist_refs: number
+  artwork_url: string | null
+}
+
+type ProviderLinkConflict = {
+  provider: string
+  provider_name: string
+  source_provider_id: string
+  target_provider_id: string
+}
+
+type MergeTrackResponse = {
+  message: string
+  source_track_id: string
+  target_track_id: string
+  resolved_conflicts: {
+    provider: string
+    provider_name: string
+    kept_provider_id: string
+    dropped_provider_id: string
+    kept_from_source: boolean
+  }[]
 }
 
 type PlaylistSummary = {
@@ -2234,6 +2276,7 @@ function TrackEditorModal({
   const [identityValue, setIdentityValue] = useState('')
   const [saving, setSaving] = useState(false)
   const [linkingIdentity, setLinkingIdentity] = useState(false)
+  const [mergingConflict, setMergingConflict] = useState<string | null>(null)
 
   useEffect(() => {
     if (!resource.data) {
@@ -2318,6 +2361,47 @@ function TrackEditorModal({
       notify(error instanceof Error ? error.message : 'Identity link failed.')
     } finally {
       setLinkingIdentity(false)
+    }
+  }
+
+  async function mergeConflict(
+    conflict: TrackIdentityConflict,
+    conflictResolution: 'keep_source' | 'keep_target',
+  ) {
+    if (!resource.data) {
+      return
+    }
+
+    const keepCurrent = conflictResolution === 'keep_source'
+    const accepted = await confirm({
+      title: keepCurrent ? 'Merge and keep current IDs?' : 'Merge and keep candidate IDs?',
+      message: `This will merge "${resource.data.title}" into "${conflict.owner_track.title}".`,
+      details: keepCurrent
+        ? 'Saved tracks and playlist entries will move to the candidate row. For conflicting providers, the current row provider ID wins and the candidate alternate ID is recorded in audit status. Provider accounts are not changed.'
+        : 'Saved tracks and playlist entries will move to the candidate row. For conflicting providers, the candidate row provider ID wins and the current alternate ID is recorded in audit status. Provider accounts are not changed.',
+      confirmLabel: keepCurrent ? 'Merge, keep current' : 'Merge, keep candidate',
+      tone: 'danger',
+    })
+    if (!accepted) {
+      return
+    }
+
+    setMergingConflict(`${conflict.provider}:${conflict.provider_id}:${conflictResolution}`)
+    try {
+      const payload = await apiRequest<MergeTrackResponse>(`/tracks/${trackId}/merge`, {
+        method: 'POST',
+        body: JSON.stringify({
+          target_track_id: conflict.owner_track.track_id,
+          conflict_resolution: conflictResolution,
+        }),
+      })
+      notify(payload.message)
+      refresh()
+      onClose()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Merge failed.')
+    } finally {
+      setMergingConflict(null)
     }
   }
 
@@ -2422,6 +2506,68 @@ function TrackEditorModal({
               </button>
             </div>
           </div>
+
+          {resource.data.identity_conflicts.length ? (
+            <div className="section-stack">
+              <h3>Identity Conflicts</h3>
+              <p className="section-copy">
+                These provider matches point at another canonical row. Merge only after checking
+                which provider identity should win.
+              </p>
+              <div className="provider-state-list">
+                {resource.data.identity_conflicts.map((conflict) => {
+                  const mergeKey = `${conflict.provider}:${conflict.provider_id}`
+                  return (
+                    <div className="provider-state-card" key={mergeKey}>
+                      <strong>
+                        {conflict.provider_name} candidate: {conflict.provider_id}
+                      </strong>
+                      <p>{conflict.message}</p>
+                      <div className="chip-row">
+                        <span className="mini-chip">
+                          Candidate row: {conflict.owner_track.title}
+                        </span>
+                        <span className="mini-chip">
+                          {conflict.owner_track.artist_summary}
+                        </span>
+                        <span className="mini-chip">
+                          {conflict.owner_track.coverage.label}
+                        </span>
+                      </div>
+                      {conflict.conflicting_provider_links.map((link) => (
+                        <p key={link.provider}>
+                          {link.provider_name}: current {link.source_provider_id} · candidate{' '}
+                          {link.target_provider_id}
+                        </p>
+                      ))}
+                      <div className="modal-actions modal-actions--inline">
+                        <button
+                          className="provider-action-button provider-action-button--secondary"
+                          disabled={mergingConflict !== null}
+                          onClick={() => void mergeConflict(conflict, 'keep_source')}
+                          type="button"
+                        >
+                          {mergingConflict === `${mergeKey}:keep_source`
+                            ? 'Merging…'
+                            : 'Merge, keep current IDs'}
+                        </button>
+                        <button
+                          className="provider-action-button provider-action-button--secondary"
+                          disabled={mergingConflict !== null}
+                          onClick={() => void mergeConflict(conflict, 'keep_target')}
+                          type="button"
+                        >
+                          {mergingConflict === `${mergeKey}:keep_target`
+                            ? 'Merging…'
+                            : 'Merge, keep candidate IDs'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
 
           <div className="section-stack">
             <h3>Provider State</h3>

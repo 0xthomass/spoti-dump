@@ -27,6 +27,27 @@ pub enum TrackIdentityApplyResult {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackMergeConflictResolution {
+    KeepSource,
+    KeepTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedTrackMergeConflict {
+    pub provider_key: String,
+    pub kept_provider_id: String,
+    pub dropped_provider_id: String,
+    pub kept_from_source: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackMergeResult {
+    pub source_track_id: String,
+    pub target_track_id: String,
+    pub resolved_conflicts: Vec<ResolvedTrackMergeConflict>,
+}
+
 impl TrackIdentityApplyResult {
     pub fn track_id(&self) -> &str {
         match self {
@@ -302,8 +323,43 @@ impl LibraryState {
         source_track_id: &str,
         target_track_id: &str,
     ) -> anyhow::Result<bool> {
+        self.merge_track_into_with_conflict_resolution(
+            source_track_id,
+            target_track_id,
+            TrackMergeConflictResolution::KeepTarget,
+            Utc::now(),
+            false,
+        )
+        .map(|result| result.is_some())
+    }
+
+    pub fn merge_track_into_resolving_conflicts(
+        &mut self,
+        source_track_id: &str,
+        target_track_id: &str,
+        resolution: TrackMergeConflictResolution,
+        merged_at: DateTime<Utc>,
+    ) -> anyhow::Result<TrackMergeResult> {
+        self.merge_track_into_with_conflict_resolution(
+            source_track_id,
+            target_track_id,
+            resolution,
+            merged_at,
+            true,
+        )?
+        .ok_or_else(|| anyhow::anyhow!("Source and target track are already the same row."))
+    }
+
+    fn merge_track_into_with_conflict_resolution(
+        &mut self,
+        source_track_id: &str,
+        target_track_id: &str,
+        resolution: TrackMergeConflictResolution,
+        merged_at: DateTime<Utc>,
+        allow_conflicts: bool,
+    ) -> anyhow::Result<Option<TrackMergeResult>> {
         if source_track_id == target_track_id {
-            return Ok(false);
+            return Ok(None);
         }
 
         let source = self
@@ -323,28 +379,55 @@ impl LibraryState {
                 .find(|track| track.id == target_track_id)
                 .expect("target was checked above");
             merge_metadata(&mut target.metadata, &source.metadata);
-            merge_provider_links(&mut target.provider_links, source.provider_links)?;
+            let resolved_conflicts = merge_provider_links_with_resolution(
+                &mut target.provider_links,
+                source.provider_links,
+                resolution,
+                allow_conflicts,
+            )?;
             merge_provider_artwork(&mut target.provider_artwork, source.provider_artwork);
             merge_status_maps(&mut target.provider_state, source.provider_state);
-        }
-
-        for saved_track in &mut self.saved_tracks {
-            if saved_track.track_id == source_track_id {
-                saved_track.track_id = target_track_id.to_string();
+            for conflict in &resolved_conflicts {
+                target.provider_state.insert(
+                    conflict.provider_key.clone(),
+                    SyncStatusRecord::synced(
+                        Some(conflict.kept_provider_id.clone()),
+                        Some(1.0),
+                        Some(format!(
+                            "Manual conflict merge kept {} ID '{}' and dropped alternate ID '{}'.",
+                            provider_display_name(&conflict.provider_key),
+                            conflict.kept_provider_id,
+                            conflict.dropped_provider_id
+                        )),
+                        merged_at,
+                    ),
+                );
             }
-        }
-        for playlist in &mut self.playlists {
-            for entry in &mut playlist.entries {
-                if entry.track_id == source_track_id {
-                    entry.track_id = target_track_id.to_string();
+
+            let result = TrackMergeResult {
+                source_track_id: source_track_id.to_string(),
+                target_track_id: target_track_id.to_string(),
+                resolved_conflicts,
+            };
+
+            for saved_track in &mut self.saved_tracks {
+                if saved_track.track_id == source_track_id {
+                    saved_track.track_id = target_track_id.to_string();
                 }
             }
-        }
+            for playlist in &mut self.playlists {
+                for entry in &mut playlist.entries {
+                    if entry.track_id == source_track_id {
+                        entry.track_id = target_track_id.to_string();
+                    }
+                }
+            }
 
-        self.tracks.retain(|track| track.id != source_track_id);
-        self.consolidate_duplicate_saved_tracks();
-        self.touch();
-        Ok(true)
+            self.tracks.retain(|track| track.id != source_track_id);
+            self.consolidate_duplicate_saved_tracks();
+            self.touch();
+            Ok(Some(result))
+        }
     }
 
     pub fn consolidate_duplicate_saved_tracks(&mut self) -> usize {
@@ -909,19 +992,44 @@ fn upsert_track_artwork(
     }
 }
 
-fn merge_provider_links(
+fn merge_provider_links_with_resolution(
     target: &mut BTreeMap<String, ProviderTrackLink>,
     source: BTreeMap<String, ProviderTrackLink>,
-) -> anyhow::Result<()> {
+    resolution: TrackMergeConflictResolution,
+    allow_conflicts: bool,
+) -> anyhow::Result<Vec<ResolvedTrackMergeConflict>> {
+    let mut resolved_conflicts = Vec::new();
     for (provider, source_link) in source {
         if let Some(target_link) = target.get_mut(&provider) {
             if target_link.provider_id != source_link.provider_id {
-                anyhow::bail!(
-                    "Cannot merge tracks because provider '{}' has conflicting IDs '{}' and '{}'.",
-                    provider,
-                    target_link.provider_id,
-                    source_link.provider_id
-                );
+                if !allow_conflicts {
+                    anyhow::bail!(
+                        "Cannot merge tracks because provider '{}' has conflicting IDs '{}' and '{}'.",
+                        provider,
+                        target_link.provider_id,
+                        source_link.provider_id
+                    );
+                }
+
+                let (kept_provider_id, dropped_provider_id, kept_from_source) = match resolution {
+                    TrackMergeConflictResolution::KeepSource => {
+                        let dropped = target_link.provider_id.clone();
+                        *target_link = source_link;
+                        (target_link.provider_id.clone(), dropped, true)
+                    }
+                    TrackMergeConflictResolution::KeepTarget => (
+                        target_link.provider_id.clone(),
+                        source_link.provider_id,
+                        false,
+                    ),
+                };
+                resolved_conflicts.push(ResolvedTrackMergeConflict {
+                    provider_key: provider,
+                    kept_provider_id,
+                    dropped_provider_id,
+                    kept_from_source,
+                });
+                continue;
             }
             target_link.confidence =
                 preferred_confidence(target_link.confidence, source_link.confidence);
@@ -930,7 +1038,13 @@ fn merge_provider_links(
             target.insert(provider, source_link);
         }
     }
-    Ok(())
+    Ok(resolved_conflicts)
+}
+
+fn provider_display_name(key: &str) -> String {
+    ProviderKind::from_key(key)
+        .map(|provider| provider.display_name().to_string())
+        .unwrap_or_else(|_| key.to_string())
 }
 
 fn merge_provider_artwork(

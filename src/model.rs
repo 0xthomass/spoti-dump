@@ -484,6 +484,23 @@ impl SyncStatusRecord {
         }
     }
 
+    pub fn error_with_provider_item_id(
+        message: impl Into<String>,
+        provider_item_id: impl Into<String>,
+        confidence: Option<f64>,
+        at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            state: SyncState::Error,
+            message: Some(message.into()),
+            confidence,
+            provider_item_id: Some(provider_item_id.into()),
+            last_attempt_at: Some(at),
+            last_success_at: None,
+            last_seen_at: None,
+        }
+    }
+
     pub fn skipped(message: impl Into<String>, at: DateTime<Utc>) -> Self {
         Self {
             state: SyncState::Skipped,

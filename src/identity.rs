@@ -201,7 +201,12 @@ pub async fn reconcile_provider_identities_with_options(
                         state.set_track_status(
                             &track_id,
                             provider_kind,
-                            SyncStatusRecord::error(message, now),
+                            SyncStatusRecord::error_with_provider_item_id(
+                                message,
+                                provider_id.clone(),
+                                Some(confidence),
+                                now,
+                            ),
                         );
                         continue;
                     }

@@ -1139,6 +1139,11 @@ code {
   gap: 10px;
 }
 
+.modal-actions--inline {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .ghost-button {
   background: rgba(255, 255, 255, 0.06);
   color: #f7f5f0;

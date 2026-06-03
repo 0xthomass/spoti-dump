@@ -28,7 +28,9 @@ use crate::model::{
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 use crate::providers::spotify::SpotifyProvider;
 use crate::providers::youtube_music::YoutubeMusicProvider;
-use crate::state::{merge_provider_snapshot, TrackIdentityApplyResult};
+use crate::state::{
+    merge_provider_snapshot, TrackIdentityApplyResult, TrackMergeConflictResolution,
+};
 use crate::storage;
 
 const PAGE_SIZE: usize = 50;
@@ -666,9 +668,41 @@ struct TrackDetailDto {
     coverage: CoverageDto,
     providers: Vec<ProviderBadgeDto>,
     provider_status: Vec<ProviderStatusDetailDto>,
+    identity_conflicts: Vec<TrackIdentityConflictDto>,
     saved_count: usize,
     playlist_refs: usize,
     artwork_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TrackIdentityConflictDto {
+    provider: String,
+    provider_name: String,
+    provider_id: String,
+    owner_track: ConflictTrackDto,
+    conflicting_provider_links: Vec<ProviderLinkConflictDto>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ConflictTrackDto {
+    track_id: String,
+    title: String,
+    artist_summary: String,
+    album: Option<String>,
+    coverage: CoverageDto,
+    providers: Vec<ProviderBadgeDto>,
+    saved_count: usize,
+    playlist_refs: usize,
+    artwork_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ProviderLinkConflictDto {
+    provider: String,
+    provider_name: String,
+    source_provider_id: String,
+    target_provider_id: String,
 }
 
 #[derive(Serialize)]
@@ -696,6 +730,36 @@ struct ApplyTrackIdentityResponse {
     provider: String,
     provider_id: String,
     track_id: String,
+}
+
+#[derive(Deserialize)]
+struct MergeTrackRequest {
+    target_track_id: String,
+    conflict_resolution: MergeConflictResolutionChoice,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MergeConflictResolutionChoice {
+    KeepSource,
+    KeepTarget,
+}
+
+#[derive(Serialize)]
+struct MergeTrackResponse {
+    message: String,
+    source_track_id: String,
+    target_track_id: String,
+    resolved_conflicts: Vec<ResolvedProviderConflictDto>,
+}
+
+#[derive(Serialize)]
+struct ResolvedProviderConflictDto {
+    provider: String,
+    provider_name: String,
+    kept_provider_id: String,
+    dropped_provider_id: String,
+    kept_from_source: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -947,6 +1011,7 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
             "/tracks/:track_id/identities",
             post(api_apply_track_identity),
         )
+        .route("/tracks/:track_id/merge", post(api_merge_track))
         .route("/playlists", get(api_playlists))
         .route(
             "/playlists/:playlist_id",
@@ -2038,6 +2103,53 @@ async fn api_apply_track_identity(
         provider: request.provider.as_key().to_string(),
         provider_id,
         track_id: result_track_id,
+    }))
+}
+
+async fn api_merge_track(
+    State(context): State<Arc<AppContext>>,
+    Path(source_track_id): Path<String>,
+    Json(request): Json<MergeTrackRequest>,
+) -> Result<Json<MergeTrackResponse>, ApiError> {
+    let _state_guard = context.state_mutation.lock().await;
+    let mut state = read_state().await?;
+    let now = Utc::now();
+    let resolution = match request.conflict_resolution {
+        MergeConflictResolutionChoice::KeepSource => TrackMergeConflictResolution::KeepSource,
+        MergeConflictResolutionChoice::KeepTarget => TrackMergeConflictResolution::KeepTarget,
+    };
+    let result = state
+        .merge_track_into_resolving_conflicts(
+            &source_track_id,
+            &request.target_track_id,
+            resolution,
+            now,
+        )
+        .map_err(|error| ApiError::bad_request(sanitize_error_message(&error.to_string())))?;
+    state.validate().map_err(ApiError::from)?;
+    write_state(state).await?;
+
+    let resolved_conflicts = result
+        .resolved_conflicts
+        .iter()
+        .map(|conflict| ResolvedProviderConflictDto {
+            provider: conflict.provider_key.clone(),
+            provider_name: provider_display_name(&conflict.provider_key),
+            kept_provider_id: conflict.kept_provider_id.clone(),
+            dropped_provider_id: conflict.dropped_provider_id.clone(),
+            kept_from_source: conflict.kept_from_source,
+        })
+        .collect::<Vec<_>>();
+    let conflict_count = resolved_conflicts.len();
+
+    Ok(Json(MergeTrackResponse {
+        message: format!(
+            "Merged canonical track {} into {} and resolved {} provider ID conflict(s). Provider accounts were not changed.",
+            result.source_track_id, result.target_track_id, conflict_count
+        ),
+        source_track_id: result.source_track_id,
+        target_track_id: result.target_track_id,
+        resolved_conflicts,
     }))
 }
 
@@ -3284,10 +3396,118 @@ fn build_track_detail(state: &LibraryState, track_id: &str) -> Result<TrackDetai
         coverage: coverage_dto(track),
         providers: provider_badges(&track.provider_links),
         provider_status: provider_status_details(&track.provider_state),
+        identity_conflicts: identity_conflicts_for_track(state, track),
         saved_count,
         playlist_refs,
         artwork_url: preferred_artwork_url(track),
     })
+}
+
+fn identity_conflicts_for_track(
+    state: &LibraryState,
+    track: &TrackEntity,
+) -> Vec<TrackIdentityConflictDto> {
+    track
+        .provider_state
+        .iter()
+        .filter_map(|(provider_key, status)| {
+            if status.state != SyncState::Error {
+                return None;
+            }
+            let message = status.message.as_deref()?;
+            if !is_identity_conflict_message(message) {
+                return None;
+            }
+            let provider = ProviderKind::from_key(provider_key).ok()?;
+            let provider_id = status
+                .provider_item_id
+                .clone()
+                .or_else(|| parse_conflict_candidate_provider_id(message))?;
+            let owner = state.tracks.iter().find(|candidate| {
+                candidate.id != track.id
+                    && candidate
+                        .provider_links
+                        .get(provider.as_key())
+                        .map(|link| link.provider_id == provider_id)
+                        .unwrap_or(false)
+            })?;
+
+            Some(TrackIdentityConflictDto {
+                provider: provider.as_key().to_string(),
+                provider_name: provider.display_name().to_string(),
+                provider_id,
+                owner_track: conflict_track_dto(state, owner),
+                conflicting_provider_links: provider_link_conflicts(track, owner),
+                message: message.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn conflict_track_dto(state: &LibraryState, track: &TrackEntity) -> ConflictTrackDto {
+    ConflictTrackDto {
+        track_id: track.id.clone(),
+        title: track.metadata.title.clone(),
+        artist_summary: track.metadata.artist_summary(),
+        album: track.metadata.album.clone(),
+        coverage: coverage_dto(track),
+        providers: provider_badges(&track.provider_links),
+        saved_count: saved_track_count(state, &track.id),
+        playlist_refs: playlist_reference_count(state, &track.id),
+        artwork_url: preferred_artwork_url(track),
+    }
+}
+
+fn provider_link_conflicts(
+    source: &TrackEntity,
+    target: &TrackEntity,
+) -> Vec<ProviderLinkConflictDto> {
+    source
+        .provider_links
+        .iter()
+        .filter_map(|(provider_key, source_link)| {
+            let target_link = target.provider_links.get(provider_key)?;
+            if target_link.provider_id == source_link.provider_id {
+                return None;
+            }
+            Some(ProviderLinkConflictDto {
+                provider: provider_key.clone(),
+                provider_name: provider_display_name(provider_key),
+                source_provider_id: source_link.provider_id.clone(),
+                target_provider_id: target_link.provider_id.clone(),
+            })
+        })
+        .collect()
+}
+
+fn parse_conflict_candidate_provider_id(message: &str) -> Option<String> {
+    let marker = "identity '";
+    let start = message.find(marker)? + marker.len();
+    let suffix = &message[start..];
+    let end = suffix.find('\'')?;
+    let provider_id = suffix[..end].trim();
+    if provider_id.is_empty() {
+        None
+    } else {
+        Some(provider_id.to_string())
+    }
+}
+
+fn saved_track_count(state: &LibraryState, track_id: &str) -> usize {
+    state
+        .saved_tracks
+        .iter()
+        .filter(|saved_track| saved_track.track_id == track_id)
+        .count()
+}
+
+fn playlist_reference_count(state: &LibraryState, track_id: &str) -> usize {
+    state
+        .playlists
+        .iter()
+        .flat_map(|playlist| playlist.entries.iter())
+        .filter(|entry| entry.track_id == track_id)
+        .count()
 }
 
 fn playlist_summaries(state: &LibraryState, query: Option<&str>) -> Vec<PlaylistSummaryDto> {

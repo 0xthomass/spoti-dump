@@ -11,7 +11,7 @@ use spoti_dump::model::{
     ProviderLibrarySnapshot, ProviderTrackArtwork, SavedTrackEntry, SpotifyConnectionConfig,
     SyncState, SyncStatusRecord, TrackEntity, TrackMetadata,
 };
-use spoti_dump::state::merge_provider_snapshot;
+use spoti_dump::state::{merge_provider_snapshot, TrackMergeConflictResolution};
 use spoti_dump::storage::{
     create_manual_library_backup_in, database_health_in, database_path_in, export_csv,
     list_library_backups_in, list_provider_connections_in, list_provider_cooldowns_in,
@@ -190,6 +190,121 @@ fn applying_identity_merges_duplicate_track_rows_and_saved_entries() {
     assert!(state.tracks[0]
         .provider_links
         .contains_key(ProviderKind::YoutubeMusic.as_key()));
+    state.validate().unwrap();
+}
+
+#[test]
+fn explicit_conflict_merge_requires_and_records_provider_link_choice() {
+    let mut state = LibraryState::new();
+    state.tracks.push(track_entity("spotify-row", "Drive"));
+    state.tracks.push(track_entity("youtube-row", "Drive"));
+    let now = Utc::now();
+    state.upsert_track_link(
+        "spotify-row",
+        ProviderKind::Spotify,
+        "spotify-candidate",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    );
+    state.upsert_track_link(
+        "spotify-row",
+        ProviderKind::YoutubeMusic,
+        "youtube-shared",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    );
+    state.upsert_track_link(
+        "youtube-row",
+        ProviderKind::Spotify,
+        "spotify-current",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    );
+    state.saved_tracks.push(SavedTrackEntry {
+        id: "saved-youtube".to_string(),
+        track_id: "youtube-row".to_string(),
+        added_at: Some("2026-01-01T00:00:00Z".to_string()),
+        provider_state: BTreeMap::new(),
+    });
+    state.playlists.push(PlaylistEntity {
+        id: "playlist-1".to_string(),
+        name: "Favorites".to_string(),
+        description: None,
+        provider_links: BTreeMap::new(),
+        provider_state: BTreeMap::new(),
+        entries: vec![PlaylistEntry {
+            id: "entry-1".to_string(),
+            track_id: "youtube-row".to_string(),
+            added_at: None,
+            provider_state: BTreeMap::new(),
+        }],
+    });
+
+    let failed_merge = state
+        .merge_track_into("youtube-row", "spotify-row")
+        .expect_err("plain merge should reject conflicting Spotify IDs");
+    assert!(failed_merge.to_string().contains("conflicting IDs"));
+
+    let result = state
+        .merge_track_into_resolving_conflicts(
+            "youtube-row",
+            "spotify-row",
+            TrackMergeConflictResolution::KeepSource,
+            now,
+        )
+        .unwrap();
+
+    assert_eq!(result.target_track_id, "spotify-row");
+    assert_eq!(result.source_track_id, "youtube-row");
+    assert_eq!(result.resolved_conflicts.len(), 1);
+    assert_eq!(
+        result.resolved_conflicts[0].provider_key,
+        ProviderKind::Spotify.as_key()
+    );
+    assert_eq!(
+        result.resolved_conflicts[0].kept_provider_id,
+        "spotify-current"
+    );
+    assert_eq!(
+        result.resolved_conflicts[0].dropped_provider_id,
+        "spotify-candidate"
+    );
+    assert!(result.resolved_conflicts[0].kept_from_source);
+    assert_eq!(state.tracks.len(), 1);
+    assert_eq!(state.saved_tracks[0].track_id, "spotify-row");
+    assert_eq!(state.playlists[0].entries[0].track_id, "spotify-row");
+    let merged = &state.tracks[0];
+    assert_eq!(
+        merged
+            .provider_links
+            .get(ProviderKind::Spotify.as_key())
+            .map(|link| link.provider_id.as_str()),
+        Some("spotify-current")
+    );
+    assert_eq!(
+        merged
+            .provider_links
+            .get(ProviderKind::YoutubeMusic.as_key())
+            .map(|link| link.provider_id.as_str()),
+        Some("youtube-shared")
+    );
+    let spotify_status = merged
+        .provider_state
+        .get(ProviderKind::Spotify.as_key())
+        .unwrap();
+    assert_eq!(spotify_status.state, SyncState::Synced);
+    assert_eq!(
+        spotify_status.provider_item_id.as_deref(),
+        Some("spotify-current")
+    );
+    assert!(spotify_status
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("dropped alternate ID 'spotify-candidate'"));
     state.validate().unwrap();
 }
 
