@@ -8,11 +8,15 @@ use crate::model::{LibraryState, LinkSource, ProviderKind, SyncStatusRecord, Tra
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 use crate::state::TrackIdentityApplyResult;
 
+const SPOTIFY_IDENTITY_SEARCHES_PER_RUN: usize = 75;
+const YOUTUBE_MUSIC_IDENTITY_SEARCHES_PER_RUN: usize = 150;
+
 #[derive(Clone, Debug, Default)]
 pub struct IdentityReconcileSummary {
     pub provider: ProviderKind,
     pub tracks_scanned: usize,
     pub tracks_missing_provider_id: usize,
+    pub provider_searches: usize,
     pub provider_links_added: usize,
     pub tracks_merged: usize,
     pub already_linked: usize,
@@ -22,13 +26,34 @@ pub struct IdentityReconcileSummary {
     pub duplicate_saved_tracks_removed: usize,
     pub rate_limited: bool,
     pub unprocessed_due_rate_limit: usize,
+    pub unprocessed_due_safety_limit: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdentityReconcileOptions {
+    pub max_provider_searches: Option<usize>,
 }
 
 pub async fn reconcile_provider_identities(
     provider: &dyn StreamingProvider,
     state: &mut LibraryState,
     progress: Option<ProgressHandler>,
+) -> Result<IdentityReconcileSummary> {
+    reconcile_provider_identities_with_options(
+        provider,
+        state,
+        progress,
+        IdentityReconcileOptions::default(),
+    )
+    .await
+}
+
+pub async fn reconcile_provider_identities_with_options(
+    provider: &dyn StreamingProvider,
+    state: &mut LibraryState,
+    progress: Option<ProgressHandler>,
+    options: IdentityReconcileOptions,
 ) -> Result<IdentityReconcileSummary> {
     let provider_kind = provider.kind();
     let now = Utc::now();
@@ -46,6 +71,9 @@ pub async fn reconcile_provider_identities(
         .map(|track| (track.id.clone(), track.metadata.clone()))
         .collect::<Vec<_>>();
     summary.tracks_missing_provider_id = candidates.len();
+    let provider_search_budget = options
+        .max_provider_searches
+        .unwrap_or_else(|| default_provider_search_budget(provider_kind));
 
     let mut cache = HashMap::<String, Option<(String, f64)>>::new();
     for (index, (track_id, metadata)) in candidates.into_iter().enumerate() {
@@ -93,6 +121,19 @@ pub async fn reconcile_provider_identities(
         let resolved = if let Some(cached) = cache.get(&cache_key) {
             cached.clone()
         } else {
+            if summary.provider_searches >= provider_search_budget {
+                summary.unprocessed_due_safety_limit =
+                    summary.tracks_missing_provider_id.saturating_sub(index);
+                summary.warnings.push(format!(
+                    "{} identity sync paused after {} provider identity lookups to avoid triggering provider rate limits. Re-run identity sync to continue from the remaining {} tracks.",
+                    provider_kind.display_name(),
+                    summary.provider_searches,
+                    summary.unprocessed_due_safety_limit
+                ));
+                break;
+            }
+
+            summary.provider_searches += 1;
             match provider.resolve_track_identity(&metadata).await {
                 Ok(resolved) => {
                     cache.insert(cache_key, resolved.clone());
@@ -211,7 +252,8 @@ pub async fn reconcile_provider_identities(
             stage: "Identity sync complete".to_string(),
             saved_tracks_done: summary
                 .tracks_missing_provider_id
-                .saturating_sub(summary.unprocessed_due_rate_limit),
+                .saturating_sub(summary.unprocessed_due_rate_limit)
+                .saturating_sub(summary.unprocessed_due_safety_limit),
             saved_tracks_total: Some(summary.tracks_missing_provider_id),
             ..Default::default()
         },
@@ -273,6 +315,13 @@ fn normalize_key_part(value: &str) -> String {
         .join(" ")
 }
 
+fn default_provider_search_budget(provider: ProviderKind) -> usize {
+    match provider {
+        ProviderKind::Spotify => SPOTIFY_IDENTITY_SEARCHES_PER_RUN,
+        ProviderKind::YoutubeMusic => YOUTUBE_MUSIC_IDENTITY_SEARCHES_PER_RUN,
+    }
+}
+
 fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let message = cause.to_string();
@@ -304,7 +353,10 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
 
-    use super::reconcile_provider_identities;
+    use super::{
+        reconcile_provider_identities, reconcile_provider_identities_with_options,
+        IdentityReconcileOptions,
+    };
     use crate::model::{
         LibraryState, LinkSource, ProviderKind, ProviderLibrarySnapshot, PurgeReport, SyncState,
         SyncSummary, TrackEntity, TrackMetadata,
@@ -314,6 +366,10 @@ mod tests {
     struct StaticIdentityProvider {
         provider: ProviderKind,
         provider_id: String,
+    }
+
+    struct EchoIdentityProvider {
+        provider: ProviderKind,
     }
 
     #[async_trait]
@@ -353,6 +409,72 @@ mod tests {
             _metadata: &TrackMetadata,
         ) -> Result<Option<(String, f64)>> {
             Ok(Some((self.provider_id.clone(), 0.99)))
+        }
+
+        async fn purge_library(&self, _force: bool) -> Result<PurgeReport> {
+            Ok(PurgeReport::default())
+        }
+
+        async fn remove_saved_track(&self, _provider_track_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_playlist(&self, _provider_playlist_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl StreamingProvider for EchoIdentityProvider {
+        fn kind(&self) -> ProviderKind {
+            self.provider
+        }
+
+        async fn verify_connection(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn export_library_with_progress(
+            &self,
+            _progress: Option<ProgressHandler>,
+        ) -> Result<ProviderLibrarySnapshot> {
+            Ok(ProviderLibrarySnapshot {
+                provider: self.provider,
+                captured_at: Utc::now(),
+                saved_tracks: Vec::new(),
+                playlists: Vec::new(),
+                warnings: Vec::new(),
+            })
+        }
+
+        async fn sync_library_with_progress(
+            &self,
+            _state: &mut LibraryState,
+            _force: bool,
+            _progress: Option<ProgressHandler>,
+        ) -> Result<SyncSummary> {
+            Ok(SyncSummary::default())
+        }
+
+        async fn resolve_track_identity(
+            &self,
+            metadata: &TrackMetadata,
+        ) -> Result<Option<(String, f64)>> {
+            let title_key = metadata
+                .title
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() {
+                        character.to_ascii_lowercase()
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>();
+            Ok(Some((
+                format!("{}-{title_key}", self.provider.as_key()),
+                0.99,
+            )))
         }
 
         async fn purge_library(&self, _force: bool) -> Result<PurgeReport> {
@@ -464,6 +586,48 @@ mod tests {
                 .get(ProviderKind::YoutubeMusic.as_key())
                 .map(|status| status.state),
             Some(SyncState::Error)
+        );
+        state.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn identity_reconcile_pauses_after_search_budget_to_avoid_rate_limits() {
+        let mut state = LibraryState::new();
+        state.tracks.push(track_entity("track-1", "Track One"));
+        state.tracks.push(track_entity("track-2", "Track Two"));
+        state.tracks.push(track_entity("track-3", "Track Three"));
+        let provider = EchoIdentityProvider {
+            provider: ProviderKind::Spotify,
+        };
+
+        let summary = reconcile_provider_identities_with_options(
+            &provider,
+            &mut state,
+            None,
+            IdentityReconcileOptions {
+                max_provider_searches: Some(2),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.provider_searches, 2);
+        assert_eq!(summary.provider_links_added, 2);
+        assert_eq!(summary.unprocessed_due_rate_limit, 0);
+        assert_eq!(summary.unprocessed_due_safety_limit, 1);
+        assert!(summary
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("paused after 2 provider identity lookups")));
+        assert_eq!(
+            state
+                .tracks
+                .iter()
+                .filter(|track| track
+                    .provider_links
+                    .contains_key(ProviderKind::Spotify.as_key()))
+                .count(),
+            2
         );
         state.validate().unwrap();
     }

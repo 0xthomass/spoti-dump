@@ -1489,18 +1489,21 @@ async fn api_start_provider_identity(
             )
             .await
             .map_err(ApiError::from)?;
+            let deferred =
+                summary.unprocessed_due_rate_limit + summary.unprocessed_due_safety_limit;
             write_state(state).await?;
             Ok::<MessageResponse, ApiError>(MessageResponse::with_warnings(
                 format!(
-                    "{} identity sync added {} links, merged {} duplicate track rows, skipped {} merge conflicts, flagged {} invalid metadata rows, removed {} duplicate saved rows, left {} unmatched, and deferred {} rate-limited tracks.",
+                    "{} identity sync performed {} provider identity lookups, added {} links, merged {} duplicate track rows, skipped {} merge conflicts, flagged {} invalid metadata rows, removed {} duplicate saved rows, left {} unmatched, and deferred {} tracks for a later run.",
                     provider.display_name(),
+                    summary.provider_searches,
                     summary.provider_links_added,
                     summary.tracks_merged,
                     summary.merge_conflicts,
                     summary.invalid_metadata,
                     summary.duplicate_saved_tracks_removed,
                     summary.unmatched,
-                    summary.unprocessed_due_rate_limit
+                    deferred
                 ),
                 summary.warnings,
             ))
@@ -1558,7 +1561,8 @@ async fn api_start_library_identity(
             let mut invalid_metadata = 0_usize;
             let mut duplicate_saved_removed = 0_usize;
             let mut unmatched = 0_usize;
-            let mut rate_limited = 0_usize;
+            let mut provider_searches = 0_usize;
+            let mut deferred = 0_usize;
 
             for provider in ProviderKind::all().iter().copied() {
                 progress(ProviderProgress {
@@ -1625,7 +1629,9 @@ async fn api_start_library_identity(
                 invalid_metadata += summary.invalid_metadata;
                 duplicate_saved_removed += summary.duplicate_saved_tracks_removed;
                 unmatched += summary.unmatched;
-                rate_limited += summary.unprocessed_due_rate_limit;
+                provider_searches += summary.provider_searches;
+                deferred +=
+                    summary.unprocessed_due_rate_limit + summary.unprocessed_due_safety_limit;
                 warnings.extend(summary.warnings);
                 storage::clear_provider_cooldown(provider).map_err(ApiError::from)?;
                 save_provider_health(provider_health_ok(
@@ -1646,7 +1652,7 @@ async fn api_start_library_identity(
                 "Library identity sync did not run against any provider.".to_string()
             } else {
                 format!(
-                    "Library identity sync ran against {providers_ran} provider(s), added {links_added} links, merged {tracks_merged} duplicate track rows, skipped {merge_conflicts} merge conflicts, flagged {invalid_metadata} invalid metadata rows, removed {duplicate_saved_removed} duplicate saved rows, left {unmatched} unmatched, and deferred {rate_limited} rate-limited tracks."
+                    "Library identity sync ran against {providers_ran} provider(s), performed {provider_searches} provider identity lookups, added {links_added} links, merged {tracks_merged} duplicate track rows, skipped {merge_conflicts} merge conflicts, flagged {invalid_metadata} invalid metadata rows, removed {duplicate_saved_removed} duplicate saved rows, left {unmatched} unmatched, and deferred {deferred} tracks for a later run."
                 )
             };
 

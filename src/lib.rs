@@ -565,10 +565,12 @@ fn print_sync_summary(provider: ProviderKind, summary: &SyncSummary) {
 }
 
 fn print_identity_summary(summary: &identity::IdentityReconcileSummary) {
+    let deferred = summary.unprocessed_due_rate_limit + summary.unprocessed_due_safety_limit;
     println!(
-        "{} identity sync scanned {} tracks, found {} missing IDs, added {} links, merged {} duplicate track rows, skipped {} merge conflicts, flagged {} invalid metadata rows, removed {} duplicate saved rows, left {} unmatched, and deferred {} rate-limited tracks.",
+        "{} identity sync scanned {} tracks, performed {} provider identity lookups, found {} missing IDs, added {} links, merged {} duplicate track rows, skipped {} merge conflicts, flagged {} invalid metadata rows, removed {} duplicate saved rows, left {} unmatched, and deferred {} tracks for a later run.",
         summary.provider,
         summary.tracks_scanned,
+        summary.provider_searches,
         summary.tracks_missing_provider_id,
         summary.provider_links_added,
         summary.tracks_merged,
@@ -576,7 +578,7 @@ fn print_identity_summary(summary: &identity::IdentityReconcileSummary) {
         summary.invalid_metadata,
         summary.duplicate_saved_tracks_removed,
         summary.unmatched,
-        summary.unprocessed_due_rate_limit
+        deferred
     );
     for warning in &summary.warnings {
         eprintln!("Warning: {warning}");
