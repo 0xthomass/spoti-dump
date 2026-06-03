@@ -3636,12 +3636,29 @@ fn coverage_matches(key: &str, track: &TrackEntity, filter: Option<&str>) -> boo
         Some("missing-any-provider") => ProviderKind::all()
             .iter()
             .any(|provider| !track.provider_links.contains_key(provider.as_key())),
+        Some("identity-conflicts") => track_has_identity_conflict(track),
         Some("unmatched") => track
             .provider_state
             .values()
             .any(|status| status.state == SyncState::Unmatched),
         Some(value) => key == value,
     }
+}
+
+fn track_has_identity_conflict(track: &TrackEntity) -> bool {
+    track.provider_state.values().any(|status| {
+        status.state == SyncState::Error
+            && status
+                .message
+                .as_deref()
+                .map(is_identity_conflict_message)
+                .unwrap_or(false)
+    })
+}
+
+fn is_identity_conflict_message(message: &str) -> bool {
+    message.contains("conflicting provider IDs")
+        || message.contains("Cannot merge tracks because provider")
 }
 
 async fn enrich_artwork_for_track_ids(
@@ -4132,7 +4149,7 @@ mod tests {
     use crate::model::{
         LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
         ProviderConnectionConfig, ProviderKind, ProviderTrackLink, SavedTrackEntry,
-        SpotifyConnectionConfig, TrackEntity, TrackMetadata,
+        SpotifyConnectionConfig, SyncStatusRecord, TrackEntity, TrackMetadata,
     };
 
     use super::{
@@ -4239,6 +4256,14 @@ mod tests {
             "youtube-video-1",
             now,
         );
+        let mut conflict = test_track("track-conflict", "Conflict");
+        conflict.provider_state.insert(
+            ProviderKind::Spotify.as_key().to_string(),
+            SyncStatusRecord::error(
+                "Skipped Spotify identity because it would merge tracks with conflicting provider IDs.",
+                now,
+            ),
+        );
         let mut multi_provider = test_track_with_link(
             "track-both",
             "Multi-provider",
@@ -4272,10 +4297,20 @@ mod tests {
             &youtube_only,
             Some("missing-spotify")
         ));
+        assert!(coverage_matches(
+            "canonical-only",
+            &conflict,
+            Some("identity-conflicts")
+        ));
         assert!(!coverage_matches(
             "multi-provider",
             &multi_provider,
             Some("missing-any-provider")
+        ));
+        assert!(!coverage_matches(
+            "spotify-only",
+            &spotify_only,
+            Some("identity-conflicts")
         ));
         assert!(!coverage_matches(
             "spotify-only",

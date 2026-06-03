@@ -1716,6 +1716,7 @@ function TracksPage() {
               ['youtube-music-only', 'YouTube only'],
               ['multi-provider', 'Multi-provider'],
               ['canonical-only', 'Canonical only'],
+              ['identity-conflicts', 'Identity conflicts'],
               ['unmatched', 'Unmatched'],
             ].map(([value, label]) => (
               <button
@@ -3114,6 +3115,9 @@ function coverageLabel(value: string) {
   }
   if (value === 'canonical-only') {
     return 'Canonical only'
+  }
+  if (value === 'identity-conflicts') {
+    return 'Identity conflicts'
   }
   if (value === 'unmatched') {
     return 'Unmatched'
