@@ -74,7 +74,11 @@ pub fn data_root() -> PathBuf {
     env::var_os(DATA_DIR_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| {
+            let local_root = PathBuf::from(".");
+            let current_dir = env::current_dir().unwrap_or_else(|_| local_root.clone());
+            discover_default_data_root(&local_root, &current_dir)
+        })
 }
 
 pub fn library_state_path() -> PathBuf {
@@ -107,6 +111,41 @@ pub fn manual_backup_dir() -> PathBuf {
 
 pub fn manual_backup_dir_in(root: &Path) -> PathBuf {
     root.join(DUMP_DIR).join(MANUAL_BACKUP_DIR)
+}
+
+fn discover_default_data_root(local_root: &Path, current_dir: &Path) -> PathBuf {
+    if has_existing_library_data(local_root) {
+        return local_root.to_path_buf();
+    }
+
+    if let Some(parent) = current_dir.parent() {
+        if has_existing_library_data(parent) {
+            return parent.to_path_buf();
+        }
+    }
+
+    local_root.to_path_buf()
+}
+
+fn has_existing_library_data(root: &Path) -> bool {
+    database_path_in(root).exists()
+        || legacy_library_state_path_in(root).exists()
+        || has_legacy_csv_dump(root)
+}
+
+fn has_legacy_csv_dump(root: &Path) -> bool {
+    let dump_dir = root.join(DUMP_DIR);
+    let Ok(entries) = fs::read_dir(dump_dir) else {
+        return false;
+    };
+
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("csv")
+    })
 }
 
 pub fn write_library_state(state: &LibraryState) -> Result<PathBuf> {
@@ -1854,20 +1893,7 @@ fn read_legacy_json_state(root: &Path) -> Result<Option<LibraryState>> {
 }
 
 fn legacy_dump_exists(root: &Path) -> Result<bool> {
-    let dump_dir = root.join(DUMP_DIR);
-    if !dump_dir.exists() {
-        return Ok(false);
-    }
-
-    Ok(fs::read_dir(dump_dir)?
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                == Some("csv")
-        }))
+    Ok(has_legacy_csv_dump(root))
 }
 
 fn read_legacy_csv_state(root: &Path) -> Result<LibraryState> {
@@ -2531,4 +2557,75 @@ struct LegacyTrackRecord {
     isrc: Option<String>,
     #[serde(default)]
     provider_ids: BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{database_path_in, discover_default_data_root, DUMP_DIR, LIBRARY_DB_FILE};
+
+    #[test]
+    fn default_data_root_prefers_existing_local_dump() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("spoti-dump");
+        fs::create_dir_all(app_root.join(DUMP_DIR)).unwrap();
+        fs::write(database_path_in(&app_root), []).unwrap();
+        fs::create_dir_all(temp.path().join(DUMP_DIR)).unwrap();
+        fs::write(database_path_in(temp.path()), []).unwrap();
+
+        assert_eq!(discover_default_data_root(&app_root, &app_root), app_root);
+    }
+
+    #[test]
+    fn default_data_root_discovers_existing_adjacent_parent_dump() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("spoti-dump");
+        fs::create_dir_all(&app_root).unwrap();
+        fs::create_dir_all(temp.path().join(DUMP_DIR)).unwrap();
+        fs::write(database_path_in(temp.path()), []).unwrap();
+
+        assert_eq!(
+            discover_default_data_root(&app_root, &app_root),
+            temp.path()
+        );
+    }
+
+    #[test]
+    fn default_data_root_stays_local_for_fresh_installs() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("spoti-dump");
+        fs::create_dir_all(&app_root).unwrap();
+        fs::create_dir_all(temp.path().join(DUMP_DIR)).unwrap();
+
+        assert_eq!(discover_default_data_root(&app_root, &app_root), app_root);
+    }
+
+    #[test]
+    fn default_data_root_discovers_adjacent_legacy_csv_dump() {
+        let temp = tempdir().unwrap();
+        let app_root = temp.path().join("spoti-dump");
+        fs::create_dir_all(&app_root).unwrap();
+        let dump_dir = temp.path().join(DUMP_DIR);
+        fs::create_dir_all(&dump_dir).unwrap();
+        fs::write(dump_dir.join("saved_tracks.csv"), "title,artist\n").unwrap();
+
+        assert_eq!(
+            discover_default_data_root(&app_root, &app_root),
+            temp.path()
+        );
+    }
+
+    #[test]
+    fn library_database_file_constant_matches_discovery_path() {
+        let temp = tempdir().unwrap();
+        assert_eq!(
+            database_path_in(temp.path())
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some(LIBRARY_DB_FILE)
+        );
+    }
 }
