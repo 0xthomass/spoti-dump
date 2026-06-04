@@ -472,6 +472,27 @@
   border: 1px solid rgba(255, 190, 105, 0.2);
 }
 
+.push-plan {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 20px;
+  background: rgba(126, 233, 220, 0.06);
+  border: 1px solid rgba(126, 233, 220, 0.14);
+}
+
+.push-plan-examples {
+  display: grid;
+  gap: 5px;
+  color: rgba(247, 245, 240, 0.66);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.push-plan-examples strong {
+  color: rgba(247, 245, 240, 0.86);
+}
+
 .provider-callout a {
   color: #94e8e4;
   font-weight: 800;

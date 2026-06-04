@@ -609,6 +609,41 @@ struct ProviderPreflightDto {
     track_ids_missing: usize,
 }
 
+#[derive(Serialize)]
+struct ProviderPushPlanDto {
+    provider: String,
+    provider_name: String,
+    preflight: ProviderPreflightDto,
+    saved_tracks: PushPlanSectionDto,
+    playlist_entries: PushPlanSectionDto,
+    playlists: PushPlaylistPlanSectionDto,
+}
+
+#[derive(Serialize)]
+struct PushPlanSectionDto {
+    total: usize,
+    pushable: usize,
+    skipped_missing_identity: usize,
+    skipped_examples: Vec<ConflictTrackDto>,
+}
+
+#[derive(Serialize)]
+struct PushPlaylistPlanSectionDto {
+    total: usize,
+    linked: usize,
+    unlinked: usize,
+    examples: Vec<PushPlaylistPlanItemDto>,
+}
+
+#[derive(Serialize)]
+struct PushPlaylistPlanItemDto {
+    playlist_id: String,
+    name: String,
+    entry_count: usize,
+    linked: bool,
+    missing_entries: usize,
+}
+
 #[derive(Clone, Serialize)]
 struct ProviderBadgeDto {
     key: String,
@@ -1011,6 +1046,10 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
             "/providers/:provider/preflight",
             get(api_provider_preflight),
         )
+        .route(
+            "/providers/:provider/push-plan",
+            get(api_provider_push_plan),
+        )
         .route("/providers/:provider/export", post(api_provider_export))
         .route(
             "/providers/:provider/identity/start",
@@ -1301,6 +1340,32 @@ async fn api_provider_preflight(
     let health = healths.iter().find(|health| health.provider == provider);
 
     Ok(Json(provider_preflight_payload(
+        &state, provider, connection, cooldown, health,
+    )))
+}
+
+async fn api_provider_push_plan(
+    Path(provider): Path<ProviderKind>,
+) -> Result<Json<ProviderPushPlanDto>, ApiError> {
+    let state = read_state_or_new().await?;
+    let connections = read_provider_connections().await?;
+    let cooldowns = tokio::task::spawn_blocking(storage::list_provider_cooldowns)
+        .await
+        .context("Failed to join provider cooldown task")?
+        .map_err(ApiError::from)?;
+    let healths = tokio::task::spawn_blocking(storage::list_provider_healths)
+        .await
+        .context("Failed to join provider health task")?
+        .map_err(ApiError::from)?;
+    let connection = connections
+        .iter()
+        .find(|connection| connection.provider == provider);
+    let cooldown = cooldowns
+        .iter()
+        .find(|cooldown| cooldown.provider == provider);
+    let health = healths.iter().find(|health| health.provider == provider);
+
+    Ok(Json(provider_push_plan_payload(
         &state, provider, connection, cooldown, health,
     )))
 }
@@ -3257,6 +3322,127 @@ fn provider_preflight_payload(
     }
 }
 
+fn provider_push_plan_payload(
+    state: &LibraryState,
+    provider: ProviderKind,
+    connection: Option<&ProviderConnection>,
+    cooldown: Option<&ProviderCooldown>,
+    health: Option<&ProviderHealth>,
+) -> ProviderPushPlanDto {
+    ProviderPushPlanDto {
+        provider: provider.as_key().to_string(),
+        provider_name: provider.display_name().to_string(),
+        preflight: provider_preflight_payload(state, provider, connection, cooldown, health),
+        saved_tracks: push_saved_track_plan_section(state, provider),
+        playlist_entries: push_playlist_entry_plan_section(state, provider),
+        playlists: push_playlist_plan_section(state, provider),
+    }
+}
+
+fn push_saved_track_plan_section(
+    state: &LibraryState,
+    provider: ProviderKind,
+) -> PushPlanSectionDto {
+    let track_index = build_track_index(state);
+    let skipped_examples = state
+        .saved_tracks
+        .iter()
+        .filter_map(|entry| {
+            let track = track_index.get(entry.track_id.as_str())?;
+            if track.provider_links.contains_key(provider.as_key()) {
+                return None;
+            }
+            Some(conflict_track_dto(state, track))
+        })
+        .take(10)
+        .collect::<Vec<_>>();
+    let pushable = state
+        .saved_tracks
+        .iter()
+        .filter(|entry| indexed_track_has_provider_link(&track_index, &entry.track_id, provider))
+        .count();
+
+    PushPlanSectionDto {
+        total: state.saved_tracks.len(),
+        pushable,
+        skipped_missing_identity: state.saved_tracks.len().saturating_sub(pushable),
+        skipped_examples,
+    }
+}
+
+fn push_playlist_entry_plan_section(
+    state: &LibraryState,
+    provider: ProviderKind,
+) -> PushPlanSectionDto {
+    let track_index = build_track_index(state);
+    let total = state.playlist_entry_count();
+    let mut pushable = 0;
+    let mut skipped_examples = Vec::new();
+
+    for entry in state
+        .playlists
+        .iter()
+        .flat_map(|playlist| playlist.entries.iter())
+    {
+        let Some(track) = track_index.get(entry.track_id.as_str()) else {
+            continue;
+        };
+        if track.provider_links.contains_key(provider.as_key()) {
+            pushable += 1;
+        } else if skipped_examples.len() < 10 {
+            skipped_examples.push(conflict_track_dto(state, track));
+        }
+    }
+
+    PushPlanSectionDto {
+        total,
+        pushable,
+        skipped_missing_identity: total.saturating_sub(pushable),
+        skipped_examples,
+    }
+}
+
+fn push_playlist_plan_section(
+    state: &LibraryState,
+    provider: ProviderKind,
+) -> PushPlaylistPlanSectionDto {
+    let track_index = build_track_index(state);
+    let provider_key = provider.as_key();
+    let mut examples = Vec::new();
+    let mut linked = 0;
+
+    for playlist in &state.playlists {
+        let playlist_linked = playlist.provider_links.contains_key(provider_key);
+        if playlist_linked {
+            linked += 1;
+        }
+        let missing_entries = playlist
+            .entries
+            .iter()
+            .filter(|entry| {
+                !indexed_track_has_provider_link(&track_index, &entry.track_id, provider)
+            })
+            .count();
+
+        if examples.len() < 10 && (!playlist_linked || missing_entries > 0) {
+            examples.push(PushPlaylistPlanItemDto {
+                playlist_id: playlist.id.clone(),
+                name: playlist.name.clone(),
+                entry_count: playlist.entries.len(),
+                linked: playlist_linked,
+                missing_entries,
+            });
+        }
+    }
+
+    PushPlaylistPlanSectionDto {
+        total: state.playlists.len(),
+        linked,
+        unlinked: state.playlists.len().saturating_sub(linked),
+        examples,
+    }
+}
+
 fn random_state() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -4672,7 +4858,7 @@ mod tests {
     use super::{
         coverage_matches, extract_retry_after_seconds, identity_conflict_rows, identity_gap_rows,
         normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
-        provider_preflight_payload, raw_table_value_to_string,
+        provider_preflight_payload, provider_push_plan_payload, raw_table_value_to_string,
     };
 
     #[test]
@@ -5123,6 +5309,95 @@ mod tests {
             .blockers
             .iter()
             .any(|blocker| blocker.contains("connection check failed")));
+    }
+
+    #[test]
+    fn push_plan_matches_preflight_and_lists_skipped_identity_examples() {
+        let now = Utc::now();
+        let mut linked_track = test_track("track-linked", "Sirius");
+        linked_track.provider_links.insert(
+            ProviderKind::Spotify.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: "spotify-track-1".to_string(),
+                source: LinkSource::Export,
+                confidence: Some(1.0),
+                linked_at: now,
+                last_seen_at: Some(now),
+            },
+        );
+
+        let mut state = LibraryState::new();
+        state.tracks.push(linked_track);
+        state
+            .tracks
+            .push(test_track("track-missing", "No Spotify ID"));
+        state.saved_tracks.push(SavedTrackEntry {
+            id: "saved-linked".to_string(),
+            track_id: "track-linked".to_string(),
+            added_at: None,
+            provider_state: BTreeMap::new(),
+        });
+        state.saved_tracks.push(SavedTrackEntry {
+            id: "saved-missing".to_string(),
+            track_id: "track-missing".to_string(),
+            added_at: None,
+            provider_state: BTreeMap::new(),
+        });
+        state.playlists.push(PlaylistEntity {
+            id: "playlist-1".to_string(),
+            name: "Favorites".to_string(),
+            description: None,
+            provider_links: BTreeMap::new(),
+            provider_state: BTreeMap::new(),
+            entries: vec![
+                PlaylistEntry {
+                    id: "entry-linked".to_string(),
+                    track_id: "track-linked".to_string(),
+                    added_at: None,
+                    provider_state: BTreeMap::new(),
+                },
+                PlaylistEntry {
+                    id: "entry-missing".to_string(),
+                    track_id: "track-missing".to_string(),
+                    added_at: None,
+                    provider_state: BTreeMap::new(),
+                },
+            ],
+        });
+        let connection = ProviderConnection {
+            provider: ProviderKind::Spotify,
+            connected_at: now,
+            updated_at: now,
+            config: ProviderConnectionConfig::Spotify(SpotifyConnectionConfig {
+                client_id: "client".to_string(),
+                client_secret: "secret".to_string(),
+                refresh_token: "refresh".to_string(),
+            }),
+        };
+
+        let plan = provider_push_plan_payload(
+            &state,
+            ProviderKind::Spotify,
+            Some(&connection),
+            None,
+            None,
+        );
+
+        assert!(plan.preflight.can_push);
+        assert_eq!(plan.saved_tracks.total, 2);
+        assert_eq!(plan.saved_tracks.pushable, 1);
+        assert_eq!(plan.saved_tracks.skipped_missing_identity, 1);
+        assert_eq!(
+            plan.saved_tracks.skipped_examples[0].track_id,
+            "track-missing"
+        );
+        assert_eq!(plan.playlist_entries.total, 2);
+        assert_eq!(plan.playlist_entries.pushable, 1);
+        assert_eq!(plan.playlist_entries.skipped_missing_identity, 1);
+        assert_eq!(plan.playlists.total, 1);
+        assert_eq!(plan.playlists.linked, 0);
+        assert_eq!(plan.playlists.unlinked, 1);
+        assert_eq!(plan.playlists.examples[0].missing_entries, 1);
     }
 
     fn test_track(id: &str, title: &str) -> TrackEntity {

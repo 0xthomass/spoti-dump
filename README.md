@@ -171,6 +171,7 @@ The main interface is an editable source-of-truth console for:
 - resolving provider identities and deduplicating canonical track rows from a dedicated library-wide maintenance action
 - reviewing identity conflicts in a queue before explicitly merging rows and choosing which provider IDs win
 - reviewing provider ID gaps in a queue and opening the affected canonical row for manual Spotify or YouTube Music ID repair
+- generating a provider push plan before mutating a destination account, including pushable counts, skipped identity gaps, playlist risk examples, and reset blockers
 - starting outward syncs from the canonical database into connected providers
 - reviewing provider coverage and unmatched pressure
 - backfilling missing track artwork into the database from provider-backed identifiers
@@ -182,6 +183,8 @@ The main interface is an editable source-of-truth console for:
 - browsing and paging without full-page reloads
 
 Provider imports remain append-only with respect to the canonical database. Explicit deletes in the app are authoritative and the runtime immediately tries to propagate those deletes to every connected provider that has a linked saved track or playlist.
+
+Before pushing, use each provider card's Push Plan action to inspect what will be applied and what will be skipped. The plan is read-only and does not call Spotify or YouTube Music; it derives from the current source-of-truth database and provider connection health.
 
 By default it listens on `http://127.0.0.1:7878/app/` and tries to open a browser automatically. If the frontend bundle is missing, the `ui` command will try to build it from `frontend/` before starting the server.
 

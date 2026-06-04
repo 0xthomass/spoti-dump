@@ -186,6 +186,37 @@ type ProviderPreflight = {
   track_ids_missing: number
 }
 
+type ProviderPushPlan = {
+  provider: string
+  provider_name: string
+  preflight: ProviderPreflight
+  saved_tracks: PushPlanSection
+  playlist_entries: PushPlanSection
+  playlists: PushPlaylistPlanSection
+}
+
+type PushPlanSection = {
+  total: number
+  pushable: number
+  skipped_missing_identity: number
+  skipped_examples: ConflictTrack[]
+}
+
+type PushPlaylistPlanSection = {
+  total: number
+  linked: number
+  unlinked: number
+  examples: PushPlaylistPlanItem[]
+}
+
+type PushPlaylistPlanItem = {
+  playlist_id: string
+  name: string
+  entry_count: number
+  linked: boolean
+  missing_entries: number
+}
+
 const YOUTUBE_HEADERS_SAMPLE = `{
   "cookie": "SAPISID=your_cookie_here; __Secure-3PAPISID=your_cookie_here; SID=your_cookie_here",
   "x-goog-authuser": "paste_from_request",
@@ -741,12 +772,63 @@ function SidebarMetric({ label, value }: { label: string; value: number }) {
   )
 }
 
+function PushPlanSummary({ plan }: { plan: ProviderPushPlan }) {
+  return (
+    <div className="push-plan">
+      <div className="readiness-head">
+        <span>Push plan</span>
+        <strong>{plan.provider_name}</strong>
+      </div>
+      <div className="readiness-grid">
+        <ReadinessItem
+          label="Saved tracks"
+          ready={plan.saved_tracks.pushable}
+          blocked={plan.saved_tracks.skipped_missing_identity}
+        />
+        <ReadinessItem
+          label="Playlist entries"
+          ready={plan.playlist_entries.pushable}
+          blocked={plan.playlist_entries.skipped_missing_identity}
+        />
+        <ReadinessItem
+          label="Playlists"
+          ready={plan.playlists.linked}
+          blocked={plan.playlists.unlinked}
+        />
+      </div>
+      {plan.saved_tracks.skipped_examples.length > 0 ? (
+        <div className="push-plan-examples">
+          <strong>Skipped saved-track examples</strong>
+          {plan.saved_tracks.skipped_examples.slice(0, 3).map((track) => (
+            <span key={`saved-${track.track_id}`}>
+              {track.title || 'Untitled'} · {track.artist_summary || 'Unknown artist'}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {plan.playlists.examples.length > 0 ? (
+        <div className="push-plan-examples">
+          <strong>Playlist risks</strong>
+          {plan.playlists.examples.slice(0, 3).map((playlist) => (
+            <span key={playlist.playlist_id}>
+              {playlist.name}: {playlist.linked ? 'linked' : 'unlinked'}, {playlist.missing_entries}{' '}
+              missing entries
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function OverviewPage() {
   const { revision, refresh, notify, openOperation } = useRuntime()
   const confirm = useConfirm()
   const [spotifyModalOpen, setSpotifyModalOpen] = useState(false)
   const [youtubeModalOpen, setYoutubeModalOpen] = useState(false)
   const [pendingAction, setPendingAction] = useState<string | null>(null)
+  const [pushPlans, setPushPlans] = useState<Record<string, ProviderPushPlan>>({})
+  const [loadingPushPlan, setLoadingPushPlan] = useState<string | null>(null)
   const overviewResource = useApiResource<Overview>('/overview', revision)
   const providersResource = useApiResource<ProvidersResponse>('/providers', revision)
 
@@ -858,6 +940,20 @@ function OverviewPage() {
       notify(error instanceof Error ? error.message : 'Identity sync failed.')
     } finally {
       setPendingAction(null)
+    }
+  }
+
+  async function loadPushPlan(provider: ProviderConnectionState) {
+    setLoadingPushPlan(provider.key)
+    try {
+      const payload = await apiRequest<ProviderPushPlan>(
+        `/providers/${provider.key}/push-plan`,
+      )
+      setPushPlans((current) => ({ ...current, [provider.key]: payload }))
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Failed to load push plan.')
+    } finally {
+      setLoadingPushPlan(null)
     }
   }
 
@@ -1044,6 +1140,7 @@ function OverviewPage() {
                   : identityGap > 0
                     ? 'Ready, with identity gaps'
                     : 'Ready to push'
+            const pushPlan = pushPlans[provider.key]
             return (
               <div className="provider-card provider-card--control" key={provider.key}>
                 <header>
@@ -1154,6 +1251,7 @@ function OverviewPage() {
                       . Push will skip tracks without a {provider.name} ID.
                     </p>
                   ) : null}
+                  {pushPlan ? <PushPlanSummary plan={pushPlan} /> : null}
                 </div>
                 <div className="provider-actions">
                   <button
@@ -1209,6 +1307,14 @@ function OverviewPage() {
                     title={preflightTitle}
                   >
                     {pendingAction === `${provider.key}:sync` ? 'Pushing…' : 'Push Changes'}
+                  </button>
+                  <button
+                    className="provider-action-button provider-action-button--secondary"
+                    disabled={loadingPushPlan !== null}
+                    onClick={() => void loadPushPlan(provider)}
+                    type="button"
+                  >
+                    {loadingPushPlan === provider.key ? 'Planning…' : 'Push Plan'}
                   </button>
                   {provider.key === 'spotify' ? (
                     <button
