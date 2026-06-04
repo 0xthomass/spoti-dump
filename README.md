@@ -132,6 +132,7 @@ This is the library-wide reconciliation pass. It searches the selected provider 
 Run this before pushing when the database has provider-only tracks, such as YouTube Music-only tracks that still need Spotify IDs. Push commands do not perform catalog search; they apply the provider IDs already stored in `dump/library.db`.
 
 The web app exposes the same maintenance step from Overview → Resolve Missing IDs. That library-wide job attempts Spotify and YouTube Music in sequence, skips providers that are unlinked, cooling down, or failing connection checks, and reports those skips in the operation warnings.
+After identity sync, use the ID Gaps page to inspect remaining tracks that are still missing Spotify or YouTube Music IDs. Rows with saved-track or playlist references are prioritized because those gaps directly reduce push coverage. Open a row from that page to paste a verified provider track URL or ID into the manual Identity Repair form.
 
 ### Sync providers directly
 
@@ -169,6 +170,7 @@ The main interface is an editable source-of-truth console for:
 - starting provider imports into the canonical database from the app
 - resolving provider identities and deduplicating canonical track rows from a dedicated library-wide maintenance action
 - reviewing identity conflicts in a queue before explicitly merging rows and choosing which provider IDs win
+- reviewing provider ID gaps in a queue and opening the affected canonical row for manual Spotify or YouTube Music ID repair
 - starting outward syncs from the canonical database into connected providers
 - reviewing provider coverage and unmatched pressure
 - backfilling missing track artwork into the database from provider-backed identifiers

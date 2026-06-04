@@ -323,6 +323,13 @@ type IdentityConflictQueueItem = {
   conflict: TrackIdentityConflict
 }
 
+type IdentityGapQueueItem = {
+  provider: string
+  provider_name: string
+  track: ConflictTrack
+  push_blocking: boolean
+}
+
 type PlaylistSummary = {
   playlist_id: string
   name: string
@@ -565,6 +572,7 @@ function App() {
             <Route path="/saved-tracks" element={<SavedTracksPage />} />
             <Route path="/tracks" element={<TracksPage />} />
             <Route path="/identity-conflicts" element={<IdentityConflictsPage />} />
+            <Route path="/identity-gaps" element={<IdentityGapsPage />} />
             <Route path="/playlists" element={<PlaylistsPage />} />
             <Route path="/playlists/:playlistId" element={<PlaylistsPage />} />
             <Route path="/safety" element={<SafetyPage />} />
@@ -600,6 +608,8 @@ function Shell({ children }: { children: ReactNode }) {
       ? `${overview?.playlists ?? 0} playlists`
       : location.pathname.indexOf('/identity-conflicts') >= 0
         ? `${overview?.identity_conflicts ?? 0} conflicts`
+        : location.pathname.indexOf('/identity-gaps') >= 0
+          ? 'ID gaps'
       : location.pathname.indexOf('/tracks') >= 0
         ? `${overview?.tracks ?? 0} tracks`
         : `${overview?.saved_tracks ?? 0} saved tracks`
@@ -633,6 +643,11 @@ function Shell({ children }: { children: ReactNode }) {
             to="/identity-conflicts"
             label="Conflicts"
             copy="Review merges"
+          />
+          <SidebarLink
+            to="/identity-gaps"
+            label="ID Gaps"
+            copy="Repair coverage"
           />
           <SidebarLink
             to="/overview"
@@ -1132,8 +1147,11 @@ function OverviewPage() {
                     </ul>
                   ) : identityGap > 0 ? (
                     <p>
-                      Run Resolve IDs before pushing to improve coverage. Push will skip tracks
-                      without a {provider.name} ID.
+                      Run Resolve IDs before pushing to improve coverage, then review{' '}
+                      <Link to={`/identity-gaps?provider=${provider.key}`}>
+                        missing {provider.name} IDs
+                      </Link>
+                      . Push will skip tracks without a {provider.name} ID.
                     </p>
                   ) : null}
                 </div>
@@ -1831,6 +1849,169 @@ function TracksPage() {
               onEdit={(item) => setEditingTrackId(item.track_id)}
               onDelete={(item) => void deleteTrack(item)}
             />
+            <Pagination
+              page={resource.data.page}
+              totalPages={resource.data.total_pages}
+              onPageChange={(nextPage) => {
+                const next = new URLSearchParams(searchParams)
+                next.set('page', String(nextPage))
+                startTransition(() => setSearchParams(next))
+              }}
+            />
+          </>
+        )}
+      </section>
+
+      {editingTrackId ? (
+        <TrackEditorModal
+          trackId={editingTrackId}
+          onClose={() => setEditingTrackId(null)}
+        />
+      ) : null}
+    </section>
+  )
+}
+
+function IdentityGapsPage() {
+  const { revision } = useRuntime()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [draft, setDraft] = useState(searchParams.get('q') ?? '')
+  const [editingTrackId, setEditingTrackId] = useState<string | null>(null)
+  const page = parsePage(searchParams.get('page'))
+  const query = searchParams.get('q') ?? ''
+  const provider = searchParams.get('provider') ?? ''
+
+  useEffect(() => {
+    setDraft(query)
+  }, [query])
+
+  const resource = useApiResource<PageResponse<IdentityGapQueueItem>>(
+    `/identity/gaps?page=${page}${provider ? `&provider=${encodeURIComponent(provider)}` : ''}${
+      query ? `&q=${encodeURIComponent(query)}` : ''
+    }`,
+    revision,
+  )
+
+  function submitSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const next = new URLSearchParams(searchParams)
+    if (draft.trim()) {
+      next.set('q', draft.trim())
+    } else {
+      next.delete('q')
+    }
+    next.set('page', '1')
+    startTransition(() => setSearchParams(next))
+  }
+
+  function changeProvider(nextProvider: string) {
+    const next = new URLSearchParams(searchParams)
+    if (nextProvider) {
+      next.set('provider', nextProvider)
+    } else {
+      next.delete('provider')
+    }
+    next.set('page', '1')
+    startTransition(() => setSearchParams(next))
+  }
+
+  return (
+    <section className="page-stack">
+      <PageHero
+        eyebrow="Provider ID Gaps"
+        title="Repair push coverage."
+        copy="Find canonical tracks that still need Spotify or YouTube Music IDs before a complete migration push."
+      >
+        <HeroStat
+          label="Showing"
+          value={
+            resource.data
+              ? `${resource.data.items.length} of ${formatNumber(resource.data.total)}`
+              : '...'
+          }
+        />
+        <HeroStat label="Provider" value={identityGapProviderLabel(provider)} />
+      </PageHero>
+
+      <section className="panel">
+        <div className="panel-head panel-head--stack">
+          <div>
+            <span className="eyebrow">Repair</span>
+            <h2>Missing Provider IDs</h2>
+          </div>
+          <form className="searchbar" onSubmit={submitSearch}>
+            <input
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              placeholder="Search title, artist, album"
+              type="search"
+            />
+            <button type="submit">Search</button>
+          </form>
+          <div className="filter-row">
+            {[
+              ['', 'All'],
+              ['spotify', 'Missing Spotify'],
+              ['youtube-music', 'Missing YouTube Music'],
+            ].map(([value, label]) => (
+              <button
+                className={`filter-pill${provider === value ? ' filter-pill--active' : ''}`}
+                key={value || 'all'}
+                onClick={() => changeProvider(value)}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {resource.loading && !resource.data ? (
+          <LoadingState label="Loading provider ID gaps" compact />
+        ) : resource.error || !resource.data ? (
+          <ErrorState message={resource.error ?? 'Failed to load ID gaps.'} compact />
+        ) : resource.data.items.length === 0 ? (
+          <EmptyState
+            title="No ID gaps matched"
+            copy="Broaden the search, change provider, or run Resolve Missing IDs again."
+          />
+        ) : (
+          <>
+            <div className="conflict-list">
+              {resource.data.items.map((item) => (
+                <article
+                  className="conflict-card"
+                  key={`${item.provider}:${item.track.track_id}`}
+                >
+                  <div className="conflict-card-head">
+                    <div>
+                      <span className="eyebrow">Missing {item.provider_name} ID</span>
+                      <h3>{item.track.title}</h3>
+                    </div>
+                    <span
+                      className={`status-chip ${
+                        item.push_blocking ? 'status-chip--warning' : 'status-chip--local'
+                      }`}
+                    >
+                      {item.push_blocking ? 'Affects push' : 'No push refs'}
+                    </span>
+                  </div>
+                  <div className="conflict-track-grid conflict-track-grid--single">
+                    <ConflictTrackCard
+                      label="Canonical row"
+                      onEdit={() => setEditingTrackId(item.track.track_id)}
+                      track={item.track}
+                    />
+                  </div>
+                  <div className="conflict-detail">
+                    <p>
+                      This row is missing a {item.provider_name} identity. Open the row and paste
+                      the correct {item.provider_name} track URL or ID in the Identity Repair form.
+                    </p>
+                  </div>
+                </article>
+              ))}
+            </div>
             <Pagination
               page={resource.data.page}
               totalPages={resource.data.total_pages}
@@ -3647,6 +3828,16 @@ function coverageLabel(value: string) {
     return 'Unmatched'
   }
   return 'All coverage'
+}
+
+function identityGapProviderLabel(value: string) {
+  if (value === 'spotify') {
+    return 'Spotify'
+  }
+  if (value === 'youtube-music') {
+    return 'YouTube Music'
+  }
+  return 'All providers'
 }
 
 export default App

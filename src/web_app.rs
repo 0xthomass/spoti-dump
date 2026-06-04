@@ -474,6 +474,13 @@ struct IdentityConflictsQuery {
 }
 
 #[derive(Default, Deserialize)]
+struct IdentityGapsQuery {
+    provider: Option<ProviderKind>,
+    q: Option<String>,
+    page: Option<usize>,
+}
+
+#[derive(Default, Deserialize)]
 struct PlaylistsQuery {
     q: Option<String>,
     page: Option<usize>,
@@ -717,6 +724,14 @@ struct ProviderLinkConflictDto {
 struct TrackIdentityConflictQueueItemDto {
     source_track: ConflictTrackDto,
     conflict: TrackIdentityConflictDto,
+}
+
+#[derive(Clone, Serialize)]
+struct TrackIdentityGapQueueItemDto {
+    provider: String,
+    provider_name: String,
+    track: ConflictTrackDto,
+    push_blocking: bool,
 }
 
 #[derive(Serialize)]
@@ -1003,6 +1018,7 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         )
         .route("/identity/start", post(api_start_library_identity))
         .route("/identity/conflicts", get(api_identity_conflicts))
+        .route("/identity/gaps", get(api_identity_gaps))
         .route(
             "/providers/:provider/sync/start",
             post(api_start_provider_sync),
@@ -2034,6 +2050,34 @@ async fn api_identity_conflicts(
     if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
         write_state(state.clone()).await?;
         rows = identity_conflict_rows(&state, query.q.as_deref());
+        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+    }
+
+    Ok(Json(PageResponse::new(
+        page_rows,
+        rows.len(),
+        page,
+        PAGE_SIZE,
+    )))
+}
+
+async fn api_identity_gaps(
+    State(context): State<Arc<AppContext>>,
+    Query(query): Query<IdentityGapsQuery>,
+) -> Result<Json<PageResponse<TrackIdentityGapQueueItemDto>>, ApiError> {
+    let _state_guard = context.state_mutation.lock().await;
+    let mut state = read_state().await?;
+    let page = normalized_page(query.page);
+    let mut rows = identity_gap_rows(&state, query.provider, query.q.as_deref());
+    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+    let track_ids = page_rows
+        .iter()
+        .map(|item| item.track.track_id.clone())
+        .collect::<Vec<_>>();
+
+    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
+        write_state(state.clone()).await?;
+        rows = identity_gap_rows(&state, query.provider, query.q.as_deref());
         page_rows = paginate_vec(&rows, page, PAGE_SIZE);
     }
 
@@ -3556,6 +3600,68 @@ fn identity_conflict_rows(
     rows
 }
 
+fn identity_gap_rows(
+    state: &LibraryState,
+    provider_filter: Option<ProviderKind>,
+    query: Option<&str>,
+) -> Vec<TrackIdentityGapQueueItemDto> {
+    let query_filter = normalized_query(query);
+    let providers = provider_filter
+        .map(|provider| vec![provider])
+        .unwrap_or_else(|| ProviderKind::all().to_vec());
+    let mut rows = Vec::new();
+
+    for track in &state.tracks {
+        let track_dto = conflict_track_dto(state, track);
+        for provider in &providers {
+            if track.provider_links.contains_key(provider.as_key()) {
+                continue;
+            }
+            if !query_matches(
+                query_filter.as_deref(),
+                &[
+                    &track_dto.title,
+                    &track_dto.artist_summary,
+                    track_dto.album.as_deref().unwrap_or(""),
+                    provider.display_name(),
+                ],
+            ) {
+                continue;
+            }
+
+            let push_blocking = track_dto.saved_count > 0 || track_dto.playlist_refs > 0;
+            rows.push(TrackIdentityGapQueueItemDto {
+                provider: provider.as_key().to_string(),
+                provider_name: provider.display_name().to_string(),
+                track: track_dto.clone(),
+                push_blocking,
+            });
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        right
+            .push_blocking
+            .cmp(&left.push_blocking)
+            .then_with(|| right.track.saved_count.cmp(&left.track.saved_count))
+            .then_with(|| right.track.playlist_refs.cmp(&left.track.playlist_refs))
+            .then_with(|| left.provider.cmp(&right.provider))
+            .then_with(|| {
+                left.track
+                    .title
+                    .to_lowercase()
+                    .cmp(&right.track.title.to_lowercase())
+            })
+            .then_with(|| {
+                left.track
+                    .artist_summary
+                    .to_lowercase()
+                    .cmp(&right.track.artist_summary.to_lowercase())
+            })
+    });
+    rows
+}
+
 fn build_track_detail(state: &LibraryState, track_id: &str) -> Result<TrackDetailDto, ApiError> {
     let track = state
         .tracks
@@ -4564,7 +4670,7 @@ mod tests {
     };
 
     use super::{
-        coverage_matches, extract_retry_after_seconds, identity_conflict_rows,
+        coverage_matches, extract_retry_after_seconds, identity_conflict_rows, identity_gap_rows,
         normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
         provider_preflight_payload, raw_table_value_to_string,
     };
@@ -4847,6 +4953,68 @@ mod tests {
             &state.tracks[0],
             Some("identity-conflicts")
         ));
+    }
+
+    #[test]
+    fn identity_gap_queue_filters_provider_and_prioritizes_push_blocking_rows() {
+        let now = Utc::now();
+        let mut state = LibraryState::new();
+        state.tracks.push(test_track_with_link(
+            "unused-spotify-only",
+            "Unused",
+            ProviderKind::Spotify,
+            "spotify-unused",
+            now,
+        ));
+        state.tracks.push(test_track_with_link(
+            "saved-spotify-only",
+            "Saved Missing",
+            ProviderKind::Spotify,
+            "spotify-saved",
+            now,
+        ));
+        state.tracks.push(test_track_with_link(
+            "playlist-youtube-only",
+            "Playlist Missing",
+            ProviderKind::YoutubeMusic,
+            "youtube-playlist",
+            now,
+        ));
+        state.saved_tracks.push(SavedTrackEntry {
+            id: "saved-1".to_string(),
+            track_id: "saved-spotify-only".to_string(),
+            added_at: None,
+            provider_state: BTreeMap::new(),
+        });
+        state.playlists.push(PlaylistEntity {
+            id: "playlist-1".to_string(),
+            name: "Favorites".to_string(),
+            description: None,
+            provider_links: BTreeMap::new(),
+            provider_state: BTreeMap::new(),
+            entries: vec![PlaylistEntry {
+                id: "entry-1".to_string(),
+                track_id: "playlist-youtube-only".to_string(),
+                added_at: None,
+                provider_state: BTreeMap::new(),
+            }],
+        });
+
+        let youtube_gaps = identity_gap_rows(&state, Some(ProviderKind::YoutubeMusic), None);
+        assert_eq!(youtube_gaps.len(), 2);
+        assert_eq!(youtube_gaps[0].track.track_id, "saved-spotify-only");
+        assert!(youtube_gaps[0].push_blocking);
+        assert_eq!(youtube_gaps[1].track.track_id, "unused-spotify-only");
+        assert!(!youtube_gaps[1].push_blocking);
+
+        let spotify_gaps = identity_gap_rows(&state, Some(ProviderKind::Spotify), None);
+        assert_eq!(spotify_gaps.len(), 1);
+        assert_eq!(spotify_gaps[0].track.track_id, "playlist-youtube-only");
+        assert!(spotify_gaps[0].push_blocking);
+
+        let searched = identity_gap_rows(&state, None, Some("playlist"));
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].provider, ProviderKind::Spotify.as_key());
     }
 
     #[test]

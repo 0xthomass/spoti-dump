@@ -831,6 +831,10 @@ code {
   gap: 14px;
 }
 
+.conflict-track-grid--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .conflict-track-card {
   display: grid;
   gap: 10px;
