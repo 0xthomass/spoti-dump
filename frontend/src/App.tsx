@@ -367,6 +367,38 @@ type MergeTrackResponse = {
   }[]
 }
 
+type BulkMergeIdentityConflictsPlan = {
+  eligible_count: number
+  examples: IdentityConflictQueueItem[]
+  warnings: string[]
+}
+
+type BulkMergeIdentityConflictsResponse = {
+  message: string
+  eligible_count: number
+  merged_count: number
+  skipped_count: number
+  resolved_provider_conflicts: number
+  conflict_resolution: string
+  conflict_resolution_label: string
+  pre_merge_backup_path: string
+  merged_examples: {
+    source_track_id: string
+    target_track_id: string
+    title: string
+    provider: string
+    provider_id: string
+    resolved_conflicts: {
+      provider: string
+      provider_name: string
+      kept_provider_id: string
+      dropped_provider_id: string
+      kept_from_source: boolean
+    }[]
+  }[]
+  warnings: string[]
+}
+
 type IdentityConflictQueueItem = {
   source_track: ConflictTrack
   conflict: TrackIdentityConflict
@@ -486,6 +518,19 @@ function actionMessage(payload: ActionResponse) {
     return payload.message
   }
   return `${payload.message}\n${payload.warnings.map((warning) => `• ${warning}`).join('\n')}`
+}
+
+function bulkMergeMessage(payload: BulkMergeIdentityConflictsResponse) {
+  const lines = [
+    payload.message,
+    `Manual backup: ${payload.pre_merge_backup_path}`,
+    `Resolved provider ID conflicts: ${formatNumber(payload.resolved_provider_conflicts)}`,
+  ]
+  if (payload.skipped_count > 0) {
+    lines.push(`Skipped stale or capped rows: ${formatNumber(payload.skipped_count)}`)
+  }
+  lines.push(...payload.warnings.map((warning) => `• ${warning}`))
+  return lines.join('\n')
 }
 
 function useApiResource<T>(path: string | null, revision: number) {
@@ -2167,22 +2212,37 @@ function IdentityConflictsPage() {
   const [editingTrackId, setEditingTrackId] = useState<string | null>(null)
   const [mergingConflict, setMergingConflict] = useState<string | null>(null)
   const [rejectingConflict, setRejectingConflict] = useState<string | null>(null)
+  const [runningBulkMerge, setRunningBulkMerge] = useState<string | null>(null)
   const page = parsePage(searchParams.get('page'))
   const query = searchParams.get('q') ?? ''
   const provider = searchParams.get('provider') ?? ''
   const recommendation = searchParams.get('recommendation') ?? ''
   const impact = searchParams.get('impact') ?? ''
+  const canBulkMergeRecommendation =
+    recommendation === '' || recommendation === 'likely_same_recording'
 
   useEffect(() => {
     setDraft(query)
   }, [query])
 
   const resource = useApiResource<PageResponse<IdentityConflictQueueItem>>(
-    `/identity/conflicts?page=${page}${
-      provider ? `&provider=${encodeURIComponent(provider)}` : ''
-    }${recommendation ? `&recommendation=${encodeURIComponent(recommendation)}` : ''}${
-      impact ? `&impact=${encodeURIComponent(impact)}` : ''
-    }${query ? `&q=${encodeURIComponent(query)}` : ''}`,
+    `/identity/conflicts?${identityConflictQueryString({
+      page,
+      query,
+      provider,
+      recommendation,
+      impact,
+    })}`,
+    revision,
+  )
+  const bulkPlan = useApiResource<BulkMergeIdentityConflictsPlan>(
+    canBulkMergeRecommendation
+      ? `/identity/conflicts/bulk-merge-plan?${identityConflictQueryString({
+          query,
+          provider,
+          impact,
+        })}`
+      : null,
     revision,
   )
 
@@ -2285,6 +2345,53 @@ function IdentityConflictsPage() {
     }
   }
 
+  async function bulkMergeLikelySame(
+    conflictResolution: 'keep_source' | 'keep_target',
+  ) {
+    if (!bulkPlan.data || bulkPlan.data.eligible_count === 0) {
+      return
+    }
+    const keepSource = conflictResolution === 'keep_source'
+    const accepted = await confirm({
+      title: keepSource
+        ? 'Bulk merge likely-same rows and keep source IDs?'
+        : 'Bulk merge likely-same rows and keep candidate IDs?',
+      message: `This will merge ${formatNumber(
+        bulkPlan.data.eligible_count,
+      )} likely-same identity conflict(s) matching the current search, provider, and impact filters.`,
+      details: keepSource
+        ? 'The app creates a manual source-of-truth backup first. Saved tracks and playlist entries move to the candidate rows. For conflicting providers, source row provider IDs win. Provider accounts are not changed.'
+        : 'The app creates a manual source-of-truth backup first. Saved tracks and playlist entries move to the candidate rows. For conflicting providers, candidate row provider IDs win. Provider accounts are not changed.',
+      confirmLabel: keepSource ? 'Bulk merge, keep source' : 'Bulk merge, keep candidate',
+      tone: 'danger',
+    })
+    if (!accepted) {
+      return
+    }
+
+    setRunningBulkMerge(conflictResolution)
+    try {
+      const payload = await apiRequest<BulkMergeIdentityConflictsResponse>(
+        '/identity/conflicts/bulk-merge',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            q: query || null,
+            provider: provider || null,
+            impact: impact || null,
+            conflict_resolution: conflictResolution,
+          }),
+        },
+      )
+      notify(bulkMergeMessage(payload))
+      refresh()
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Bulk merge failed.')
+    } finally {
+      setRunningBulkMerge(null)
+    }
+  }
+
   return (
     <section className="page-stack">
       <PageHero
@@ -2374,6 +2481,24 @@ function IdentityConflictsPage() {
               </button>
             ))}
           </div>
+          {canBulkMergeRecommendation ? (
+            <BulkMergeConflictPanel
+              plan={bulkPlan.data}
+              loading={bulkPlan.loading}
+              error={bulkPlan.error}
+              running={runningBulkMerge}
+              onMerge={(resolution) => void bulkMergeLikelySame(resolution)}
+            />
+          ) : (
+            <div className="conflict-bulk-panel">
+              <strong>Bulk merge unavailable for this recommendation filter</strong>
+              <p>
+                Bulk merging is intentionally limited to conflicts classified as likely same
+                recording. Switch the recommendation filter back to All or Likely same to plan a
+                guarded bulk merge.
+              </p>
+            </div>
+          )}
         </div>
 
         {resource.loading && !resource.data ? (
@@ -2488,6 +2613,99 @@ function IdentityConflictsPage() {
         />
       ) : null}
     </section>
+  )
+}
+
+function BulkMergeConflictPanel({
+  plan,
+  loading,
+  error,
+  running,
+  onMerge,
+}: {
+  plan: BulkMergeIdentityConflictsPlan | null
+  loading: boolean
+  error: string | null
+  running: string | null
+  onMerge: (resolution: 'keep_source' | 'keep_target') => void
+}) {
+  if (loading && !plan) {
+    return (
+      <div className="conflict-bulk-panel">
+        <strong>Planning likely-same bulk merge…</strong>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="conflict-bulk-panel conflict-bulk-panel--warning">
+        <strong>Bulk merge plan failed</strong>
+        <p>{error}</p>
+      </div>
+    )
+  }
+
+  if (!plan || plan.eligible_count === 0) {
+    return (
+      <div className="conflict-bulk-panel">
+        <strong>No likely-same bulk merges in these filters</strong>
+        <p>
+          Bulk merge only considers conflicts classified as likely same recording. Adjust the
+          search, provider, or impact filter to review another subset.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="conflict-bulk-panel">
+      <div className="conflict-bulk-head">
+        <div>
+          <span className="eyebrow">Bulk Safety Plan</span>
+          <strong>{formatNumber(plan.eligible_count)} likely-same conflict(s)</strong>
+          <p>
+            The action creates a manual backup, re-checks every row before merging, and never
+            changes Spotify or YouTube Music accounts.
+          </p>
+        </div>
+        <div className="modal-actions modal-actions--inline">
+          <button
+            className="provider-action-button provider-action-button--secondary"
+            disabled={running !== null}
+            onClick={() => onMerge('keep_source')}
+            type="button"
+          >
+            {running === 'keep_source' ? 'Merging…' : 'Bulk merge, keep source IDs'}
+          </button>
+          <button
+            className="ghost-button"
+            disabled={running !== null}
+            onClick={() => onMerge('keep_target')}
+            type="button"
+          >
+            {running === 'keep_target' ? 'Merging…' : 'Bulk merge, keep candidate IDs'}
+          </button>
+        </div>
+      </div>
+      <div className="chip-row">
+        {plan.warnings.map((warning) => (
+          <span className="mini-chip mini-chip--warning" key={warning}>
+            {warning}
+          </span>
+        ))}
+      </div>
+      {plan.examples.length > 0 ? (
+        <div className="push-plan-examples">
+          <strong>First examples</strong>
+          {plan.examples.slice(0, 5).map((item) => (
+            <span key={`${item.source_track.track_id}:${item.conflict.provider_id}`}>
+              {item.source_track.title} → {item.conflict.owner_track.title}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -3944,6 +4162,38 @@ function parsePage(raw: string | null) {
   }
   const value = Number(raw)
   return Number.isFinite(value) && value > 0 ? value : 1
+}
+
+function identityConflictQueryString({
+  page,
+  query,
+  provider,
+  recommendation,
+  impact,
+}: {
+  page?: number
+  query?: string
+  provider?: string
+  recommendation?: string
+  impact?: string
+}) {
+  const params = new URLSearchParams()
+  if (page) {
+    params.set('page', String(page))
+  }
+  if (query) {
+    params.set('q', query)
+  }
+  if (provider) {
+    params.set('provider', provider)
+  }
+  if (recommendation) {
+    params.set('recommendation', recommendation)
+  }
+  if (impact) {
+    params.set('impact', impact)
+  }
+  return params.toString()
 }
 
 function formatNumber(value: number) {

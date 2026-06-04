@@ -37,6 +37,8 @@ use crate::storage;
 
 const PAGE_SIZE: usize = 50;
 const RAW_PAGE_SIZE: usize = 120;
+const BULK_IDENTITY_CONFLICT_EXAMPLE_LIMIT: usize = 10;
+const BULK_IDENTITY_CONFLICT_MERGE_LIMIT: usize = 250;
 
 struct AppContext {
     http_client: reqwest::Client,
@@ -827,6 +829,22 @@ struct MergeTrackRequest {
     conflict_resolution: MergeConflictResolutionChoice,
 }
 
+#[derive(Default, Deserialize)]
+struct BulkMergeIdentityConflictsPlanQuery {
+    q: Option<String>,
+    provider: Option<ProviderKind>,
+    impact: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BulkMergeIdentityConflictsRequest {
+    q: Option<String>,
+    provider: Option<ProviderKind>,
+    impact: Option<String>,
+    conflict_resolution: MergeConflictResolutionChoice,
+    max_merges: Option<usize>,
+}
+
 #[derive(Deserialize)]
 struct RejectTrackIdentityConflictRequest {
     provider: ProviderKind,
@@ -856,6 +874,37 @@ struct ResolvedProviderConflictDto {
     kept_provider_id: String,
     dropped_provider_id: String,
     kept_from_source: bool,
+}
+
+#[derive(Serialize)]
+struct BulkMergeIdentityConflictsPlanDto {
+    eligible_count: usize,
+    examples: Vec<TrackIdentityConflictQueueItemDto>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BulkMergeIdentityConflictsResponse {
+    message: String,
+    eligible_count: usize,
+    merged_count: usize,
+    skipped_count: usize,
+    resolved_provider_conflicts: usize,
+    conflict_resolution: String,
+    conflict_resolution_label: String,
+    pre_merge_backup_path: String,
+    merged_examples: Vec<BulkMergedIdentityConflictDto>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BulkMergedIdentityConflictDto {
+    source_track_id: String,
+    target_track_id: String,
+    title: String,
+    provider: String,
+    provider_id: String,
+    resolved_conflicts: Vec<ResolvedProviderConflictDto>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1082,6 +1131,14 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         )
         .route("/identity/start", post(api_start_library_identity))
         .route("/identity/conflicts", get(api_identity_conflicts))
+        .route(
+            "/identity/conflicts/bulk-merge-plan",
+            get(api_identity_conflicts_bulk_merge_plan),
+        )
+        .route(
+            "/identity/conflicts/bulk-merge",
+            post(api_identity_conflicts_bulk_merge),
+        )
         .route("/identity/gaps", get(api_identity_gaps))
         .route(
             "/providers/:provider/sync/start",
@@ -2313,10 +2370,7 @@ async fn api_merge_track(
     let _state_guard = context.state_mutation.lock().await;
     let mut state = read_state().await?;
     let now = Utc::now();
-    let resolution = match request.conflict_resolution {
-        MergeConflictResolutionChoice::KeepSource => TrackMergeConflictResolution::KeepSource,
-        MergeConflictResolutionChoice::KeepTarget => TrackMergeConflictResolution::KeepTarget,
-    };
+    let resolution = track_merge_conflict_resolution(request.conflict_resolution);
     let result = state
         .merge_track_into_resolving_conflicts(
             &source_track_id,
@@ -2328,17 +2382,7 @@ async fn api_merge_track(
     state.validate().map_err(ApiError::from)?;
     write_state(state).await?;
 
-    let resolved_conflicts = result
-        .resolved_conflicts
-        .iter()
-        .map(|conflict| ResolvedProviderConflictDto {
-            provider: conflict.provider_key.clone(),
-            provider_name: provider_display_name(&conflict.provider_key),
-            kept_provider_id: conflict.kept_provider_id.clone(),
-            dropped_provider_id: conflict.dropped_provider_id.clone(),
-            kept_from_source: conflict.kept_from_source,
-        })
-        .collect::<Vec<_>>();
+    let resolved_conflicts = resolved_provider_conflict_dtos(&result.resolved_conflicts);
     let conflict_count = resolved_conflicts.len();
 
     Ok(Json(MergeTrackResponse {
@@ -2350,6 +2394,212 @@ async fn api_merge_track(
         target_track_id: result.target_track_id,
         resolved_conflicts,
     }))
+}
+
+async fn api_identity_conflicts_bulk_merge_plan(
+    State(context): State<Arc<AppContext>>,
+    Query(query): Query<BulkMergeIdentityConflictsPlanQuery>,
+) -> Result<Json<BulkMergeIdentityConflictsPlanDto>, ApiError> {
+    let _state_guard = context.state_mutation.lock().await;
+    let state = read_state().await?;
+    let rows = bulk_merge_identity_conflict_rows(
+        &state,
+        query.q.as_deref(),
+        query.provider,
+        query.impact.as_deref(),
+    );
+
+    Ok(Json(BulkMergeIdentityConflictsPlanDto {
+        eligible_count: rows.len(),
+        examples: rows
+            .into_iter()
+            .take(BULK_IDENTITY_CONFLICT_EXAMPLE_LIMIT)
+            .collect(),
+        warnings: bulk_merge_identity_conflict_warnings(),
+    }))
+}
+
+async fn api_identity_conflicts_bulk_merge(
+    State(context): State<Arc<AppContext>>,
+    Json(request): Json<BulkMergeIdentityConflictsRequest>,
+) -> Result<Json<BulkMergeIdentityConflictsResponse>, ApiError> {
+    let _state_guard = context.state_mutation.lock().await;
+    let mut state = read_state().await?;
+    let candidates = bulk_merge_identity_conflict_rows(
+        &state,
+        request.q.as_deref(),
+        request.provider,
+        request.impact.as_deref(),
+    );
+    let eligible_count = candidates.len();
+    let max_merges = request
+        .max_merges
+        .unwrap_or(BULK_IDENTITY_CONFLICT_MERGE_LIMIT)
+        .min(BULK_IDENTITY_CONFLICT_MERGE_LIMIT);
+    let resolution = track_merge_conflict_resolution(request.conflict_resolution);
+    let backup = tokio::task::spawn_blocking(storage::create_manual_library_backup)
+        .await
+        .context("Failed to join pre-merge backup task")?
+        .map_err(ApiError::from)?;
+
+    let mut merged_examples = Vec::new();
+    let mut merged_count = 0_usize;
+    let mut skipped_count = eligible_count.saturating_sub(max_merges);
+    let mut resolved_provider_conflicts = 0_usize;
+    let mut warnings = bulk_merge_identity_conflict_warnings();
+
+    for candidate in candidates.into_iter().take(max_merges) {
+        let Some(active_conflict) = active_bulk_merge_identity_conflict(
+            &state,
+            &candidate.source_track.track_id,
+            &candidate.conflict.owner_track.track_id,
+            &candidate.conflict.provider,
+            &candidate.conflict.provider_id,
+        ) else {
+            skipped_count += 1;
+            continue;
+        };
+
+        let result = match state.merge_track_into_resolving_conflicts(
+            &active_conflict.source_track.track_id,
+            &active_conflict.conflict.owner_track.track_id,
+            resolution,
+            Utc::now(),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                skipped_count += 1;
+                warnings.push(format!(
+                    "Skipped {} because it could no longer be merged safely: {}",
+                    active_conflict.source_track.title,
+                    sanitize_error_message(&error.to_string())
+                ));
+                continue;
+            }
+        };
+
+        let resolved_conflicts = resolved_provider_conflict_dtos(&result.resolved_conflicts);
+        resolved_provider_conflicts += resolved_conflicts.len();
+        merged_count += 1;
+        if merged_examples.len() < BULK_IDENTITY_CONFLICT_EXAMPLE_LIMIT {
+            merged_examples.push(BulkMergedIdentityConflictDto {
+                source_track_id: result.source_track_id,
+                target_track_id: result.target_track_id,
+                title: active_conflict.source_track.title,
+                provider: active_conflict.conflict.provider,
+                provider_id: active_conflict.conflict.provider_id,
+                resolved_conflicts,
+            });
+        }
+    }
+
+    state.validate().map_err(ApiError::from)?;
+    write_state(state).await?;
+
+    Ok(Json(BulkMergeIdentityConflictsResponse {
+        message: format!(
+            "Merged {merged_count} likely-same identity conflict(s). Provider accounts were not changed."
+        ),
+        eligible_count,
+        merged_count,
+        skipped_count,
+        resolved_provider_conflicts,
+        conflict_resolution: merge_conflict_resolution_key(request.conflict_resolution).to_string(),
+        conflict_resolution_label: merge_conflict_resolution_label(request.conflict_resolution)
+            .to_string(),
+        pre_merge_backup_path: backup.path.display().to_string(),
+        merged_examples,
+        warnings,
+    }))
+}
+
+fn track_merge_conflict_resolution(
+    choice: MergeConflictResolutionChoice,
+) -> TrackMergeConflictResolution {
+    match choice {
+        MergeConflictResolutionChoice::KeepSource => TrackMergeConflictResolution::KeepSource,
+        MergeConflictResolutionChoice::KeepTarget => TrackMergeConflictResolution::KeepTarget,
+    }
+}
+
+fn merge_conflict_resolution_key(choice: MergeConflictResolutionChoice) -> &'static str {
+    match choice {
+        MergeConflictResolutionChoice::KeepSource => "keep_source",
+        MergeConflictResolutionChoice::KeepTarget => "keep_target",
+    }
+}
+
+fn merge_conflict_resolution_label(choice: MergeConflictResolutionChoice) -> &'static str {
+    match choice {
+        MergeConflictResolutionChoice::KeepSource => "Keep source IDs",
+        MergeConflictResolutionChoice::KeepTarget => "Keep candidate IDs",
+    }
+}
+
+fn resolved_provider_conflict_dtos(
+    conflicts: &[crate::state::ResolvedTrackMergeConflict],
+) -> Vec<ResolvedProviderConflictDto> {
+    conflicts
+        .iter()
+        .map(|conflict| ResolvedProviderConflictDto {
+            provider: conflict.provider_key.clone(),
+            provider_name: provider_display_name(&conflict.provider_key),
+            kept_provider_id: conflict.kept_provider_id.clone(),
+            dropped_provider_id: conflict.dropped_provider_id.clone(),
+            kept_from_source: conflict.kept_from_source,
+        })
+        .collect()
+}
+
+fn bulk_merge_identity_conflict_rows(
+    state: &LibraryState,
+    query: Option<&str>,
+    provider: Option<ProviderKind>,
+    impact: Option<&str>,
+) -> Vec<TrackIdentityConflictQueueItemDto> {
+    identity_conflict_rows_filtered(
+        state,
+        IdentityConflictFilters {
+            query,
+            provider,
+            recommendation: Some("likely_same_recording"),
+            impact,
+        },
+    )
+}
+
+fn bulk_merge_identity_conflict_warnings() -> Vec<String> {
+    vec![
+        "Bulk merge is limited to conflicts still classified as likely same recording.".to_string(),
+        "A manual source-of-truth backup is created before any rows are merged.".to_string(),
+        "Provider accounts are not changed by this operation.".to_string(),
+    ]
+}
+
+fn active_bulk_merge_identity_conflict(
+    state: &LibraryState,
+    source_track_id: &str,
+    target_track_id: &str,
+    provider_key: &str,
+    provider_id: &str,
+) -> Option<TrackIdentityConflictQueueItemDto> {
+    let source_track = state
+        .tracks
+        .iter()
+        .find(|track| track.id == source_track_id)?;
+    let source_track_dto = conflict_track_dto(state, source_track);
+    identity_conflicts_for_track(state, source_track)
+        .into_iter()
+        .find(|conflict| {
+            conflict.provider == provider_key
+                && conflict.provider_id == provider_id
+                && conflict.owner_track.track_id == target_track_id
+                && conflict.evidence.recommendation.key == "likely_same_recording"
+        })
+        .map(|conflict| TrackIdentityConflictQueueItemDto {
+            source_track: source_track_dto,
+            conflict,
+        })
 }
 
 async fn api_reject_track_identity_conflict(
@@ -5090,10 +5340,11 @@ mod tests {
     };
 
     use super::{
-        coverage_matches, extract_retry_after_seconds, identity_conflict_rows,
-        identity_conflict_rows_filtered, identity_gap_rows, normalize_manual_provider_track_id,
-        provider_cooldown_from_error, provider_health_failed, provider_preflight_payload,
-        provider_push_plan_payload, raw_table_value_to_string, IdentityConflictFilters,
+        bulk_merge_identity_conflict_rows, coverage_matches, extract_retry_after_seconds,
+        identity_conflict_rows, identity_conflict_rows_filtered, identity_gap_rows,
+        normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
+        provider_preflight_payload, provider_push_plan_payload, raw_table_value_to_string,
+        IdentityConflictFilters,
     };
 
     #[test]
@@ -5535,6 +5786,15 @@ mod tests {
             },
         );
         assert!(spotify_candidate_rows.is_empty());
+
+        let bulk_rows = bulk_merge_identity_conflict_rows(
+            &state,
+            None,
+            Some(ProviderKind::YoutubeMusic),
+            Some("library-impact"),
+        );
+        assert_eq!(bulk_rows.len(), 1);
+        assert_eq!(bulk_rows[0].source_track.track_id, "track-likely-source");
     }
 
     #[test]

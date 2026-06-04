@@ -886,6 +886,43 @@ code {
   justify-self: start;
 }
 
+.conflict-bulk-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 22px;
+  background: rgba(88, 219, 188, 0.08);
+  border: 1px solid rgba(88, 219, 188, 0.18);
+}
+
+.conflict-bulk-panel--warning {
+  background: rgba(255, 185, 92, 0.08);
+  border-color: rgba(255, 185, 92, 0.22);
+}
+
+.conflict-bulk-panel p {
+  margin: 0;
+  color: rgba(247, 245, 240, 0.68);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conflict-bulk-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.conflict-bulk-head > div:first-child {
+  display: grid;
+  gap: 6px;
+}
+
+.conflict-bulk-head strong {
+  font-size: 20px;
+}
+
 .conflict-evidence {
   display: grid;
   gap: 12px;
@@ -1425,6 +1462,10 @@ code {
   .provider-actions,
   .provider-readout {
     justify-content: flex-start;
+  }
+
+  .conflict-bulk-head {
+    flex-direction: column;
   }
 
   .backup-row {
