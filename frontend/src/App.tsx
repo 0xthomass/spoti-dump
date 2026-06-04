@@ -2169,21 +2169,41 @@ function IdentityConflictsPage() {
   const [rejectingConflict, setRejectingConflict] = useState<string | null>(null)
   const page = parsePage(searchParams.get('page'))
   const query = searchParams.get('q') ?? ''
+  const provider = searchParams.get('provider') ?? ''
+  const recommendation = searchParams.get('recommendation') ?? ''
+  const impact = searchParams.get('impact') ?? ''
 
   useEffect(() => {
     setDraft(query)
   }, [query])
 
   const resource = useApiResource<PageResponse<IdentityConflictQueueItem>>(
-    `/identity/conflicts?page=${page}${query ? `&q=${encodeURIComponent(query)}` : ''}`,
+    `/identity/conflicts?page=${page}${
+      provider ? `&provider=${encodeURIComponent(provider)}` : ''
+    }${recommendation ? `&recommendation=${encodeURIComponent(recommendation)}` : ''}${
+      impact ? `&impact=${encodeURIComponent(impact)}` : ''
+    }${query ? `&q=${encodeURIComponent(query)}` : ''}`,
     revision,
   )
 
   function submitSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const next = new URLSearchParams()
+    const next = new URLSearchParams(searchParams)
     if (draft.trim()) {
       next.set('q', draft.trim())
+    } else {
+      next.delete('q')
+    }
+    next.set('page', '1')
+    startTransition(() => setSearchParams(next))
+  }
+
+  function changeConflictFilter(key: 'provider' | 'recommendation' | 'impact', value: string) {
+    const next = new URLSearchParams(searchParams)
+    if (value) {
+      next.set(key, value)
+    } else {
+      next.delete(key)
     }
     next.set('page', '1')
     startTransition(() => setSearchParams(next))
@@ -2280,10 +2300,15 @@ function IdentityConflictsPage() {
               : '...'
           }
         />
+        <HeroStat label="Provider" value={identityConflictProviderLabel(provider)} />
+        <HeroStat
+          label="Recommendation"
+          value={identityConflictRecommendationLabel(recommendation)}
+        />
       </PageHero>
 
       <section className="panel">
-        <div className="panel-head panel-head--row">
+        <div className="panel-head panel-head--stack">
           <div>
             <span className="eyebrow">Review</span>
             <h2>Identity Conflict Queue</h2>
@@ -2297,6 +2322,58 @@ function IdentityConflictsPage() {
             />
             <button type="submit">Search</button>
           </form>
+          <div className="filter-row">
+            {[
+              ['', 'All providers'],
+              ['spotify', 'Spotify candidate'],
+              ['youtube-music', 'YouTube candidate'],
+            ].map(([value, label]) => (
+              <button
+                className={`filter-pill${provider === value ? ' filter-pill--active' : ''}`}
+                key={value || 'all-providers'}
+                onClick={() => changeConflictFilter('provider', value)}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="filter-row">
+            {[
+              ['', 'All recommendations'],
+              ['likely_same_recording', 'Likely same'],
+              ['needs_manual_review', 'Manual review'],
+              ['likely_different_recording', 'Likely different'],
+            ].map(([value, label]) => (
+              <button
+                className={`filter-pill${
+                  recommendation === value ? ' filter-pill--active' : ''
+                }`}
+                key={value || 'all-recommendations'}
+                onClick={() => changeConflictFilter('recommendation', value)}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="filter-row">
+            {[
+              ['', 'All impact'],
+              ['library_impact', 'Affects saved/playlists'],
+              ['source_impact', 'Source row impact'],
+              ['candidate_impact', 'Candidate row impact'],
+            ].map(([value, label]) => (
+              <button
+                className={`filter-pill${impact === value ? ' filter-pill--active' : ''}`}
+                key={value || 'all-impact'}
+                onClick={() => changeConflictFilter('impact', value)}
+                type="button"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {resource.loading && !resource.data ? (
@@ -4053,6 +4130,29 @@ function identityGapProviderLabel(value: string) {
     return 'YouTube Music'
   }
   return 'All providers'
+}
+
+function identityConflictProviderLabel(value: string) {
+  if (value === 'spotify') {
+    return 'Spotify candidates'
+  }
+  if (value === 'youtube-music') {
+    return 'YouTube candidates'
+  }
+  return 'All providers'
+}
+
+function identityConflictRecommendationLabel(value: string) {
+  if (value === 'likely_same_recording') {
+    return 'Likely same'
+  }
+  if (value === 'needs_manual_review') {
+    return 'Manual review'
+  }
+  if (value === 'likely_different_recording') {
+    return 'Likely different'
+  }
+  return 'All recommendations'
 }
 
 export default App

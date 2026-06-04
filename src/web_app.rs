@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path as FsPath, PathBuf};
@@ -471,6 +472,9 @@ struct TracksQuery {
 #[derive(Default, Deserialize)]
 struct IdentityConflictsQuery {
     q: Option<String>,
+    provider: Option<ProviderKind>,
+    recommendation: Option<String>,
+    impact: Option<String>,
     page: Option<usize>,
 }
 
@@ -2121,7 +2125,13 @@ async fn api_identity_conflicts(
     let _state_guard = context.state_mutation.lock().await;
     let mut state = read_state().await?;
     let page = normalized_page(query.page);
-    let mut rows = identity_conflict_rows(&state, query.q.as_deref());
+    let filters = IdentityConflictFilters {
+        query: query.q.as_deref(),
+        provider: query.provider,
+        recommendation: query.recommendation.as_deref(),
+        impact: query.impact.as_deref(),
+    };
+    let mut rows = identity_conflict_rows_filtered(&state, filters);
     let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
     let track_ids = page_rows
         .iter()
@@ -2135,7 +2145,7 @@ async fn api_identity_conflicts(
 
     if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
         write_state(state.clone()).await?;
-        rows = identity_conflict_rows(&state, query.q.as_deref());
+        rows = identity_conflict_rows_filtered(&state, filters);
         page_rows = paginate_vec(&rows, page, PAGE_SIZE);
     }
 
@@ -3757,12 +3767,51 @@ fn identity_conflict_rows(
     state: &LibraryState,
     query: Option<&str>,
 ) -> Vec<TrackIdentityConflictQueueItemDto> {
-    let query_filter = normalized_query(query);
+    identity_conflict_rows_filtered(
+        state,
+        IdentityConflictFilters {
+            query,
+            ..Default::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct IdentityConflictFilters<'a> {
+    query: Option<&'a str>,
+    provider: Option<ProviderKind>,
+    recommendation: Option<&'a str>,
+    impact: Option<&'a str>,
+}
+
+fn identity_conflict_rows_filtered(
+    state: &LibraryState,
+    filters: IdentityConflictFilters<'_>,
+) -> Vec<TrackIdentityConflictQueueItemDto> {
+    let query_filter = normalized_query(filters.query);
+    let recommendation_filter = normalized_filter_token(filters.recommendation);
+    let impact_filter = normalized_filter_token(filters.impact);
     let mut rows = Vec::new();
 
     for track in &state.tracks {
         let source_track = conflict_track_dto(state, track);
         for conflict in identity_conflicts_for_track(state, track) {
+            if filters
+                .provider
+                .map(|provider| conflict.provider != provider.as_key())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if !identity_conflict_recommendation_matches(
+                &conflict,
+                recommendation_filter.as_deref(),
+            ) {
+                continue;
+            }
+            if !identity_conflict_impact_matches(&conflict.evidence, impact_filter.as_deref()) {
+                continue;
+            }
             if query_matches(
                 query_filter.as_deref(),
                 &[
@@ -3774,6 +3823,9 @@ fn identity_conflict_rows(
                     &conflict.owner_track.title,
                     &conflict.owner_track.artist_summary,
                     conflict.owner_track.album.as_deref().unwrap_or(""),
+                    &conflict.evidence.recommendation.key,
+                    &conflict.evidence.recommendation.label,
+                    &conflict.evidence.recommendation.detail,
                     &conflict.message,
                 ],
             ) {
@@ -3785,26 +3837,114 @@ fn identity_conflict_rows(
         }
     }
 
-    rows.sort_by(|left, right| {
-        left.source_track
-            .title
-            .to_lowercase()
-            .cmp(&right.source_track.title.to_lowercase())
-            .then_with(|| {
-                left.source_track
-                    .artist_summary
-                    .to_lowercase()
-                    .cmp(&right.source_track.artist_summary.to_lowercase())
-            })
-            .then_with(|| left.conflict.provider.cmp(&right.conflict.provider))
-            .then_with(|| {
-                left.conflict
-                    .owner_track
-                    .track_id
-                    .cmp(&right.conflict.owner_track.track_id)
-            })
-    });
+    rows.sort_by(compare_identity_conflict_rows);
     rows
+}
+
+fn compare_identity_conflict_rows(
+    left: &TrackIdentityConflictQueueItemDto,
+    right: &TrackIdentityConflictQueueItemDto,
+) -> Ordering {
+    identity_conflict_recommendation_priority(&left.conflict.evidence.recommendation.key)
+        .cmp(&identity_conflict_recommendation_priority(
+            &right.conflict.evidence.recommendation.key,
+        ))
+        .then_with(|| {
+            identity_conflict_library_impact(&right.conflict.evidence)
+                .cmp(&identity_conflict_library_impact(&left.conflict.evidence))
+        })
+        .then_with(|| {
+            right
+                .conflict
+                .evidence
+                .metadata_similarity
+                .partial_cmp(&left.conflict.evidence.metadata_similarity)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| {
+            left.conflict
+                .evidence
+                .duration_delta_seconds
+                .unwrap_or(u32::MAX)
+                .cmp(
+                    &right
+                        .conflict
+                        .evidence
+                        .duration_delta_seconds
+                        .unwrap_or(u32::MAX),
+                )
+        })
+        .then_with(|| {
+            left.source_track
+                .title
+                .to_lowercase()
+                .cmp(&right.source_track.title.to_lowercase())
+        })
+        .then_with(|| {
+            left.source_track
+                .artist_summary
+                .to_lowercase()
+                .cmp(&right.source_track.artist_summary.to_lowercase())
+        })
+        .then_with(|| left.conflict.provider.cmp(&right.conflict.provider))
+        .then_with(|| {
+            left.conflict
+                .owner_track
+                .track_id
+                .cmp(&right.conflict.owner_track.track_id)
+        })
+}
+
+fn identity_conflict_recommendation_priority(key: &str) -> u8 {
+    match key {
+        "likely_same_recording" => 0,
+        "needs_manual_review" => 1,
+        "likely_different_recording" => 2,
+        _ => 3,
+    }
+}
+
+fn identity_conflict_library_impact(evidence: &TrackIdentityConflictEvidenceDto) -> usize {
+    evidence.source_saved_tracks
+        + evidence.source_playlist_entries
+        + evidence.candidate_saved_tracks
+        + evidence.candidate_playlist_entries
+}
+
+fn identity_conflict_recommendation_matches(
+    conflict: &TrackIdentityConflictDto,
+    filter: Option<&str>,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    normalized_filter_token(Some(&conflict.evidence.recommendation.key)).as_deref() == Some(filter)
+}
+
+fn identity_conflict_impact_matches(
+    evidence: &TrackIdentityConflictEvidenceDto,
+    filter: Option<&str>,
+) -> bool {
+    match filter {
+        None => true,
+        Some("library_impact") | Some("push_blocking") | Some("affects_library") => {
+            identity_conflict_library_impact(evidence) > 0
+        }
+        Some("source_impact") => {
+            evidence.source_saved_tracks + evidence.source_playlist_entries > 0
+        }
+        Some("candidate_impact") => {
+            evidence.candidate_saved_tracks + evidence.candidate_playlist_entries > 0
+        }
+        _ => true,
+    }
+}
+
+fn normalized_filter_token(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase().replace('-', "_"))
 }
 
 fn identity_gap_rows(
@@ -4950,9 +5090,10 @@ mod tests {
     };
 
     use super::{
-        coverage_matches, extract_retry_after_seconds, identity_conflict_rows, identity_gap_rows,
-        normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
-        provider_preflight_payload, provider_push_plan_payload, raw_table_value_to_string,
+        coverage_matches, extract_retry_after_seconds, identity_conflict_rows,
+        identity_conflict_rows_filtered, identity_gap_rows, normalize_manual_provider_track_id,
+        provider_cooldown_from_error, provider_health_failed, provider_preflight_payload,
+        provider_push_plan_payload, raw_table_value_to_string, IdentityConflictFilters,
     };
 
     #[test]
@@ -5300,6 +5441,103 @@ mod tests {
     }
 
     #[test]
+    fn identity_conflict_queue_filters_and_prioritizes_by_review_evidence() {
+        let now = Utc::now();
+        let mut state = LibraryState::new();
+
+        let (manual_source, manual_owner) = identity_conflict_pair(IdentityConflictPairFixture {
+            source_id: "track-manual-source",
+            source_title: "Alpha Theme",
+            owner_id: "track-manual-owner",
+            owner_title: "Alpha Theme Deluxe",
+            candidate_provider: ProviderKind::YoutubeMusic,
+            candidate_provider_id: "youtube-manual",
+            source_duration_seconds: Some(120),
+            owner_duration_seconds: Some(121),
+            confidence: Some(0.80),
+            now,
+        });
+        let (different_source, different_owner) =
+            identity_conflict_pair(IdentityConflictPairFixture {
+                source_id: "track-different-source",
+                source_title: "Beta Short",
+                owner_id: "track-different-owner",
+                owner_title: "Gamma Long",
+                candidate_provider: ProviderKind::YoutubeMusic,
+                candidate_provider_id: "youtube-different",
+                source_duration_seconds: Some(90),
+                owner_duration_seconds: Some(240),
+                confidence: Some(0.80),
+                now,
+            });
+        let (mut likely_source, mut likely_owner) =
+            identity_conflict_pair(IdentityConflictPairFixture {
+                source_id: "track-likely-source",
+                source_title: "Zulu Same",
+                owner_id: "track-likely-owner",
+                owner_title: "Zulu Same",
+                candidate_provider: ProviderKind::YoutubeMusic,
+                candidate_provider_id: "youtube-likely",
+                source_duration_seconds: Some(180),
+                owner_duration_seconds: Some(181),
+                confidence: Some(0.99),
+                now,
+            });
+        likely_source.metadata.album = Some("Same Album".to_string());
+        likely_owner.metadata.album = Some("Same Album".to_string());
+
+        state.tracks.push(manual_source);
+        state.tracks.push(manual_owner);
+        state.tracks.push(different_source);
+        state.tracks.push(different_owner);
+        state.tracks.push(likely_source);
+        state.tracks.push(likely_owner);
+        state.saved_tracks.push(SavedTrackEntry {
+            id: "saved-likely-source".to_string(),
+            track_id: "track-likely-source".to_string(),
+            added_at: None,
+            provider_state: BTreeMap::new(),
+        });
+
+        let rows = identity_conflict_rows(&state, None);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].source_track.track_id, "track-likely-source");
+        assert_eq!(
+            rows[0].conflict.evidence.recommendation.key,
+            "likely_same_recording"
+        );
+
+        let likely_rows = identity_conflict_rows_filtered(
+            &state,
+            IdentityConflictFilters {
+                recommendation: Some("likely-same-recording"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(likely_rows.len(), 1);
+        assert_eq!(likely_rows[0].source_track.track_id, "track-likely-source");
+
+        let impact_rows = identity_conflict_rows_filtered(
+            &state,
+            IdentityConflictFilters {
+                impact: Some("library_impact"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(impact_rows.len(), 1);
+        assert_eq!(impact_rows[0].source_track.track_id, "track-likely-source");
+
+        let spotify_candidate_rows = identity_conflict_rows_filtered(
+            &state,
+            IdentityConflictFilters {
+                provider: Some(ProviderKind::Spotify),
+                ..Default::default()
+            },
+        );
+        assert!(spotify_candidate_rows.is_empty());
+    }
+
+    #[test]
     fn identity_gap_queue_filters_provider_and_prioritizes_push_blocking_rows() {
         let now = Utc::now();
         let mut state = LibraryState::new();
@@ -5572,6 +5810,70 @@ mod tests {
             provider_artwork: BTreeMap::new(),
             provider_state: BTreeMap::new(),
         }
+    }
+
+    struct IdentityConflictPairFixture<'a> {
+        source_id: &'a str,
+        source_title: &'a str,
+        owner_id: &'a str,
+        owner_title: &'a str,
+        candidate_provider: ProviderKind,
+        candidate_provider_id: &'a str,
+        source_duration_seconds: Option<u32>,
+        owner_duration_seconds: Option<u32>,
+        confidence: Option<f64>,
+        now: chrono::DateTime<Utc>,
+    }
+
+    fn identity_conflict_pair(
+        fixture: IdentityConflictPairFixture<'_>,
+    ) -> (TrackEntity, TrackEntity) {
+        let conflicting_provider = match fixture.candidate_provider {
+            ProviderKind::Spotify => ProviderKind::YoutubeMusic,
+            ProviderKind::YoutubeMusic => ProviderKind::Spotify,
+        };
+        let mut source = test_track_with_link(
+            fixture.source_id,
+            fixture.source_title,
+            conflicting_provider,
+            &format!("{}-source", conflicting_provider.as_key()),
+            fixture.now,
+        );
+        source.metadata.duration_seconds = fixture.source_duration_seconds;
+        source.provider_state.insert(
+            fixture.candidate_provider.as_key().to_string(),
+            SyncStatusRecord::error_with_provider_item_id(
+                format!(
+                    "Skipped {} identity '{}' because it would merge tracks with conflicting provider IDs.",
+                    fixture.candidate_provider.display_name(),
+                    fixture.candidate_provider_id
+                ),
+                fixture.candidate_provider_id,
+                fixture.confidence,
+                fixture.now,
+            ),
+        );
+
+        let mut owner = test_track_with_link(
+            fixture.owner_id,
+            fixture.owner_title,
+            conflicting_provider,
+            &format!("{}-owner", conflicting_provider.as_key()),
+            fixture.now,
+        );
+        owner.metadata.duration_seconds = fixture.owner_duration_seconds;
+        owner.provider_links.insert(
+            fixture.candidate_provider.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: fixture.candidate_provider_id.to_string(),
+                source: LinkSource::Export,
+                confidence: Some(1.0),
+                linked_at: fixture.now,
+                last_seen_at: Some(fixture.now),
+            },
+        );
+
+        (source, owner)
     }
 
     fn test_track_with_link(
