@@ -886,6 +886,61 @@ code {
   justify-self: start;
 }
 
+.conflict-evidence {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.conflict-evidence--compact {
+  padding: 12px;
+  border-radius: 16px;
+}
+
+.conflict-evidence-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.conflict-evidence-head p {
+  margin: 0;
+  color: rgba(247, 245, 240, 0.68);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conflict-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.evidence-metric {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 14px;
+  background: rgba(0, 0, 0, 0.16);
+}
+
+.evidence-metric span {
+  color: rgba(247, 245, 240, 0.5);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.evidence-metric strong {
+  color: rgba(247, 245, 240, 0.88);
+  font-size: 13px;
+}
+
 .conflict-detail {
   display: grid;
   gap: 8px;
@@ -1320,7 +1375,8 @@ code {
 @media (max-width: 1180px) {
   .metric-grid,
   .provider-metric-grid,
-  .readiness-grid {
+  .readiness-grid,
+  .conflict-evidence-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1384,7 +1440,8 @@ code {
   .metric-grid,
   .field-grid,
   .operation-grid,
-  .readiness-grid {
+  .readiness-grid,
+  .conflict-evidence-grid {
     grid-template-columns: 1fr;
   }
 }

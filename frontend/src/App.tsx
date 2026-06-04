@@ -314,7 +314,25 @@ type TrackIdentityConflict = {
   provider_id: string
   owner_track: ConflictTrack
   conflicting_provider_links: ProviderLinkConflict[]
+  evidence: TrackIdentityConflictEvidence
   message: string
+}
+
+type TrackIdentityConflictEvidence = {
+  provider_confidence: number | null
+  metadata_similarity: number
+  duration_delta_seconds: number | null
+  source_saved_tracks: number
+  source_playlist_entries: number
+  candidate_saved_tracks: number
+  candidate_playlist_entries: number
+  recommendation: TrackIdentityConflictRecommendation
+}
+
+type TrackIdentityConflictRecommendation = {
+  key: string
+  label: string
+  detail: string
 }
 
 type ConflictTrack = {
@@ -2325,6 +2343,8 @@ function IdentityConflictsPage() {
                       />
                     </div>
 
+                    <ConflictEvidencePanel conflict={item.conflict} />
+
                     <div className="conflict-detail">
                       <p>{item.conflict.message}</p>
                       {item.conflict.conflicting_provider_links.map((link) => (
@@ -2391,6 +2411,63 @@ function IdentityConflictsPage() {
         />
       ) : null}
     </section>
+  )
+}
+
+function ConflictEvidencePanel({
+  conflict,
+  compact,
+}: {
+  conflict: TrackIdentityConflict
+  compact?: boolean
+}) {
+  const evidence = conflict.evidence
+  const recommendationClass = recommendationClassName(evidence.recommendation.key)
+
+  return (
+    <div className={`conflict-evidence${compact ? ' conflict-evidence--compact' : ''}`}>
+      <div className="conflict-evidence-head">
+        <span className={`status-chip ${recommendationClass}`}>
+          {evidence.recommendation.label}
+        </span>
+        <p>{evidence.recommendation.detail}</p>
+      </div>
+      <div className="conflict-evidence-grid">
+        <EvidenceMetric
+          label="Metadata score"
+          value={formatScorePercent(evidence.metadata_similarity)}
+        />
+        <EvidenceMetric
+          label="Provider confidence"
+          value={formatOptionalScorePercent(evidence.provider_confidence)}
+        />
+        <EvidenceMetric
+          label="Duration delta"
+          value={formatDurationDelta(evidence.duration_delta_seconds)}
+        />
+        <EvidenceMetric
+          label="Source impact"
+          value={`${formatNumber(evidence.source_saved_tracks)} saved · ${formatNumber(
+            evidence.source_playlist_entries,
+          )} refs`}
+        />
+        <EvidenceMetric
+          label="Candidate impact"
+          value={`${formatNumber(evidence.candidate_saved_tracks)} saved · ${formatNumber(
+            evidence.candidate_playlist_entries,
+          )} refs`}
+        />
+      </div>
+    </div>
+  )
+}
+
+function EvidenceMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="evidence-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
@@ -3189,6 +3266,7 @@ function TrackEditorModal({
                           {conflict.owner_track.coverage.label}
                         </span>
                       </div>
+                      <ConflictEvidencePanel conflict={conflict} compact />
                       {conflict.conflicting_provider_links.map((link) => (
                         <p key={link.provider}>
                           {link.provider_name}: current {link.source_provider_id} · candidate{' '}
@@ -3793,6 +3871,37 @@ function parsePage(raw: string | null) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value)
+}
+
+function formatScorePercent(value: number) {
+  return `${Math.round(value * 100)}%`
+}
+
+function formatOptionalScorePercent(value: number | null) {
+  if (value === null) {
+    return 'Unknown'
+  }
+  return formatScorePercent(value)
+}
+
+function formatDurationDelta(value: number | null) {
+  if (value === null) {
+    return 'Unknown'
+  }
+  if (value === 1) {
+    return '1 sec'
+  }
+  return `${formatNumber(value)} sec`
+}
+
+function recommendationClassName(key: string) {
+  if (key === 'likely_same_recording') {
+    return 'status-chip--good'
+  }
+  if (key === 'likely_different_recording') {
+    return 'status-chip--danger'
+  }
+  return 'status-chip--warning'
 }
 
 function formatDateTime(value: string) {

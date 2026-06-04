@@ -211,7 +211,7 @@ When it does not, run `resolve-identities` or use Overview → Resolve Missing I
 
 This is what makes cross-provider sync possible, but it also means mismatches are still possible when catalogs differ or metadata is inconsistent. Those misses are written back into `dump/library.db` so they can be retried or inspected later instead of disappearing after the run.
 
-If a discovered provider ID already belongs to another canonical row and both rows also contain conflicting IDs on another provider, the app does not auto-merge. Use the Conflicts page in the web app to compare the source row and candidate owner row, then explicitly merge while keeping either the source provider IDs or the candidate provider IDs. If the candidate is the wrong recording, mark it as not the same track; the rejected candidate is recorded so the next identity run does not immediately re-open the same conflict. These canonical repairs do not mutate Spotify or YouTube Music accounts.
+If a discovered provider ID already belongs to another canonical row and both rows also contain conflicting IDs on another provider, the app does not auto-merge. Use the Conflicts page in the web app to compare the source row and candidate owner row; each conflict includes metadata similarity, duration delta, provider confidence when available, saved/playlist impact, and a conservative review recommendation. Then explicitly merge while keeping either the source provider IDs or the candidate provider IDs. If the candidate is the wrong recording, mark it as not the same track; the rejected candidate is recorded so the next identity run does not immediately re-open the same conflict. These canonical repairs do not mutate Spotify or YouTube Music accounts.
 
 ## Current Semantics
 

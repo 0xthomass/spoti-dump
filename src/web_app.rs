@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
+use crate::matching::metadata_similarity;
 use crate::model::{
     LibraryState, LinkSource, ProviderConnection, ProviderConnectionConfig, ProviderCooldown,
     ProviderHealth, ProviderKind, ProviderTrackArtwork, SyncState, SyncStatusRecord, TrackEntity,
@@ -731,6 +732,7 @@ struct TrackIdentityConflictDto {
     provider_id: String,
     owner_track: ConflictTrackDto,
     conflicting_provider_links: Vec<ProviderLinkConflictDto>,
+    evidence: TrackIdentityConflictEvidenceDto,
     message: String,
 }
 
@@ -753,6 +755,25 @@ struct ProviderLinkConflictDto {
     provider_name: String,
     source_provider_id: String,
     target_provider_id: String,
+}
+
+#[derive(Clone, Serialize)]
+struct TrackIdentityConflictEvidenceDto {
+    provider_confidence: Option<f64>,
+    metadata_similarity: f64,
+    duration_delta_seconds: Option<u32>,
+    source_saved_tracks: usize,
+    source_playlist_entries: usize,
+    candidate_saved_tracks: usize,
+    candidate_playlist_entries: usize,
+    recommendation: TrackIdentityConflictRecommendationDto,
+}
+
+#[derive(Clone, Serialize)]
+struct TrackIdentityConflictRecommendationDto {
+    key: String,
+    label: String,
+    detail: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -3920,6 +3941,7 @@ fn identity_conflicts_for_track(
                 provider_id,
                 owner_track: conflict_track_dto(state, owner),
                 conflicting_provider_links: provider_link_conflicts(track, owner),
+                evidence: identity_conflict_evidence(state, track, owner, status),
                 message: message.to_string(),
             })
         })
@@ -3960,6 +3982,78 @@ fn provider_link_conflicts(
             })
         })
         .collect()
+}
+
+fn identity_conflict_evidence(
+    state: &LibraryState,
+    source: &TrackEntity,
+    candidate: &TrackEntity,
+    status: &SyncStatusRecord,
+) -> TrackIdentityConflictEvidenceDto {
+    let similarity = metadata_similarity(&source.metadata, &candidate.metadata);
+    let duration_delta_seconds = match (
+        source.metadata.duration_seconds,
+        candidate.metadata.duration_seconds,
+    ) {
+        (Some(source_duration), Some(candidate_duration)) => {
+            Some(source_duration.abs_diff(candidate_duration))
+        }
+        _ => None,
+    };
+    let recommendation =
+        identity_conflict_recommendation(similarity, duration_delta_seconds, status.confidence);
+
+    TrackIdentityConflictEvidenceDto {
+        provider_confidence: status.confidence,
+        metadata_similarity: similarity,
+        duration_delta_seconds,
+        source_saved_tracks: saved_track_count(state, &source.id),
+        source_playlist_entries: playlist_reference_count(state, &source.id),
+        candidate_saved_tracks: saved_track_count(state, &candidate.id),
+        candidate_playlist_entries: playlist_reference_count(state, &candidate.id),
+        recommendation,
+    }
+}
+
+fn identity_conflict_recommendation(
+    metadata_similarity: f64,
+    duration_delta_seconds: Option<u32>,
+    provider_confidence: Option<f64>,
+) -> TrackIdentityConflictRecommendationDto {
+    let close_duration = duration_delta_seconds
+        .map(|delta| delta <= 5)
+        .unwrap_or(false);
+    let incompatible_duration = duration_delta_seconds
+        .map(|delta| delta >= 45)
+        .unwrap_or(false);
+    let provider_high_confidence = provider_confidence
+        .map(|confidence| confidence >= 0.98)
+        .unwrap_or(false);
+
+    if close_duration
+        && (metadata_similarity >= 0.97
+            || (provider_high_confidence && metadata_similarity >= 0.94))
+    {
+        return TrackIdentityConflictRecommendationDto {
+            key: "likely_same_recording".to_string(),
+            label: "Likely same recording".to_string(),
+            detail: "Metadata and duration are strong. Verify the provider IDs, then merge with the provider identity you trust.".to_string(),
+        };
+    }
+
+    if metadata_similarity < 0.86 || (incompatible_duration && metadata_similarity < 0.95) {
+        return TrackIdentityConflictRecommendationDto {
+            key: "likely_different_recording".to_string(),
+            label: "Likely different recording".to_string(),
+            detail: "The rows differ enough that an automatic merge would be unsafe. Inspect both provider tracks or mark the candidate as not the same track.".to_string(),
+        };
+    }
+
+    TrackIdentityConflictRecommendationDto {
+        key: "needs_manual_review".to_string(),
+        label: "Needs manual review".to_string(),
+        detail: "The evidence is mixed. Compare album, version, duration, and provider pages before merging or rejecting.".to_string(),
+    }
 }
 
 fn parse_conflict_candidate_provider_id(message: &str) -> Option<String> {
@@ -5032,12 +5126,14 @@ mod tests {
             "spotify-source",
             now,
         );
+        source.metadata.album = Some("Same Album".to_string());
+        source.metadata.duration_seconds = Some(180);
         source.provider_state.insert(
             ProviderKind::YoutubeMusic.as_key().to_string(),
             SyncStatusRecord::error_with_provider_item_id(
                 "Skipped YouTube Music identity 'youtube-owner' because it would merge tracks with conflicting provider IDs.",
                 "youtube-owner",
-                Some(0.97),
+                Some(0.99),
                 now,
             ),
         );
@@ -5049,6 +5145,8 @@ mod tests {
             "spotify-owner",
             now,
         );
+        owner.metadata.album = Some("Same Album".to_string());
+        owner.metadata.duration_seconds = Some(182);
         owner.provider_links.insert(
             ProviderKind::YoutubeMusic.as_key().to_string(),
             ProviderTrackLink {
@@ -5082,6 +5180,13 @@ mod tests {
             rows[0].conflict.conflicting_provider_links[0].target_provider_id,
             "spotify-owner"
         );
+        assert_eq!(rows[0].conflict.evidence.provider_confidence, Some(0.99));
+        assert_eq!(rows[0].conflict.evidence.duration_delta_seconds, Some(2));
+        assert_eq!(
+            rows[0].conflict.evidence.recommendation.key,
+            "likely_same_recording"
+        );
+        assert!(rows[0].conflict.evidence.metadata_similarity >= 0.97);
     }
 
     #[test]
@@ -5139,6 +5244,59 @@ mod tests {
             &state.tracks[0],
             Some("identity-conflicts")
         ));
+    }
+
+    #[test]
+    fn identity_conflict_evidence_flags_likely_different_recordings() {
+        let now = Utc::now();
+        let mut source = test_track_with_link(
+            "track-source",
+            "Short Theme",
+            ProviderKind::Spotify,
+            "spotify-source",
+            now,
+        );
+        source.metadata.duration_seconds = Some(90);
+        source.provider_state.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            SyncStatusRecord::error_with_provider_item_id(
+                "Skipped YouTube Music identity 'youtube-owner' because it would merge tracks with conflicting provider IDs.",
+                "youtube-owner",
+                Some(0.88),
+                now,
+            ),
+        );
+
+        let mut owner = test_track_with_link(
+            "track-owner",
+            "Long Theme",
+            ProviderKind::Spotify,
+            "spotify-owner",
+            now,
+        );
+        owner.metadata.duration_seconds = Some(240);
+        owner.provider_links.insert(
+            ProviderKind::YoutubeMusic.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: "youtube-owner".to_string(),
+                source: LinkSource::Export,
+                confidence: Some(1.0),
+                linked_at: now,
+                last_seen_at: Some(now),
+            },
+        );
+
+        let mut state = LibraryState::new();
+        state.tracks.push(source);
+        state.tracks.push(owner);
+
+        let rows = identity_conflict_rows(&state, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conflict.evidence.duration_delta_seconds, Some(150));
+        assert_eq!(
+            rows[0].conflict.evidence.recommendation.key,
+            "likely_different_recording"
+        );
     }
 
     #[test]
