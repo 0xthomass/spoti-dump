@@ -55,6 +55,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -63,3 +66,16 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
+        with:
+          # The licenses check is excluded until the crate declares its own
+          # license (no LICENSE file / Cargo.toml license field yet).
+          command: check advisories bans sources

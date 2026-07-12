@@ -1,0 +1,51 @@
+# cargo-deny configuration.
+# Run with: cargo deny check
+# Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# KNOWN GAP: `cargo deny check licenses` currently fails with
+# `error[unlicensed]: spoti-dump = 2.0.5 is unlicensed` because the root
+# crate's Cargo.toml has no `license`/`license-file` field (and the repo has
+# no LICENSE file to infer one from). This is a one-line Cargo.toml fix
+# (e.g. `license = "MIT"`) but Cargo.toml is out of scope for this pass —
+# choosing a license is a project decision for the maintainer to make.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Known vulnerabilities are always hard errors in cargo-deny (not configurable).
+# `unmaintained` controls whether unmaintained-crate advisories can fail the
+# build; set to "none" so a stale-but-safe transitive dependency (e.g.
+# RUSTSEC-2025-0134 for rustls-pemfile, which has no safe upgrade) doesn't
+# block CI. `unsound` is left at its default ("workspace"), so unsoundness
+# advisories still fail the build when they apply to a direct dependency.
+# `ignore` lists specific RUSTSEC advisory IDs we've reviewed and accepted.
+unmaintained = "none"
+ignore = []
+
+[licenses]
+# Common permissive licenses used throughout the Rust ecosystem.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

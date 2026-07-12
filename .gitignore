@@ -5,6 +5,6 @@
 /frontend/dist/
 /frontend/node_modules/
 ytmusic_headers.json
-*.csv
-*.py
-*.txt
+/*.csv
+/*.py
+/*.txt
