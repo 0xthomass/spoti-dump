@@ -156,7 +156,7 @@ export function PlaylistsPage() {
                 placeholder="Search playlists"
                 type="search"
               />
-              <button type="submit">Search</button>
+              <button className="btn btn--primary" type="submit">Search</button>
             </form>
             {listResource.loading && !listResource.data ? (
               <LoadingState label="Loading playlists" compact />

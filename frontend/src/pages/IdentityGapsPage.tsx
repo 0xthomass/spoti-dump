@@ -88,7 +88,7 @@ export function IdentityGapsPage() {
               placeholder="Search title, artist, album"
               type="search"
             />
-            <button type="submit">Search</button>
+            <button className="btn btn--primary" type="submit">Search</button>
           </form>
           <div className="filter-row">
             {[

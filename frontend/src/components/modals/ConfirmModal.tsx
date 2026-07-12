@@ -32,11 +32,11 @@ export function ConfirmModal({
           </span>
         </div>
         <div className="modal-actions">
-          <button className="ghost-button" onClick={onCancel} type="button">
+          <button className="btn btn--ghost" onClick={onCancel} type="button">
             Cancel
           </button>
           <button
-            className={`confirm-button confirm-button--${request.tone}`}
+            className={`btn ${request.tone === 'danger' ? 'btn--danger' : 'btn--primary'}`}
             onClick={onConfirm}
             type="button"
           >

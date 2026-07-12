@@ -56,7 +56,7 @@ export function BulkMergeConflictPanel({
         </div>
         <div className="modal-actions modal-actions--inline">
           <button
-            className="provider-action-button provider-action-button--secondary"
+            className="btn btn--secondary"
             disabled={running !== null}
             onClick={() => onMerge('keep_source')}
             type="button"
@@ -64,7 +64,7 @@ export function BulkMergeConflictPanel({
             {running === 'keep_source' ? 'Merging…' : 'Bulk merge, keep source IDs'}
           </button>
           <button
-            className="ghost-button"
+            className="btn btn--ghost"
             disabled={running !== null}
             onClick={() => onMerge('keep_target')}
             type="button"

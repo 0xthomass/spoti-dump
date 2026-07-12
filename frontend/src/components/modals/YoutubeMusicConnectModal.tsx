@@ -55,10 +55,11 @@ export function YoutubeMusicConnectModal({ onClose }: { onClose: () => void }) {
           />
         </label>
         <div className="modal-actions">
-          <button className="ghost-button" onClick={onClose} type="button">
+          <button className="btn btn--ghost" onClick={onClose} type="button">
             Cancel
           </button>
           <button
+            className="btn btn--primary"
             disabled={!headersJson.trim() || submitting}
             onClick={() => void connect()}
             type="button"

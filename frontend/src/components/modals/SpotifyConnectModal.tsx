@@ -67,10 +67,11 @@ export function SpotifyConnectModal({
           </label>
         </div>
         <div className="modal-actions">
-          <button className="ghost-button" onClick={onClose} type="button">
+          <button className="btn btn--ghost" onClick={onClose} type="button">
             Cancel
           </button>
           <button
+            className="btn btn--primary"
             disabled={!clientId.trim() || !clientSecret.trim() || submitting}
             onClick={() => void connect()}
             type="button"

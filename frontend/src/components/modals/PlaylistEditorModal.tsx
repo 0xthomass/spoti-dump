@@ -62,10 +62,10 @@ export function PlaylistEditorModal({
           ))}
         </div>
         <div className="modal-actions">
-          <button className="ghost-button" onClick={onClose} type="button">
+          <button className="btn btn--ghost" onClick={onClose} type="button">
             Cancel
           </button>
-          <button disabled={saving} onClick={() => void save()} type="button">
+          <button className="btn btn--primary" disabled={saving} onClick={() => void save()} type="button">
             {saving ? 'Saving…' : 'Save Playlist'}
           </button>
         </div>

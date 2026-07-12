@@ -141,7 +141,7 @@ export function SafetyPage() {
             </p>
           </div>
           <button
-            className="provider-action-button"
+            className="btn btn--primary"
             disabled={creating}
             onClick={() => void createBackup()}
             type="button"
@@ -182,7 +182,7 @@ export function SafetyPage() {
                     {backup.modified_at ? formatDateTime(backup.modified_at) : 'Unknown date'}
                   </span>
                   <button
-                    className="provider-action-button provider-action-button--danger provider-action-button--compact"
+                    className="btn btn--danger btn--sm"
                     disabled={restoring !== null}
                     onClick={() => void restoreBackup(backup)}
                     type="button"

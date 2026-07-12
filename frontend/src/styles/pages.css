@@ -1,0 +1,561 @@
+/* pages.css — page-specific clusters (provider dashboard, identity conflicts,
+ * playlists, safety/backups). Colours resolve through tokens only. */
+
+/* ---- Provider dashboard cards ---- */
+.provider-card {
+  padding: 18px;
+  display: grid;
+  gap: 16px;
+}
+
+.provider-card--control {
+  align-content: start;
+}
+
+.provider-card header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: start;
+}
+
+.provider-card h3 {
+  font-size: 24px;
+}
+
+.provider-card p {
+  margin: 0;
+  color: var(--text-muted-2);
+  line-height: 1.6;
+}
+
+.provider-card-headline {
+  display: grid;
+  gap: 6px;
+}
+
+.provider-card-headline p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.provider-readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.provider-readiness {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+}
+
+.provider-readiness p {
+  margin: 0;
+  color: var(--text-muted-3);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.provider-callout {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.provider-callout strong {
+  color: var(--text);
+}
+
+.provider-callout span {
+  color: var(--text-muted-2);
+}
+
+.provider-callout--warning {
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-line);
+}
+
+.provider-callout a {
+  color: var(--accent-text);
+  font-weight: 800;
+}
+
+.push-plan {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--success-soft);
+  border: 1px solid var(--success-line);
+}
+
+.push-plan-examples {
+  display: grid;
+  gap: 5px;
+  color: var(--text-muted-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.push-plan-examples strong {
+  color: var(--text-muted-1);
+}
+
+.preflight-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-muted-3);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.preflight-list--blockers {
+  color: var(--warning-text);
+}
+
+.readiness-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.readiness-head span {
+  color: var(--text-muted-3);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.readiness-head strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.readiness-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.readiness-item {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+.readiness-item span,
+.readiness-item small {
+  color: var(--text-muted-3);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.readiness-item strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.provider-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+/* ---- Operation modal ---- */
+.operation-head {
+  display: grid;
+  gap: 8px;
+}
+
+.operation-head strong {
+  font-size: 24px;
+  letter-spacing: -0.03em;
+}
+
+.operation-head p {
+  margin: 0;
+  color: var(--text-muted-3);
+}
+
+.operation-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+/* ---- Provider state (track editor) ---- */
+.provider-state-list {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.provider-state-card {
+  padding: 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-soft);
+  background: var(--surface-2);
+  display: grid;
+  gap: 8px;
+}
+
+.provider-state-card p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted-3);
+  line-height: 1.5;
+}
+
+/* ---- Identity repair form ----
+ * Base columns use minmax(0, …) so the grid never forces overflow; below the
+ * modal's narrow width it stacks to a single column. */
+.identity-repair-form {
+  display: grid;
+  grid-template-columns: minmax(0, 0.35fr) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+/* ---- Identity conflict cards ---- */
+.conflict-list {
+  display: grid;
+  gap: 16px;
+  padding: 20px 24px 0;
+}
+
+.conflict-card {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-1);
+}
+
+.conflict-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 16px;
+}
+
+.conflict-card h3 {
+  font-size: 26px;
+}
+
+.conflict-track-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.conflict-track-grid--single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.conflict-track-card {
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  border: 1px solid var(--border-soft);
+}
+
+.conflict-track-main {
+  display: flex;
+  gap: 12px;
+  min-width: 0;
+}
+
+.conflict-track-card .track-text {
+  display: grid;
+  gap: 4px;
+}
+
+.conflict-track-card .track-text > span:not(.eyebrow) {
+  color: var(--text-muted-3);
+  font-size: 13px;
+}
+
+.conflict-track-card .btn {
+  justify-self: start;
+}
+
+.conflict-bulk-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: var(--success-soft);
+  border: 1px solid var(--success-line);
+}
+
+.conflict-bulk-panel--warning {
+  background: var(--warning-soft);
+  border-color: var(--warning-line);
+}
+
+.conflict-bulk-panel p {
+  margin: 0;
+  color: var(--text-muted-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conflict-bulk-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.conflict-bulk-head > div:first-child {
+  display: grid;
+  gap: 6px;
+}
+
+.conflict-bulk-head strong {
+  font-size: 20px;
+}
+
+.conflict-evidence {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+}
+
+.conflict-evidence--compact {
+  padding: 12px;
+  border-radius: var(--radius-sm);
+}
+
+.conflict-evidence-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.conflict-evidence-head p {
+  margin: 0;
+  color: var(--text-muted-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.conflict-evidence-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.evidence-metric {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-inset);
+}
+
+.evidence-metric span {
+  color: var(--text-muted-3);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.evidence-metric strong {
+  color: var(--text-muted-1);
+  font-size: 13px;
+}
+
+.conflict-detail {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning-line);
+}
+
+.conflict-detail p {
+  margin: 0;
+  color: var(--text-muted-2);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---- Playlists ---- */
+.playlist-list {
+  display: grid;
+  gap: 10px;
+}
+
+.playlist-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+
+.playlist-card--active {
+  border-color: var(--accent-line);
+  background: var(--gradient-card-active);
+}
+
+.playlist-hero {
+  display: grid;
+  grid-template-columns: 176px minmax(0, 1fr) auto;
+  gap: 22px;
+  align-items: end;
+  padding: 24px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--gradient-playlist-hero);
+}
+
+.playlist-hero-copy {
+  display: grid;
+  gap: 10px;
+}
+
+.playlist-hero-copy h2 {
+  font-size: clamp(30px, 3vw, 48px);
+}
+
+.playlist-hero-copy p {
+  margin: 0;
+  color: var(--text-muted-2);
+  line-height: 1.6;
+}
+
+.playlist-hero-actions {
+  display: flex;
+  gap: 10px;
+}
+
+/* ---- Safety / backups ---- */
+.backup-list {
+  display: grid;
+  gap: 10px;
+  padding: 0 24px 24px;
+}
+
+.backup-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: center;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+}
+
+.backup-row p {
+  margin: 4px 0 0;
+  color: var(--text-muted-3);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.backup-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* ---- Responsive ---- */
+@media (max-width: 1180px) {
+  .provider-metric-grid,
+  .readiness-grid,
+  .conflict-evidence-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .playlist-hero {
+    grid-template-columns: 120px minmax(0, 1fr);
+  }
+
+  .playlist-hero-actions {
+    grid-column: 1 / -1;
+  }
+
+  .artwork--hero {
+    width: 120px;
+    height: 120px;
+  }
+}
+
+@media (max-width: 980px) {
+  .provider-actions,
+  .provider-readout {
+    justify-content: flex-start;
+  }
+
+  .conflict-bulk-head {
+    flex-direction: column;
+  }
+
+  .backup-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .backup-meta {
+    justify-content: flex-start;
+  }
+
+  .provider-state-list,
+  .field-grid,
+  .operation-grid,
+  .readiness-grid,
+  .conflict-evidence-grid,
+  .provider-metric-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .playlist-hero {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+}
+
+@media (max-width: 560px) {
+  .identity-repair-form {
+    grid-template-columns: 1fr;
+  }
+}

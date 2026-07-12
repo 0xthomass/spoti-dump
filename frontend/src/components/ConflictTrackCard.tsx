@@ -28,7 +28,7 @@ export function ConflictTrackCard({
         <span className="mini-chip">{track.playlist_refs} playlist refs</span>
       </div>
       <ProviderChipRow providers={track.providers} />
-      <button className="ghost-button" onClick={onEdit} type="button">
+      <button className="btn btn--ghost" onClick={onEdit} type="button">
         Open row
       </button>
     </div>

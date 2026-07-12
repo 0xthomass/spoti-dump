@@ -1,0 +1,211 @@
+/*
+ * Design tokens — the single source of truth for colour, type, space, radius,
+ * elevation and focus. Every rule in base/layout/components/pages.css resolves
+ * its colours through these custom properties (no raw hex/rgba lives there).
+ *
+ * Values are DERIVED from the existing brand palette (dark warm surface,
+ * off-white text, teal accent, magenta glow) — normalised, not rebranded:
+ *  - the ~6 teal hexes (#58dbbc/#5be7c4/#7ee9dc/#94e8e4/#b6fff0/#baffec) collapse
+ *    into one --accent family.
+ *  - the ~11 ad-hoc off-white alphas collapse into --text-muted-1..3 + --text-faint.
+ *
+ * A light theme mirrors every token under prefers-color-scheme: light, keeping
+ * the teal identity. Key text pairs verified ≥ WCAG AA in both themes
+ * (see the header of App.tsx-adjacent notes / task report for the numbers).
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- Type ---- */
+  --font-display: 'Fraunces', Georgia, 'Times New Roman', serif;
+  --font-body: 'Manrope', 'Aptos', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  /* ---- Text (off-white #f7f5f0 family) ---- */
+  --text: #f7f5f0;
+  --text-muted-1: rgba(247, 245, 240, 0.82); /* was 0.9 / 0.88 / 0.86 / 0.82 / 0.8  */
+  --text-muted-2: rgba(247, 245, 240, 0.7); /*  was 0.72 / 0.7 / 0.68 / 0.66        */
+  --text-muted-3: rgba(247, 245, 240, 0.58); /* was 0.62 / 0.6 / 0.58 / 0.55 / 0.54 / 0.5 */
+  --text-faint: rgba(247, 245, 240, 0.42); /*   placeholders                        */
+  --text-on-cover: rgba(255, 255, 255, 0.9); /* monogram over artwork gradient      */
+
+  /* ---- Accent (one teal) ---- */
+  --accent: #58dbbc;
+  --accent-hover: #5be7c4;
+  --accent-text: #b6fff0; /* bright teal for links / text on dark */
+  --accent-contrast: #081018; /* dark ink on teal fills */
+  --accent-soft: rgba(88, 219, 188, 0.14); /* translucent fill */
+  --accent-line: rgba(88, 219, 188, 0.28); /* translucent border */
+  --accent-gradient: linear-gradient(135deg, #58dbbc, #5d7bff);
+
+  /* ---- Surfaces ---- */
+  --app-bg:
+    radial-gradient(circle at top left, rgba(53, 193, 181, 0.2), transparent 28%),
+    radial-gradient(circle at top right, rgba(148, 22, 108, 0.24), transparent 34%),
+    linear-gradient(180deg, #130f17 0%, #08070d 48%, #030305 100%);
+  --surface-0: rgba(14, 14, 20, 0.7); /* card / panel base */
+  --surface-1: rgba(255, 255, 255, 0.035); /* faint raised (rows, readiness) */
+  --surface-2: rgba(255, 255, 255, 0.05); /* raised (inputs, tiles, sidebar-card) */
+  --surface-3: rgba(255, 255, 255, 0.08); /* stronger raised (icon buttons, chips) */
+  --surface-inset: rgba(0, 0, 0, 0.2); /* recessed metric wells */
+  --surface-overlay: rgba(12, 12, 18, 0.96); /* opaque overlays: toast, sticky th */
+  --scrim: rgba(3, 3, 6, 0.66); /* modal backdrop */
+
+  /* ---- Borders ---- */
+  --border-soft: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.12);
+
+  /* ---- Decorative gradients ---- */
+  --gradient-sidebar:
+    linear-gradient(180deg, rgba(18, 18, 24, 0.96), rgba(10, 9, 15, 0.92)),
+    radial-gradient(circle at top left, rgba(91, 231, 196, 0.08), transparent 40%);
+  --gradient-sidebar-active:
+    linear-gradient(135deg, rgba(28, 69, 71, 0.88), rgba(20, 20, 29, 0.9)),
+    rgba(255, 255, 255, 0.05);
+  --gradient-hero:
+    radial-gradient(circle at top right, rgba(152, 35, 125, 0.4), transparent 36%),
+    radial-gradient(circle at top left, rgba(74, 178, 166, 0.24), transparent 30%),
+    linear-gradient(135deg, rgba(26, 28, 36, 0.95), rgba(8, 9, 13, 0.96));
+  --gradient-playlist-hero:
+    radial-gradient(circle at top right, rgba(148, 22, 108, 0.3), transparent 34%),
+    linear-gradient(180deg, rgba(31, 26, 41, 0.9), rgba(12, 11, 17, 0.96));
+  --gradient-card-active:
+    linear-gradient(135deg, rgba(33, 49, 64, 0.98), rgba(17, 18, 27, 0.94));
+  --gradient-modal:
+    radial-gradient(circle at top right, rgba(148, 22, 108, 0.2), transparent 36%),
+    linear-gradient(180deg, rgba(24, 20, 31, 0.98), rgba(11, 10, 16, 0.98));
+
+  /* ---- Semantic ---- */
+  --success: #58dbbc;
+  --success-text: #b6fff0;
+  --success-soft: rgba(88, 219, 188, 0.14);
+  --success-line: rgba(88, 219, 188, 0.28);
+
+  --warning: #ffb95c;
+  --warning-text: #ffd69d;
+  --warning-soft: rgba(255, 185, 92, 0.12);
+  --warning-line: rgba(255, 185, 92, 0.26);
+
+  --danger: #ff667c;
+  --danger-text: #ffb2bf;
+  --danger-soft: rgba(255, 102, 124, 0.1);
+  --danger-line: rgba(255, 102, 124, 0.24);
+  --danger-gradient: linear-gradient(135deg, #e23a57, #e8663f);
+  --danger-contrast: #ffffff;
+
+  --info: #5d7bff;
+  --info-text: #d8ddff;
+  --info-soft: rgba(93, 123, 255, 0.14);
+  --info-line: rgba(93, 123, 255, 0.28);
+
+  /* ---- Spacing (4px base) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+
+  /* ---- Radii ---- */
+  --radius-sm: 14px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-full: 999px;
+
+  /* ---- Elevation ---- */
+  --shadow-1: 0 18px 48px rgba(0, 0, 0, 0.28);
+  --shadow-2: 0 28px 90px rgba(0, 0, 0, 0.46);
+
+  /* ---- Focus ---- */
+  --focus-ring: 2px solid var(--accent);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    /* ---- Text (warm near-black on warm off-white) ---- */
+    --text: #221d29;
+    --text-muted-1: rgba(34, 29, 41, 0.82);
+    --text-muted-2: rgba(34, 29, 41, 0.7);
+    --text-muted-3: rgba(34, 29, 41, 0.62);
+    --text-faint: rgba(34, 29, 41, 0.45);
+    --text-on-cover: rgba(255, 255, 255, 0.95);
+
+    /* ---- Accent (deeper teal so it reads on light) ---- */
+    --accent: #10a488;
+    --accent-hover: #0c8f76;
+    --accent-text: #0b6b5b;
+    --accent-contrast: #081018; /* dark ink on the bright teal→indigo button gradient */
+    --accent-soft: rgba(16, 164, 136, 0.14);
+    --accent-line: rgba(16, 164, 136, 0.4);
+    /* --accent-gradient intentionally NOT overridden: the primary button stays
+       the bright teal→indigo brand gradient in both themes. */
+
+    /* ---- Surfaces (white cards on a warm grey page) ---- */
+    --app-bg:
+      radial-gradient(circle at top left, rgba(53, 193, 181, 0.14), transparent 30%),
+      radial-gradient(circle at top right, rgba(148, 22, 108, 0.1), transparent 34%),
+      linear-gradient(180deg, #f6f2ea 0%, #efeae1 58%, #e9e3d8 100%);
+    --surface-0: #fffdf8;
+    --surface-1: rgba(28, 22, 34, 0.03);
+    --surface-2: rgba(28, 22, 34, 0.05);
+    --surface-3: rgba(28, 22, 34, 0.07);
+    --surface-inset: rgba(28, 22, 34, 0.06);
+    --surface-overlay: rgba(255, 253, 248, 0.97);
+    --scrim: rgba(40, 30, 45, 0.4);
+
+    /* ---- Borders ---- */
+    --border-soft: rgba(28, 22, 34, 0.08);
+    --border: rgba(28, 22, 34, 0.12);
+    --border-strong: rgba(28, 22, 34, 0.16);
+
+    /* ---- Decorative gradients ---- */
+    --gradient-sidebar:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(250, 247, 240, 0.86)),
+      radial-gradient(circle at top left, rgba(53, 193, 181, 0.12), transparent 42%);
+    --gradient-sidebar-active:
+      linear-gradient(135deg, rgba(16, 164, 136, 0.2), rgba(255, 255, 255, 0.7));
+    --gradient-hero:
+      radial-gradient(circle at top right, rgba(148, 22, 108, 0.12), transparent 40%),
+      radial-gradient(circle at top left, rgba(74, 178, 166, 0.16), transparent 32%),
+      linear-gradient(135deg, #ffffff, #f3eee5);
+    --gradient-playlist-hero:
+      radial-gradient(circle at top right, rgba(148, 22, 108, 0.12), transparent 38%),
+      linear-gradient(180deg, #ffffff, #f2ede4);
+    --gradient-card-active:
+      linear-gradient(135deg, rgba(16, 164, 136, 0.16), rgba(255, 255, 255, 0.7));
+    --gradient-modal:
+      radial-gradient(circle at top right, rgba(148, 22, 108, 0.08), transparent 40%),
+      linear-gradient(180deg, #ffffff, #f6f1e9);
+
+    /* ---- Semantic ---- */
+    --success: #0f9e83;
+    --success-text: #0b6b5b;
+    --success-soft: rgba(16, 164, 136, 0.14);
+    --success-line: rgba(16, 164, 136, 0.34);
+
+    --warning: #b7791f;
+    --warning-text: #7a4e00;
+    --warning-soft: rgba(183, 121, 31, 0.14);
+    --warning-line: rgba(183, 121, 31, 0.34);
+
+    --danger: #d92f4f;
+    --danger-text: #b21f38;
+    --danger-soft: rgba(217, 47, 79, 0.1);
+    --danger-line: rgba(217, 47, 79, 0.3);
+    /* --danger-gradient / --danger-contrast kept: loud red button, white ink. */
+
+    --info: #3247c8;
+    --info-text: #2c40b8;
+    --info-soft: rgba(50, 71, 200, 0.12);
+    --info-line: rgba(50, 71, 200, 0.34);
+
+    /* ---- Elevation (soft dark shadows on light) ---- */
+    --shadow-1: 0 14px 40px rgba(40, 30, 45, 0.12);
+    --shadow-2: 0 28px 70px rgba(40, 30, 45, 0.22);
+  }
+}

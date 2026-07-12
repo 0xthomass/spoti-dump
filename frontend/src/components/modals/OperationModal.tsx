@@ -145,11 +145,11 @@ export function OperationModal({
 
           <div className="modal-actions">
             {operation.status === 'running' ? (
-              <button className="ghost-button" onClick={onClose} type="button">
+              <button className="btn btn--ghost" onClick={onClose} type="button">
                 Hide
               </button>
             ) : (
-              <button onClick={onClose} type="button">
+              <button className="btn btn--primary" onClick={onClose} type="button">
                 Done
               </button>
             )}

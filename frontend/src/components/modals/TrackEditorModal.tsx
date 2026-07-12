@@ -298,7 +298,7 @@ export function TrackEditorModal({
                 />
               </label>
               <button
-                className="provider-action-button provider-action-button--secondary"
+                className="btn btn--secondary"
                 disabled={linkingIdentity || !identityValue.trim()}
                 onClick={() => void applyIdentity()}
                 type="button"
@@ -344,7 +344,7 @@ export function TrackEditorModal({
                       ))}
                       <div className="modal-actions modal-actions--inline">
                         <button
-                          className="provider-action-button provider-action-button--secondary"
+                          className="btn btn--secondary"
                           disabled={mergingConflict !== null || rejectingConflict !== null}
                           onClick={() => void mergeConflict(conflict, 'keep_source')}
                           type="button"
@@ -354,7 +354,7 @@ export function TrackEditorModal({
                             : 'Merge, keep current IDs'}
                         </button>
                         <button
-                          className="provider-action-button provider-action-button--secondary"
+                          className="btn btn--secondary"
                           disabled={mergingConflict !== null || rejectingConflict !== null}
                           onClick={() => void mergeConflict(conflict, 'keep_target')}
                           type="button"
@@ -364,7 +364,7 @@ export function TrackEditorModal({
                             : 'Merge, keep candidate IDs'}
                         </button>
                         <button
-                          className="ghost-button"
+                          className="btn btn--ghost"
                           disabled={mergingConflict !== null || rejectingConflict !== null}
                           onClick={() => void rejectConflict(conflict)}
                           type="button"
@@ -397,10 +397,10 @@ export function TrackEditorModal({
           </div>
 
           <div className="modal-actions">
-            <button className="ghost-button" onClick={onClose} type="button">
+            <button className="btn btn--ghost" onClick={onClose} type="button">
               Cancel
             </button>
-            <button disabled={saving} onClick={() => void save()} type="button">
+            <button className="btn btn--primary" disabled={saving} onClick={() => void save()} type="button">
               {saving ? 'Saving…' : 'Save Track'}
             </button>
           </div>

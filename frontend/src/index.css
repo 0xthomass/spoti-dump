@@ -1,15 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Manrope:wght@400;500;600;700;800&display=swap');
+/* Low-level element reset. Fonts are self-hosted via @fontsource (see main.tsx);
+ * colours and the page background resolve through tokens.css. */
 
 :root {
-  font-family: 'Manrope', 'Aptos', sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-  color-scheme: dark;
-  color: #f7f5f0;
-  background:
-    radial-gradient(circle at top left, rgba(53, 193, 181, 0.2), transparent 28%),
-    radial-gradient(circle at top right, rgba(148, 22, 108, 0.24), transparent 34%),
-    linear-gradient(180deg, #130f17 0%, #08070d 48%, #030305 100%);
+  color: var(--text);
+  background: var(--app-bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;

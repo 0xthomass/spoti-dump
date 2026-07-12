@@ -104,7 +104,7 @@ export function TracksPage() {
               placeholder="Search title, artist, album, ISRC"
               type="search"
             />
-            <button type="submit">Search</button>
+            <button className="btn btn--primary" type="submit">Search</button>
           </form>
           <div className="filter-row">
             {[

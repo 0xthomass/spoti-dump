@@ -253,7 +253,7 @@ export function IdentityConflictsPage() {
               placeholder="Search title, artist, album, provider ID"
               type="search"
             />
-            <button type="submit">Search</button>
+            <button className="btn btn--primary" type="submit">Search</button>
           </form>
           <div className="filter-row">
             {[
@@ -385,7 +385,7 @@ export function IdentityConflictsPage() {
 
                     <div className="modal-actions modal-actions--inline">
                       <button
-                        className="provider-action-button provider-action-button--secondary"
+                        className="btn btn--secondary"
                         disabled={mergingConflict !== null || rejectingConflict !== null}
                         onClick={() => void mergeConflict(item, 'keep_source')}
                         type="button"
@@ -395,7 +395,7 @@ export function IdentityConflictsPage() {
                           : 'Merge, keep source IDs'}
                       </button>
                       <button
-                        className="provider-action-button provider-action-button--secondary"
+                        className="btn btn--secondary"
                         disabled={mergingConflict !== null || rejectingConflict !== null}
                         onClick={() => void mergeConflict(item, 'keep_target')}
                         type="button"
@@ -405,7 +405,7 @@ export function IdentityConflictsPage() {
                           : 'Merge, keep candidate IDs'}
                       </button>
                       <button
-                        className="ghost-button"
+                        className="btn btn--ghost"
                         disabled={mergingConflict !== null || rejectingConflict !== null}
                         onClick={() => void rejectConflict(item)}
                         type="button"

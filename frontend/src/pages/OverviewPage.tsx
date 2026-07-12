@@ -245,7 +245,7 @@ export function OverviewPage() {
             <h2>Resolve Missing IDs</h2>
           </div>
           <button
-            className="provider-action-button"
+            className="btn btn--primary"
             disabled={pendingAction !== null || connectedProviderCount === 0}
             onClick={() => void runLibraryIdentity()}
             type="button"
@@ -463,7 +463,7 @@ export function OverviewPage() {
                 </div>
                 <div className="provider-actions">
                   <button
-                    className="provider-action-button"
+                    className="btn btn--primary"
                     disabled={pendingAction !== null}
                     onClick={() => {
                       if (provider.key === 'spotify') {
@@ -477,7 +477,7 @@ export function OverviewPage() {
                     {provider.connected ? 'Relink' : 'Link'}
                   </button>
                   <button
-                    className="provider-action-button provider-action-button--secondary"
+                    className="btn btn--secondary"
                     disabled={!provider.connected || pendingAction !== null || cooldownActive}
                     onClick={() => void runProviderAction(provider, 'verify')}
                     type="button"
@@ -488,7 +488,7 @@ export function OverviewPage() {
                       : 'Check Connection'}
                   </button>
                   <button
-                    className="provider-action-button provider-action-button--secondary"
+                    className="btn btn--secondary"
                     disabled={providerActionDisabled || !provider.preflight.can_pull}
                     onClick={() => void runProviderAction(provider, 'export')}
                     type="button"
@@ -497,7 +497,7 @@ export function OverviewPage() {
                     {pendingAction === `${provider.key}:export` ? 'Pulling…' : 'Pull Library'}
                   </button>
                   <button
-                    className="provider-action-button provider-action-button--secondary"
+                    className="btn btn--secondary"
                     disabled={providerActionDisabled || !provider.preflight.can_pull}
                     onClick={() => void runProviderAction(provider, 'identity')}
                     type="button"
@@ -508,7 +508,7 @@ export function OverviewPage() {
                       : 'Resolve IDs'}
                   </button>
                   <button
-                    className="provider-action-button provider-action-button--secondary"
+                    className="btn btn--secondary"
                     disabled={providerActionDisabled || !provider.preflight.can_push}
                     onClick={() => void runProviderAction(provider, 'sync')}
                     type="button"
@@ -517,7 +517,7 @@ export function OverviewPage() {
                     {pendingAction === `${provider.key}:sync` ? 'Pushing…' : 'Push Changes'}
                   </button>
                   <button
-                    className="provider-action-button provider-action-button--secondary"
+                    className="btn btn--secondary"
                     disabled={loadingPushPlan !== null}
                     onClick={() => void loadPushPlan(provider)}
                     type="button"
@@ -526,7 +526,7 @@ export function OverviewPage() {
                   </button>
                   {provider.key === 'spotify' ? (
                     <button
-                      className="provider-action-button provider-action-button--danger"
+                      className="btn btn--danger"
                       disabled={providerActionDisabled || !provider.preflight.can_reset_push}
                       onClick={() => void runProviderAction(provider, 'reset-sync')}
                       type="button"
@@ -539,7 +539,7 @@ export function OverviewPage() {
                   ) : null}
                   {provider.connected ? (
                     <button
-                      className="provider-action-button provider-action-button--ghost"
+                      className="btn btn--ghost"
                       disabled={pendingAction !== null}
                       onClick={() => void runProviderAction(provider, 'disconnect')}
                       type="button"

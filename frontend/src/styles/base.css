@@ -1,0 +1,70 @@
+/* base.css — element-level reset, typography, focus and motion.
+ * Colours resolve through tokens only. */
+
+body {
+  min-height: 100vh;
+  font-family: var(--font-body);
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+/* ---- Display typography ---- */
+.brand-lockup h1,
+.hero-copy h2,
+.panel-head h2,
+.provider-card h3,
+.conflict-card h3,
+.modal-head h2 {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* ---- Eyebrow / kicker labels ---- */
+.brand-kicker,
+.eyebrow {
+  display: inline-flex;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent-text);
+}
+
+code {
+  color: var(--accent-text);
+  word-break: break-word;
+}
+
+/* ---- Focus visibility ----
+ * Keyboard users get a clear ring on every interactive element; pointer users
+ * do not (browsers scope :focus-visible for us). No element is left with a
+ * bare outline: none. */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Elements that carry their own visuals should not show the UA outline on
+ * pointer focus, but always show the token ring on keyboard focus. */
+a:focus:not(:focus-visible),
+button:focus:not(:focus-visible),
+input:focus:not(:focus-visible),
+textarea:focus:not(:focus-visible),
+select:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---- Reduced motion ---- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
