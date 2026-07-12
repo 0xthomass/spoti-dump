@@ -7,6 +7,7 @@ use crate::domain::{
     LibraryState, LinkSource, ProviderKind, SyncState, SyncStatusRecord, TrackIdentityApplyResult,
     TrackMetadata, REJECTED_IDENTITY_CANDIDATE_MARKER,
 };
+use crate::error::{ProviderError, ProviderFailure};
 use crate::matching::cleaned_title;
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 
@@ -141,7 +142,7 @@ pub async fn reconcile_provider_identities_with_options(
                     cache.insert(cache_key, resolved.clone());
                     resolved
                 }
-                Err(error) if is_rate_limit_error(&error) => {
+                Err(error) if is_rate_limited(&error) => {
                     summary.rate_limited = true;
                     summary.unprocessed_due_rate_limit =
                         summary.tracks_missing_provider_id.saturating_sub(index);
@@ -153,7 +154,7 @@ pub async fn reconcile_provider_identities_with_options(
                     ));
                     break;
                 }
-                Err(error) if is_invalid_argument_error(&error) => {
+                Err(error) if is_invalid_argument(&error) => {
                     summary.invalid_metadata += 1;
                     let message = format!(
                         "Cannot resolve {} identity for {} because the provider rejected the generated search query: {error}",
@@ -334,11 +335,11 @@ fn default_provider_search_budget(provider: ProviderKind) -> usize {
     }
 }
 
-fn is_rate_limit_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("429 Too Many Requests") || message.contains("rate limit")
-    })
+fn is_rate_limited(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::error::provider_failure(error).map(ProviderError::failure),
+        Some(ProviderFailure::RateLimited { .. })
+    )
 }
 
 fn is_identity_merge_conflict(error: &anyhow::Error) -> bool {
@@ -372,12 +373,11 @@ fn has_rejected_identity_candidate(
         .unwrap_or(false)
 }
 
-fn is_invalid_argument_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("INVALID_ARGUMENT")
-            || message.contains("Request contains an invalid argument")
-    })
+fn is_invalid_argument(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::error::provider_failure(error).map(ProviderError::failure),
+        Some(ProviderFailure::InvalidArgument)
+    )
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 pub mod domain;
+pub mod error;
 pub mod identity;
 pub mod matching;
 pub mod provider;
@@ -7,13 +8,11 @@ pub mod storage;
 pub mod web_app;
 
 use anyhow::{Context, Result};
-use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use crate::domain::{
-    merge_provider_snapshot, LibraryState, MergeSummary, ProviderCooldown, ProviderKind,
-    SyncSummary,
+    merge_provider_snapshot, LibraryState, MergeSummary, ProviderKind, SyncSummary,
 };
 use crate::provider::{ProviderCapability, StreamingProvider};
 use crate::providers::spotify::SpotifyProvider;
@@ -413,7 +412,7 @@ async fn sync_provider_and_persist(
         }
         Err(sync_error) => {
             if let Some(cooldown) =
-                provider_cooldown_from_error(provider.kind(), &sync_error.to_string())
+                providers::policy::cooldown_from_error(provider.kind(), &sync_error)
             {
                 storage::save_provider_cooldown(&cooldown)?;
             }
@@ -454,7 +453,7 @@ fn ensure_provider_supports_library_reset(provider: ProviderKind) -> Result<()> 
 }
 
 fn remember_provider_failure(provider: ProviderKind, error: &anyhow::Error) {
-    let Some(cooldown) = provider_cooldown_from_error(provider, &error.to_string()) else {
+    let Some(cooldown) = providers::policy::cooldown_from_error(provider, error) else {
         return;
     };
 
@@ -471,57 +470,6 @@ fn remember_provider_failure(provider: ProviderKind, error: &anyhow::Error) {
         provider.display_name(),
         cooldown.blocked_until.to_rfc3339()
     );
-}
-
-fn provider_cooldown_from_error(provider: ProviderKind, message: &str) -> Option<ProviderCooldown> {
-    if !is_rate_limited_message(message) {
-        return None;
-    }
-
-    let now = Utc::now();
-    let default_seconds = match provider {
-        ProviderKind::Spotify => 15 * 60,
-        ProviderKind::YoutubeMusic => 30 * 60,
-    };
-    let blocked_seconds = extract_retry_after_seconds(message)
-        .unwrap_or(default_seconds)
-        .max(default_seconds);
-
-    Some(ProviderCooldown {
-        provider,
-        blocked_until: now + Duration::seconds(blocked_seconds),
-        reason: message.to_string(),
-        updated_at: now,
-    })
-}
-
-fn is_rate_limited_message(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    lowered.contains("429")
-        || lowered.contains("too many requests")
-        || lowered.contains("rate limit")
-        || lowered.contains("rate-limit")
-}
-
-fn extract_retry_after_seconds(message: &str) -> Option<i64> {
-    let lowered = message.to_ascii_lowercase();
-    for marker in ["retry after", "retry-after", "retry_after"] {
-        let Some(index) = lowered.find(marker) else {
-            continue;
-        };
-        let suffix = &lowered[index + marker.len()..];
-        let digits = suffix
-            .chars()
-            .skip_while(|character| {
-                character.is_whitespace() || matches!(character, ':' | '=' | '(')
-            })
-            .take_while(|character| character.is_ascii_digit())
-            .collect::<String>();
-        if let Ok(seconds) = digits.parse::<i64>() {
-            return Some(seconds.max(1));
-        }
-    }
-    None
 }
 
 fn print_merge_summary(summary: &MergeSummary, state: &LibraryState) {

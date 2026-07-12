@@ -12,7 +12,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, get_service, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -32,6 +32,7 @@ use crate::domain::{
 };
 use crate::matching::metadata_similarity;
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
+use crate::providers::policy;
 use crate::providers::spotify::SpotifyProvider;
 use crate::providers::youtube_music::YoutubeMusicProvider;
 use crate::storage;
@@ -148,6 +149,10 @@ enum ApiErrorKind {
 struct ApiError {
     kind: ApiErrorKind,
     message: String,
+    /// The originating `anyhow` error, preserved so cooldown/health decisions
+    /// can be made from the typed [`crate::error::ProviderError`] in its chain
+    /// rather than from the display message.
+    source: Option<anyhow::Error>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +165,7 @@ impl ApiError {
         Self {
             kind: ApiErrorKind::BadRequest,
             message: message.into(),
+            source: None,
         }
     }
 
@@ -167,6 +173,7 @@ impl ApiError {
         Self {
             kind: ApiErrorKind::NotFound,
             message: message.into(),
+            source: None,
         }
     }
 
@@ -174,6 +181,7 @@ impl ApiError {
         Self {
             kind: ApiErrorKind::Internal,
             message: message.into(),
+            source: None,
         }
     }
 
@@ -181,7 +189,15 @@ impl ApiError {
         Self {
             kind: ApiErrorKind::RateLimited,
             message: message.into(),
+            source: None,
         }
+    }
+
+    /// Attaches the originating `anyhow` error so downstream cooldown/health
+    /// classification can inspect the typed provider failure it carries.
+    fn with_source(mut self, source: anyhow::Error) -> Self {
+        self.source = Some(source);
+        self
     }
 
     fn status_code(&self) -> StatusCode {
@@ -350,85 +366,29 @@ fn save_provider_health(health: ProviderHealth) -> Result<(), ApiError> {
     storage::save_provider_health(&health).map_err(ApiError::from)
 }
 
-fn is_connection_health_failure(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    lowered.contains("expired")
-        || lowered.contains("incomplete")
-        || lowered.contains("authentication")
-        || lowered.contains("authorization")
-        || lowered.contains("unauthorized")
-        || lowered.contains("forbidden")
-        || lowered.contains("sign in")
-        || lowered.contains("signin")
-        || lowered.contains("missing scopes")
-        || lowered.contains("401")
-        || lowered.contains("403")
-}
-
-fn provider_cooldown_from_error(provider: ProviderKind, message: &str) -> Option<ProviderCooldown> {
-    if !is_rate_limited_message(message) {
-        return None;
-    }
-
-    let now = Utc::now();
-    let default_seconds = match provider {
-        ProviderKind::Spotify => 15 * 60,
-        ProviderKind::YoutubeMusic => 30 * 60,
-    };
-    let blocked_seconds = extract_retry_after_seconds(message)
-        .unwrap_or(default_seconds)
-        .max(default_seconds);
-
-    Some(ProviderCooldown {
-        provider,
-        blocked_until: now + Duration::seconds(blocked_seconds),
-        reason: message.to_string(),
-        updated_at: now,
-    })
-}
-
+/// Records a cooldown and/or unhealthy state after an identity-sync provider
+/// failure, classifying the failure from the typed provider error in the
+/// `anyhow` chain. A missing source (e.g. a plain bad-request) records nothing.
 fn remember_identity_provider_failure(
     provider: ProviderKind,
-    message: &str,
+    error: Option<&anyhow::Error>,
 ) -> Result<(), ApiError> {
-    if let Some(cooldown) = provider_cooldown_from_error(provider, message) {
+    let Some(error) = error else {
+        return Ok(());
+    };
+
+    if let Some(cooldown) = policy::cooldown_from_error(provider, error) {
         storage::save_provider_cooldown(&cooldown).map_err(ApiError::from)?;
     }
 
-    if is_connection_health_failure(message) {
-        save_provider_health(provider_health_failed(provider, message.to_string()))?;
+    if policy::is_connection_health_failure(error) {
+        save_provider_health(provider_health_failed(
+            provider,
+            sanitize_error_message(&error.to_string()),
+        ))?;
     }
 
     Ok(())
-}
-
-fn is_rate_limited_message(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    lowered.contains("429")
-        || lowered.contains("too many requests")
-        || lowered.contains("rate limit")
-        || lowered.contains("rate-limit")
-}
-
-fn extract_retry_after_seconds(message: &str) -> Option<i64> {
-    let lowered = message.to_ascii_lowercase();
-    for marker in ["retry after", "retry-after", "retry_after"] {
-        let Some(index) = lowered.find(marker) else {
-            continue;
-        };
-        let suffix = &lowered[index + marker.len()..];
-        let digits = suffix
-            .chars()
-            .skip_while(|character| {
-                character.is_whitespace() || matches!(character, ':' | '=' | '(')
-            })
-            .take_while(|character| character.is_ascii_digit())
-            .collect::<String>();
-        if let Ok(seconds) = digits.parse::<i64>() {
-            return Some(seconds.max(1));
-        }
-    }
-    None
 }
 
 fn looks_like_placeholder_ytmusic_cookie(cookie: &str) -> bool {
@@ -443,7 +403,11 @@ fn looks_like_placeholder_ytmusic_authuser(authuser: &str) -> bool {
 
 impl From<anyhow::Error> for ApiError {
     fn from(value: anyhow::Error) -> Self {
-        Self::internal(sanitize_error_message(&value.to_string()))
+        Self {
+            kind: ApiErrorKind::Internal,
+            message: sanitize_error_message(&value.to_string()),
+            source: Some(value),
+        }
     }
 }
 
@@ -1589,7 +1553,7 @@ async fn api_start_provider_verify(
                 Err(error) => {
                     let message = sanitize_error_message(&error.to_string());
                     save_provider_health(provider_health_failed(provider, message.clone()))?;
-                    Err(ApiError::bad_request(message))
+                    Err(ApiError::bad_request(message).with_source(error))
                 }
             }
         }
@@ -1923,7 +1887,7 @@ async fn api_start_library_identity(
                         Ok(provider_client) => provider_client,
                         Err(error) => {
                             let message = sanitize_error_message(&error.message);
-                            remember_identity_provider_failure(provider, &message)?;
+                            remember_identity_provider_failure(provider, error.source.as_ref())?;
                             warnings.push(format!(
                                 "Skipped {} identity sync: {}",
                                 provider.display_name(),
@@ -1951,7 +1915,7 @@ async fn api_start_library_identity(
                     Ok(summary) => summary,
                     Err(error) => {
                         let message = sanitize_error_message(&error.to_string());
-                        remember_identity_provider_failure(provider, &message)?;
+                        remember_identity_provider_failure(provider, Some(&error))?;
                         write_state(state.clone()).await?;
                         warnings.push(format!(
                             "{} identity sync stopped early: {}",
@@ -3418,10 +3382,15 @@ fn finish_operation(
                 }
                 Err(error) => {
                     if !matches!(operation.kind, OperationKind::IdentityAll) {
-                        cooldown_to_save =
-                            provider_cooldown_from_error(operation.provider, &error.message);
+                        if let Some(source) = &error.source {
+                            cooldown_to_save =
+                                policy::cooldown_from_error(operation.provider, source);
+                        }
                         if matches!(operation.kind, OperationKind::Verify)
-                            || is_connection_health_failure(&error.message)
+                            || error
+                                .source
+                                .as_ref()
+                                .is_some_and(policy::is_connection_health_failure)
                         {
                             health_to_save = Some(provider_health_failed(
                                 operation.provider,
@@ -5426,10 +5395,9 @@ mod tests {
     };
 
     use super::{
-        bulk_merge_identity_conflict_rows, coverage_matches, extract_retry_after_seconds,
-        identity_conflict_rows, identity_conflict_rows_filtered, identity_gap_rows,
-        is_request_origin_allowed, normalize_manual_provider_track_id,
-        provider_cooldown_from_error, provider_health_failed, provider_preflight_payload,
+        bulk_merge_identity_conflict_rows, coverage_matches, identity_conflict_rows,
+        identity_conflict_rows_filtered, identity_gap_rows, is_request_origin_allowed,
+        normalize_manual_provider_track_id, provider_health_failed, provider_preflight_payload,
         provider_push_plan_payload, raw_table_value_to_string, IdentityConflictFilters,
     };
     use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method};
@@ -5538,20 +5506,6 @@ mod tests {
             raw_table_value_to_string("tracks", "title", ValueRef::Text(b"Sirius")),
             "Sirius"
         );
-    }
-
-    #[test]
-    fn classifies_provider_rate_limit_as_runtime_cooldown() {
-        let cooldown = provider_cooldown_from_error(
-            ProviderKind::Spotify,
-            "Failed to get items from Spotify (429 Too Many Requests, retry after 60s): too many requests",
-        )
-        .unwrap();
-
-        assert_eq!(cooldown.provider, ProviderKind::Spotify);
-        assert!(cooldown.reason.contains("429"));
-        assert!(cooldown.blocked_until > cooldown.updated_at);
-        assert_eq!(extract_retry_after_seconds("retry after 60s"), Some(60));
     }
 
     #[test]

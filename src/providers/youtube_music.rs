@@ -16,6 +16,7 @@ use crate::domain::{
     ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
     SyncStatusRecord, SyncSummary, TrackMetadata, YoutubeMusicConnectionConfig,
 };
+use crate::error::ProviderError;
 use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 
@@ -115,9 +116,9 @@ impl YoutubeMusicProvider {
             )
             .await?;
         if contains_key_recursive(&response, "signInEndpoint") {
-            anyhow::bail!(
-                "YouTube Music browser headers are expired or incomplete. Capture fresh signed-in headers from a music.youtube.com browse request and relink the account."
-            );
+            return Err(anyhow::Error::new(ProviderError::auth_failed(
+                "YouTube Music browser headers are expired or incomplete. Capture fresh signed-in headers from a music.youtube.com browse request and relink the account.",
+            )));
         }
         Ok(())
     }
@@ -264,13 +265,23 @@ impl YoutubeMusicProvider {
                             sleep(Duration::from_secs(1 << attempt)).await;
                             continue;
                         }
-                        anyhow::bail!("YouTube Music API returned an error: {error}");
+                        return Err(ytmusic_status_error(
+                            "YouTube Music API returned an error",
+                            code,
+                            None,
+                            &error.to_string(),
+                        ));
                     }
 
                     return Ok(response_json);
                 }
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    let retry_after = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(parse_ytmusic_retry_after);
                     let response_body = response
                         .text()
                         .await
@@ -279,14 +290,19 @@ impl YoutubeMusicProvider {
                         sleep(Duration::from_secs(1 << attempt)).await;
                         continue;
                     }
-                    anyhow::bail!("YouTube Music request failed ({status}): {response_body}");
+                    return Err(ytmusic_status_error(
+                        "YouTube Music request failed",
+                        status,
+                        retry_after,
+                        &response_body,
+                    ));
                 }
                 Err(error) => {
                     if attempt < 4 {
                         sleep(Duration::from_secs(1 << attempt)).await;
                         continue;
                     }
-                    return Err(error.into());
+                    return Err(ytmusic_transport_error(error));
                 }
             }
         }
@@ -574,7 +590,7 @@ impl StreamingProvider for YoutubeMusicProvider {
                                     now,
                                 ),
                             );
-                            return Err(error.into());
+                            return Err(ytmusic_client_error(error));
                         }
                     }
                     summary.saved_tracks_synced += 1;
@@ -719,7 +735,8 @@ impl StreamingProvider for YoutubeMusicProvider {
                         playlist.description.as_deref(),
                         Privacy::Private,
                     )
-                    .await?;
+                    .await
+                    .map_err(ytmusic_client_error)?;
 
                 for chunk in resolved_video_ids.chunks(100) {
                     if let Err(error) = self
@@ -739,7 +756,7 @@ impl StreamingProvider for YoutubeMusicProvider {
                                 now,
                             ),
                         );
-                        return Err(error.into());
+                        return Err(ytmusic_client_error(error));
                     }
                 }
 
@@ -835,13 +852,19 @@ impl StreamingProvider for YoutubeMusicProvider {
 
     async fn remove_saved_track(&self, provider_track_id: &str) -> Result<()> {
         self.verify_connection().await?;
-        self.client.unlike_song(provider_track_id).await?;
+        self.client
+            .unlike_song(provider_track_id)
+            .await
+            .map_err(ytmusic_client_error)?;
         Ok(())
     }
 
     async fn delete_playlist(&self, provider_playlist_id: &str) -> Result<()> {
         self.verify_connection().await?;
-        self.client.delete_playlist(provider_playlist_id).await?;
+        self.client
+            .delete_playlist(provider_playlist_id)
+            .await
+            .map_err(ytmusic_client_error)?;
         Ok(())
     }
 }
@@ -1103,6 +1126,137 @@ fn playlist_track_to_observed(track: &ytmusicapi::PlaylistTrack) -> Option<Obser
 
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 409 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Builds the typed [`ProviderError`] for a non-success YouTube Music response
+/// observed on the crate-internal `reqwest` path, where the numeric status code
+/// (and optional `Retry-After`) is in hand.
+fn ytmusic_status_error(
+    context: &str,
+    status: u16,
+    retry_after: Option<Duration>,
+    body: &str,
+) -> anyhow::Error {
+    let message = format!("{context} ({status}): {body}");
+    let provider_error = if looks_like_bot_block(body) {
+        ProviderError::blocked(message)
+    } else {
+        match status {
+            429 => ProviderError::rate_limited(message, retry_after),
+            401 | 403 => ProviderError::auth_failed(message),
+            400 => ProviderError::invalid_argument(message),
+            other => ProviderError::http(message, other),
+        }
+    };
+    anyhow::Error::new(provider_error)
+}
+
+/// Classifies a transport-level `reqwest` error from the YouTube Music
+/// `reqwest` path, mapping connect/timeout failures to
+/// [`ProviderFailure::Network`](crate::error::ProviderFailure).
+fn ytmusic_transport_error(error: reqwest::Error) -> anyhow::Error {
+    if error.is_connect() || error.is_timeout() {
+        anyhow::Error::new(ProviderError::network(format!(
+            "YouTube Music request transport failure: {error}"
+        )))
+    } else {
+        error.into()
+    }
+}
+
+/// Wraps an error returned by the `ytmusicapi` crate, attaching a typed
+/// [`ProviderError`] when the string form is recognizable.
+///
+/// The `ytmusicapi` crate surfaces failures as `Display` strings rather than
+/// structured statuses, so this is the sole surviving message-sniffing
+/// classifier — and it lives at the boundary where those errors are received.
+fn ytmusic_client_error(error: ytmusicapi::Error) -> anyhow::Error {
+    match classify_ytmusic_error(&error.to_string()) {
+        Some(provider_error) => anyhow::Error::new(provider_error),
+        None => error.into(),
+    }
+}
+
+/// Classifies a `ytmusicapi` error string into a typed [`ProviderError`].
+///
+/// Returns `None` when the string carries no recognizable signal, in which case
+/// the caller keeps the original error unclassified.
+fn classify_ytmusic_error(message: &str) -> Option<ProviderError> {
+    let lowered = message.to_ascii_lowercase();
+
+    if looks_like_bot_block(&lowered) {
+        return Some(ProviderError::blocked(message));
+    }
+
+    if lowered.contains("429")
+        || lowered.contains("too many requests")
+        || lowered.contains("quota")
+        || lowered.contains("resource_exhausted")
+        || lowered.contains("rate limit")
+        || lowered.contains("rate-limit")
+    {
+        return Some(ProviderError::rate_limited(message, None));
+    }
+
+    if let Some(status) = parse_ytmusic_server_status(&lowered) {
+        return Some(match status {
+            401 | 403 => ProviderError::auth_failed(message),
+            400 => ProviderError::invalid_argument(message),
+            other => ProviderError::http(message, other),
+        });
+    }
+
+    if lowered.contains("authentication required")
+        || lowered.contains("invalid auth")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+        || lowered.contains("sign in")
+        || lowered.contains("signin")
+    {
+        return Some(ProviderError::auth_failed(message));
+    }
+
+    if lowered.contains("invalid input") || lowered.contains("invalid_argument") {
+        return Some(ProviderError::invalid_argument(message));
+    }
+
+    None
+}
+
+/// Extracts the HTTP status from a `ytmusicapi` `Error::Server` display string
+/// of the form `Server error {status}: {message}`.
+fn parse_ytmusic_server_status(lowered_message: &str) -> Option<u16> {
+    let marker = "server error ";
+    let index = lowered_message.find(marker)?;
+    let suffix = &lowered_message[index + marker.len()..];
+    let digits = suffix
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<u16>().ok()
+}
+
+/// Detects Google's anti-bot / "automated queries" interstitial in a response
+/// body or error string.
+fn looks_like_bot_block(raw: &str) -> bool {
+    let lowered = raw.to_ascii_lowercase();
+    lowered.contains("automated queries") || lowered.contains("unusual traffic")
+}
+
+/// Parses a `Retry-After` header value (delta-seconds) into a [`Duration`].
+fn parse_ytmusic_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .or_else(|| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                .map(|seconds| seconds.ceil() as u64)
+        })
+        .map(Duration::from_secs)
 }
 
 #[cfg(test)]

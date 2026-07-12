@@ -22,6 +22,7 @@ use crate::domain::{
     ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
     SpotifyConnectionConfig, SyncStatusRecord, SyncSummary, TrackMetadata,
 };
+use crate::error::ProviderError;
 use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 
@@ -159,10 +160,9 @@ impl SpotifyProvider {
         )
         .await?;
         if !token_has_required_scopes(response.scope.as_deref(), capability) {
-            anyhow::bail!(
-                "Stored Spotify connection is missing scopes required for {:?}",
-                capability
-            );
+            return Err(anyhow::Error::new(ProviderError::auth_failed(format!(
+                "Stored Spotify connection is missing scopes required for {capability:?}"
+            ))));
         }
 
         Ok(Self {
@@ -243,15 +243,21 @@ impl SpotifyProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_seconds);
             let text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Could not read response text".to_string());
-            anyhow::bail!(
-                "Spotify API request failed with status: {}. Response: {}",
+            return Err(spotify_status_error(
+                "Spotify API request failed",
                 status,
-                text
-            );
+                retry_after,
+                &text,
+            ));
         }
 
         let response: AccessTokenResponse =
@@ -1342,15 +1348,21 @@ async fn get_access_token_from_authorization_code(
 
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after_seconds);
         let text = response
             .text()
             .await
             .unwrap_or_else(|_| "Could not read response text".to_string());
-        anyhow::bail!(
-            "Spotify API request failed with status: {}. Response: {}",
+        return Err(spotify_status_error(
+            "Spotify API request failed",
             status,
-            text
-        );
+            retry_after,
+            &text,
+        ));
     }
 
     let response: AccessTokenResponse =
@@ -1397,15 +1409,21 @@ async fn refresh_access_token(
 
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_retry_after_seconds);
         let text = response
             .text()
             .await
             .unwrap_or_else(|_| "Could not read response text".to_string());
-        anyhow::bail!(
-            "Spotify API request failed with status: {}. Response: {}",
+        return Err(spotify_status_error(
+            "Spotify API request failed",
             status,
-            text
-        );
+            retry_after,
+            &text,
+        ));
     }
 
     response
@@ -1533,10 +1551,42 @@ async fn response_error(context: &str, response: reqwest::Response) -> anyhow::E
         .text()
         .await
         .unwrap_or_else(|_| "Could not read response body".to_string());
-    let retry_after_detail = retry_after
-        .map(|seconds| format!(", retry after {seconds}s"))
-        .unwrap_or_default();
-    anyhow::anyhow!("{context} ({status}{retry_after_detail}): {body}")
+    spotify_status_error(context, status, retry_after, &body)
+}
+
+/// Builds the typed [`ProviderError`] for a non-success Spotify HTTP response.
+///
+/// This is the Spotify classification boundary: the `Retry-After` header is
+/// carried structurally as a [`Duration`] on the rate-limit variant, so nothing
+/// downstream re-parses message text.
+fn spotify_status_error(
+    context: &str,
+    status: StatusCode,
+    retry_after: Option<u64>,
+    body: &str,
+) -> anyhow::Error {
+    let message = format!("{context} ({status}): {body}");
+    let provider_error = match status {
+        StatusCode::TOO_MANY_REQUESTS => {
+            ProviderError::rate_limited(message, retry_after.map(Duration::from_secs))
+        }
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderError::auth_failed(message),
+        StatusCode::BAD_REQUEST => ProviderError::invalid_argument(message),
+        other => ProviderError::http(message, other.as_u16()),
+    };
+    anyhow::Error::new(provider_error)
+}
+
+/// Classifies a transport-level `reqwest` error, mapping connect/timeout
+/// failures to [`ProviderFailure::Network`](crate::error::ProviderFailure).
+fn spotify_transport_error(error: reqwest::Error) -> anyhow::Error {
+    if error.is_connect() || error.is_timeout() {
+        anyhow::Error::new(ProviderError::network(format!(
+            "Spotify request transport failure: {error}"
+        )))
+    } else {
+        error.into()
+    }
 }
 
 fn build_http_client() -> Result<reqwest::Client> {
@@ -1599,10 +1649,10 @@ async fn send_request_with_retry_policy(
                 );
                 sleep(delay).await;
                 if error.is_builder() {
-                    return Err(error.into());
+                    return Err(spotify_transport_error(error));
                 }
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(spotify_transport_error(error)),
         }
     }
 
