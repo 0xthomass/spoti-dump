@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 
 use super::playlist::PlaylistEntity;
 use super::sync::SyncStatusRecord;
-use super::track::TrackEntity;
+use super::track::{IdentityConflictStatus, TrackEntity};
 
-pub const LIBRARY_STATE_FORMAT_VERSION: u32 = 4;
+pub const LIBRARY_STATE_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LibraryState {
@@ -61,6 +61,9 @@ impl LibraryState {
             }
             let mut conflict_candidates = HashSet::new();
             for conflict in &track.identity_conflicts {
+                // The provider is a typed `ProviderKind`, so it always names a
+                // provider the app knows about; there is nothing else to check
+                // for provider validity here.
                 if !conflict_candidates
                     .insert((conflict.provider, conflict.candidate_provider_id.as_str()))
                 {
@@ -70,6 +73,18 @@ impl LibraryState {
                         conflict.candidate_provider_id,
                         track.id
                     );
+                }
+                if conflict.status == IdentityConflictStatus::Open {
+                    if let Some(link) = track.provider_links.get(conflict.provider.as_key()) {
+                        if link.provider_id == conflict.candidate_provider_id {
+                            anyhow::bail!(
+                                "Track '{}' has an open identity conflict for {} ID '{}' that equals its own linked ID.",
+                                track.id,
+                                conflict.provider.as_key(),
+                                conflict.candidate_provider_id
+                            );
+                        }
+                    }
                 }
             }
         }

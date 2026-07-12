@@ -8,8 +8,6 @@ use serde::{Deserialize, Serialize};
 use super::provider::ProviderKind;
 use super::sync::SyncStatusRecord;
 
-pub const REJECTED_IDENTITY_CANDIDATE_MARKER: &str = "Rejected identity candidate";
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrackEntity {
     pub id: String,
@@ -25,9 +23,13 @@ pub struct TrackEntity {
 }
 
 impl TrackEntity {
-    /// Records an open identity conflict for `provider` unless a conflict with
-    /// the same candidate provider ID (of any status) is already present.
-    /// Returns true when a new conflict was added.
+    /// Records an open identity conflict for `provider`.
+    ///
+    /// At most one conflict row exists per `(provider, candidate_provider_id)`.
+    /// Re-detecting an already-open conflict refreshes its `detected_at` and
+    /// `confidence` in place. A rejected conflict is a permanent tombstone:
+    /// re-detection must NOT resurrect it, so the candidate is never
+    /// re-proposed. Returns true only when a brand-new open row was added.
     pub fn record_identity_conflict(
         &mut self,
         provider: ProviderKind,
@@ -36,9 +38,13 @@ impl TrackEntity {
         detected_at: DateTime<Utc>,
     ) -> bool {
         let candidate_provider_id = candidate_provider_id.into();
-        if self.identity_conflicts.iter().any(|conflict| {
+        if let Some(existing) = self.identity_conflicts.iter_mut().find(|conflict| {
             conflict.provider == provider && conflict.candidate_provider_id == candidate_provider_id
         }) {
+            if existing.status == IdentityConflictStatus::Open {
+                existing.detected_at = detected_at;
+                existing.confidence = confidence.or(existing.confidence);
+            }
             return false;
         }
         self.identity_conflicts.push(TrackIdentityConflict {
@@ -50,6 +56,49 @@ impl TrackEntity {
             rejected_at: None,
         });
         true
+    }
+
+    /// Flips an open identity conflict for `(provider, candidate_provider_id)`
+    /// into a rejected tombstone. Returns true when an open row was rejected;
+    /// false when no such open conflict exists (already rejected or absent).
+    pub fn reject_identity_conflict(
+        &mut self,
+        provider: ProviderKind,
+        candidate_provider_id: &str,
+        rejected_at: DateTime<Utc>,
+    ) -> bool {
+        let Some(conflict) = self.identity_conflicts.iter_mut().find(|conflict| {
+            conflict.provider == provider
+                && conflict.candidate_provider_id == candidate_provider_id
+                && conflict.status == IdentityConflictStatus::Open
+        }) else {
+            return false;
+        };
+        conflict.status = IdentityConflictStatus::Rejected;
+        conflict.rejected_at = Some(rejected_at);
+        true
+    }
+
+    /// True when `provider`'s `candidate_provider_id` has been rejected as an
+    /// identity match for this track (a tombstone that must never be
+    /// re-proposed).
+    pub fn has_rejected_identity_conflict(
+        &self,
+        provider: ProviderKind,
+        candidate_provider_id: &str,
+    ) -> bool {
+        self.identity_conflicts.iter().any(|conflict| {
+            conflict.provider == provider
+                && conflict.candidate_provider_id == candidate_provider_id
+                && conflict.status == IdentityConflictStatus::Rejected
+        })
+    }
+
+    /// Open (unresolved) identity conflicts, in stored order.
+    pub fn open_identity_conflicts(&self) -> impl Iterator<Item = &TrackIdentityConflict> {
+        self.identity_conflicts
+            .iter()
+            .filter(|conflict| conflict.status == IdentityConflictStatus::Open)
     }
 }
 
@@ -109,6 +158,33 @@ pub struct TrackIdentityConflict {
 pub enum IdentityConflictStatus {
     Open,
     Rejected,
+}
+
+impl IdentityConflictStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdentityConflictStatus::Open => "open",
+            IdentityConflictStatus::Rejected => "rejected",
+        }
+    }
+}
+
+impl fmt::Display for IdentityConflictStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for IdentityConflictStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "open" => Ok(Self::Open),
+            "rejected" => Ok(Self::Rejected),
+            _ => anyhow::bail!("Unsupported identity conflict status '{value}'"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

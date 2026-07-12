@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use spoti_dump::domain::{
-    new_canonical_id, LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderKind,
-    ProviderTrackArtwork, ProviderTrackLink, SavedTrackEntry, SyncStatusRecord, TrackEntity,
-    TrackMetadata,
+    new_canonical_id, IdentityConflictStatus, LibraryState, LinkSource, PlaylistEntity,
+    PlaylistEntry, ProviderKind, ProviderTrackArtwork, ProviderTrackLink, SavedTrackEntry,
+    SyncStatusRecord, TrackEntity, TrackIdentityConflict, TrackMetadata,
 };
 
 struct SeedTrack {
@@ -172,18 +172,16 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        let mut identity_conflicts = Vec::new();
         if let Some(candidate) = seed.conflict_candidate {
-            provider_state.insert(
-                ProviderKind::YoutubeMusic.as_key().to_string(),
-                SyncStatusRecord::error_with_provider_item_id(
-                    format!(
-                        "Skipped YouTube Music identity '{candidate}' because it would merge tracks with conflicting provider IDs."
-                    ),
-                    candidate,
-                    Some(0.88),
-                    now,
-                ),
-            );
+            identity_conflicts.push(TrackIdentityConflict {
+                provider: ProviderKind::YoutubeMusic,
+                candidate_provider_id: candidate.to_string(),
+                confidence: Some(0.88),
+                detected_at: now,
+                status: IdentityConflictStatus::Open,
+                rejected_at: None,
+            });
         }
 
         state.tracks.push(TrackEntity {
@@ -202,7 +200,7 @@ fn main() -> anyhow::Result<()> {
             provider_links,
             provider_artwork,
             provider_state,
-            identity_conflicts: Vec::new(),
+            identity_conflicts,
         });
         track_ids.push(track_id);
     }

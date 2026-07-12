@@ -218,6 +218,26 @@ impl LibraryState {
         added
     }
 
+    /// Rejects an open identity conflict on `track_id`, turning it into a
+    /// permanent tombstone so the candidate is never re-proposed. Returns true
+    /// when an open conflict was rejected.
+    pub fn reject_track_identity_conflict(
+        &mut self,
+        track_id: &str,
+        provider: ProviderKind,
+        candidate_provider_id: &str,
+        rejected_at: DateTime<Utc>,
+    ) -> bool {
+        let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) else {
+            return false;
+        };
+        let rejected = track.reject_identity_conflict(provider, candidate_provider_id, rejected_at);
+        if rejected {
+            self.touch();
+        }
+        rejected
+    }
+
     pub fn apply_track_identity(
         &mut self,
         track_id: &str,

@@ -10,7 +10,7 @@ use spoti_dump::domain::{
     ObservedPlaylistTrack, ObservedSavedTrack, ObservedTrack, PlaylistEntity, PlaylistEntry,
     ProviderCooldown, ProviderHealth, ProviderKind, ProviderLibrarySnapshot, ProviderTrackArtwork,
     SavedTrackEntry, SpotifyConnectionConfig, SyncState, SyncStatusRecord, TrackEntity,
-    TrackMergeConflictResolution, TrackMetadata,
+    TrackIdentityConflict, TrackMergeConflictResolution, TrackMetadata,
 };
 use spoti_dump::storage::{
     create_manual_library_backup_in, database_health_in, database_path_in, export_csv,
@@ -388,6 +388,119 @@ fn validation_rejects_duplicate_identity_conflicts_on_a_track() {
 }
 
 #[test]
+fn validation_rejects_open_conflict_matching_own_link() {
+    let mut state = LibraryState::new();
+    let now = Utc::now();
+    let mut track = track_entity("track-a", "Fallout 3 Theme");
+    // A track cannot have an OPEN conflict for a candidate that equals its own
+    // established link for that provider.
+    assert!(track.record_identity_conflict(ProviderKind::Spotify, "spotify-self", None, now));
+    state.tracks.push(track);
+    assert!(state.upsert_track_link(
+        "track-a",
+        ProviderKind::Spotify,
+        "spotify-self",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    ));
+
+    let error = state.validate().unwrap_err().to_string();
+    assert!(error.contains("equals its own linked ID"));
+
+    // Rejecting the conflict turns it into a tombstone, which is allowed to
+    // coexist with the link.
+    assert!(state.reject_track_identity_conflict(
+        "track-a",
+        ProviderKind::Spotify,
+        "spotify-self",
+        now,
+    ));
+    state.validate().unwrap();
+}
+
+#[test]
+fn identity_conflict_lifecycle_survives_save_load_and_rejection_is_permanent() {
+    let temp = tempdir().unwrap();
+    let now = Utc::now();
+    let mut state = LibraryState::new();
+    state.tracks.push(track_entity("src", "Disputed"));
+    state.tracks.push(track_entity("own", "Disputed"));
+    assert!(state.upsert_track_link(
+        "own",
+        ProviderKind::YoutubeMusic,
+        "youtube-owner",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    ));
+    // Record an open conflict on the source track and persist it.
+    assert!(state.record_track_identity_conflict(
+        "src",
+        ProviderKind::YoutubeMusic,
+        "youtube-owner",
+        Some(0.95),
+        now,
+    ));
+    write_library_state_in(temp.path(), &state).unwrap();
+
+    let loaded = read_library_state_in(temp.path(), false).unwrap();
+    let src = loaded
+        .tracks
+        .iter()
+        .find(|track| track.id == "src")
+        .unwrap();
+    assert_eq!(src.identity_conflicts.len(), 1);
+    assert_eq!(
+        src.identity_conflicts[0].status,
+        IdentityConflictStatus::Open
+    );
+    assert_eq!(src.identity_conflicts[0].confidence, Some(0.95));
+
+    // Reject the conflict and persist the tombstone.
+    let mut loaded = loaded;
+    assert!(loaded.reject_track_identity_conflict(
+        "src",
+        ProviderKind::YoutubeMusic,
+        "youtube-owner",
+        now,
+    ));
+    write_library_state_in(temp.path(), &loaded).unwrap();
+
+    let mut reloaded = read_library_state_in(temp.path(), false).unwrap();
+    let src = reloaded
+        .tracks
+        .iter()
+        .find(|track| track.id == "src")
+        .unwrap();
+    assert_eq!(src.identity_conflicts.len(), 1);
+    assert_eq!(
+        src.identity_conflicts[0].status,
+        IdentityConflictStatus::Rejected
+    );
+    assert!(src.identity_conflicts[0].rejected_at.is_some());
+
+    // Re-detecting the same candidate must not resurrect the tombstone.
+    assert!(!reloaded.record_track_identity_conflict(
+        "src",
+        ProviderKind::YoutubeMusic,
+        "youtube-owner",
+        Some(0.99),
+        now,
+    ));
+    let src = reloaded
+        .tracks
+        .iter()
+        .find(|track| track.id == "src")
+        .unwrap();
+    assert_eq!(src.identity_conflicts.len(), 1);
+    assert_eq!(
+        src.identity_conflicts[0].status,
+        IdentityConflictStatus::Rejected
+    );
+}
+
+#[test]
 fn merge_provider_snapshot_keeps_saved_tracks_append_only_when_unseen_later() {
     let captured_at = Utc::now();
     let initial_snapshot = ProviderLibrarySnapshot {
@@ -581,7 +694,14 @@ fn csv_export_dumps_normalized_database_tables() {
             },
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
-            identity_conflicts: Vec::new(),
+            identity_conflicts: vec![TrackIdentityConflict {
+                provider: ProviderKind::YoutubeMusic,
+                candidate_provider_id: "youtube-candidate".to_string(),
+                confidence: Some(0.9),
+                detected_at: Utc::now(),
+                status: IdentityConflictStatus::Open,
+                rejected_at: None,
+            }],
             provider_state: track_provider_state,
         }],
         saved_tracks: vec![SavedTrackEntry {
@@ -600,15 +720,21 @@ fn csv_export_dumps_normalized_database_tables() {
     assert!(export_dir.join("tracks.csv").exists());
     assert!(export_dir.join("track_provider_artwork.csv").exists());
     assert!(export_dir.join("track_provider_status.csv").exists());
+    assert!(export_dir.join("track_identity_conflicts.csv").exists());
     assert!(export_dir.join("saved_tracks.csv").exists());
 
     let tracks_csv = fs::read_to_string(export_dir.join("tracks.csv")).unwrap();
     let track_status_csv =
         fs::read_to_string(export_dir.join("track_provider_status.csv")).unwrap();
+    let conflicts_csv =
+        fs::read_to_string(export_dir.join("track_identity_conflicts.csv")).unwrap();
 
     assert!(tracks_csv.contains("track_1"));
     assert!(track_status_csv.contains("spotify"));
     assert!(track_status_csv.contains("synced"));
+    assert!(conflicts_csv.contains("track_1"));
+    assert!(conflicts_csv.contains("youtube-candidate"));
+    assert!(conflicts_csv.contains("open"));
 }
 
 #[test]
@@ -869,12 +995,10 @@ fn restoring_backup_validates_and_preserves_pre_restore_snapshot() {
         .tracks
         .push(track_entity("original-track", "Original"));
     write_library_state_in(temp.path(), &original).unwrap();
+    // The backup is an older, v4-shaped database (no typed conflict table): the
+    // restore must migrate it up to the current schema before loading it.
     let backup = create_manual_library_backup_in(temp.path()).unwrap();
-    let backup_database = Connection::open(&backup.path).unwrap();
-    backup_database
-        .execute("DROP TABLE track_provider_artwork", [])
-        .unwrap();
-    drop(backup_database);
+    downgrade_database_to_v4(&backup.path);
 
     let mut changed = LibraryState::new();
     changed
@@ -890,15 +1014,17 @@ fn restoring_backup_validates_and_preserves_pre_restore_snapshot() {
     let restored = read_library_state_in(temp.path(), false).unwrap();
     assert_eq!(restored.tracks.len(), 1);
     assert_eq!(restored.tracks[0].metadata.title, "Original");
+    assert_eq!(restored.format_version, 5);
+    // The restored (live) database carries the migrated schema.
     let restored_database = Connection::open(database_path_in(temp.path())).unwrap();
-    let artwork_table_exists: i64 = restored_database
+    let conflicts_table_exists: i64 = restored_database
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'track_provider_artwork'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'track_identity_conflicts'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(artwork_table_exists, 1);
+    assert_eq!(conflicts_table_exists, 1);
     assert!(fs::read_dir(temp.path().join("dump"))
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -1036,25 +1162,200 @@ fn provider_cooldowns_are_runtime_only_and_expire() {
     );
 }
 
-#[test]
-fn opening_older_database_snapshots_before_schema_migration() {
-    let temp = tempdir().unwrap();
-    write_library_state_in(temp.path(), &LibraryState::new()).unwrap();
-    let database_path = database_path_in(temp.path());
-    let database = Connection::open(&database_path).unwrap();
+/// Rewrites a freshly written v5 database into a v4-shaped one: drops the typed
+/// conflict table and rolls the stored schema version back to 4. Callers then
+/// insert legacy status rows to exercise the migration.
+fn downgrade_database_to_v4(database_path: &std::path::Path) {
+    let database = Connection::open(database_path).unwrap();
     database
-        .execute("DROP TABLE track_provider_artwork", [])
+        .execute("DROP TABLE track_identity_conflicts", [])
+        .unwrap();
+    database
+        .execute(
+            "UPDATE library_metadata SET value = '4' WHERE key = 'schema_version'",
+            [],
+        )
         .unwrap();
     drop(database);
+}
 
-    read_library_state_in(temp.path(), false).unwrap();
+fn insert_legacy_track_status(
+    database: &Connection,
+    track_id: &str,
+    provider: ProviderKind,
+    state: &str,
+    message: &str,
+    provider_item_id: Option<&str>,
+) {
+    database
+        .execute(
+            "INSERT INTO track_provider_status
+                (track_id, provider, state, message, confidence, provider_item_id, last_attempt_at, last_success_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+            params![
+                track_id,
+                provider.as_key(),
+                state,
+                message,
+                0.9_f64,
+                provider_item_id,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .unwrap();
+}
 
+#[test]
+fn migrating_v4_database_converts_legacy_conflicts_and_snapshots() {
+    let temp = tempdir().unwrap();
+    let mut state = LibraryState::new();
+    state
+        .tracks
+        .push(track_entity("track-open", "Open Conflict"));
+    state
+        .tracks
+        .push(track_entity("track-rejected", "Rejected Conflict"));
+    state
+        .tracks
+        .push(track_entity("track-unparseable", "Unparseable Conflict"));
+    state
+        .tracks
+        .push(track_entity("track-normal", "Normal Error"));
+    write_library_state_in(temp.path(), &state).unwrap();
+
+    let database_path = database_path_in(temp.path());
+    downgrade_database_to_v4(&database_path);
+
+    let database = Connection::open(&database_path).unwrap();
+    // Legacy open conflict: an error row whose candidate id is in the
+    // provider_item_id column.
+    insert_legacy_track_status(
+        &database,
+        "track-open",
+        ProviderKind::YoutubeMusic,
+        "error",
+        "Skipped YouTube Music identity 'youtube-open' because it would merge tracks with conflicting provider IDs.",
+        Some("youtube-open"),
+    );
+    // Legacy rejected tombstone with the retired marker; candidate parsed from
+    // the message (no provider_item_id column value).
+    insert_legacy_track_status(
+        &database,
+        "track-rejected",
+        ProviderKind::YoutubeMusic,
+        "unmatched",
+        "Rejected identity candidate: rejected YouTube Music identity 'youtube-rejected' for a track.",
+        None,
+    );
+    // Matches a conflict pattern but the candidate id cannot be recovered: must
+    // be dropped, not converted.
+    insert_legacy_track_status(
+        &database,
+        "track-unparseable",
+        ProviderKind::YoutubeMusic,
+        "error",
+        "Merge aborted because of conflicting provider IDs.",
+        None,
+    );
+    // A genuine, non-conflict error must never become a conflict.
+    insert_legacy_track_status(
+        &database,
+        "track-normal",
+        ProviderKind::Spotify,
+        "error",
+        "Provider rejected the request.",
+        None,
+    );
+    drop(database);
+
+    let migrated = read_library_state_in(temp.path(), false).unwrap();
+    assert_eq!(migrated.format_version, 5);
+
+    let open = migrated
+        .tracks
+        .iter()
+        .find(|track| track.id == "track-open")
+        .unwrap();
+    assert_eq!(open.identity_conflicts.len(), 1);
+    assert_eq!(
+        open.identity_conflicts[0].provider,
+        ProviderKind::YoutubeMusic
+    );
+    assert_eq!(
+        open.identity_conflicts[0].candidate_provider_id,
+        "youtube-open"
+    );
+    assert_eq!(
+        open.identity_conflicts[0].status,
+        IdentityConflictStatus::Open
+    );
+
+    let rejected = migrated
+        .tracks
+        .iter()
+        .find(|track| track.id == "track-rejected")
+        .unwrap();
+    assert_eq!(rejected.identity_conflicts.len(), 1);
+    assert_eq!(
+        rejected.identity_conflicts[0].candidate_provider_id,
+        "youtube-rejected"
+    );
+    assert_eq!(
+        rejected.identity_conflicts[0].status,
+        IdentityConflictStatus::Rejected
+    );
+    assert!(rejected.identity_conflicts[0].rejected_at.is_some());
+
+    let unparseable = migrated
+        .tracks
+        .iter()
+        .find(|track| track.id == "track-unparseable")
+        .unwrap();
+    assert!(unparseable.identity_conflicts.is_empty());
+
+    let normal = migrated
+        .tracks
+        .iter()
+        .find(|track| track.id == "track-normal")
+        .unwrap();
+    assert!(normal.identity_conflicts.is_empty());
+
+    // A pre-migration snapshot was taken before the schema was upgraded.
     assert_eq!(
         fs::read_dir(temp.path().join("dump").join("backups"))
             .unwrap()
             .count(),
         1
     );
+
+    // The database on disk was permanently bumped to the current version.
+    let database = Connection::open(&database_path).unwrap();
+    let stored_version: String = database
+        .query_row(
+            "SELECT value FROM library_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_version, "5");
+}
+
+#[test]
+fn opening_future_version_database_is_rejected() {
+    let temp = tempdir().unwrap();
+    write_library_state_in(temp.path(), &LibraryState::new()).unwrap();
+    let database_path = database_path_in(temp.path());
+    let database = Connection::open(&database_path).unwrap();
+    database
+        .execute(
+            "UPDATE library_metadata SET value = '999' WHERE key = 'schema_version'",
+            [],
+        )
+        .unwrap();
+    drop(database);
+
+    let error = read_library_state_in(temp.path(), false).unwrap_err();
+    assert!(error.to_string().contains("newer than this app supports"));
 }
 
 #[test]

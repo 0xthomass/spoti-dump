@@ -26,9 +26,8 @@ use uuid::Uuid;
 use crate::domain::{
     merge_provider_snapshot, LibraryState, LinkSource, ProviderConnection,
     ProviderConnectionConfig, ProviderCooldown, ProviderHealth, ProviderKind, ProviderTrackArtwork,
-    SyncState, SyncStatusRecord, TrackEntity, TrackIdentityApplyResult,
+    SyncState, SyncStatusRecord, TrackEntity, TrackIdentityApplyResult, TrackIdentityConflict,
     TrackMergeConflictResolution, TrackMetadata, YoutubeMusicConnectionConfig,
-    REJECTED_IDENTITY_CANDIDATE_MARKER,
 };
 use crate::matching::metadata_similarity;
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
@@ -2681,30 +2680,25 @@ async fn api_reject_track_identity_conflict(
                 "That identity conflict is no longer active for this track.".to_string(),
             )
         })?;
+    let provider_name = conflict.provider_name.clone();
+    let candidate_provider_id = conflict.provider_id.clone();
     let now = Utc::now();
-    let message = format!(
-        "{REJECTED_IDENTITY_CANDIDATE_MARKER}: rejected {} ID '{}' for {} because candidate row '{}' was marked not the same track. The track still needs a different {} ID before a complete push.",
-        conflict.provider_name,
-        conflict.provider_id,
-        track.metadata.display_label(),
-        conflict.owner_track.title,
-        conflict.provider_name
-    );
-    state.set_track_status(
+    // Flip the typed conflict into a permanent rejected tombstone so the
+    // candidate is never re-proposed by future identity syncs.
+    if !state.reject_track_identity_conflict(
         &track_id,
         request.provider,
-        SyncStatusRecord::unmatched_with_provider_item_id(
-            message,
-            conflict.provider_id.clone(),
-            None,
-            now,
-        ),
-    );
+        &candidate_provider_id,
+        now,
+    ) {
+        return Err(ApiError::bad_request(
+            "That identity conflict is no longer active for this track.".to_string(),
+        ));
+    }
     write_state(state).await?;
 
     Ok(Json(MessageResponse::new(format!(
-        "Marked {} candidate {} as not the same track. The source row remains unresolved for that provider.",
-        conflict.provider_name, conflict.provider_id
+        "Marked {provider_name} candidate {candidate_provider_id} as not the same track. The source row remains unresolved for that provider."
     ))))
 }
 
@@ -4356,41 +4350,46 @@ fn identity_conflicts_for_track(
     track: &TrackEntity,
 ) -> Vec<TrackIdentityConflictDto> {
     track
-        .provider_state
-        .iter()
-        .filter_map(|(provider_key, status)| {
-            if status.state != SyncState::Error {
-                return None;
-            }
-            let message = status.message.as_deref()?;
-            if !is_identity_conflict_message(message) {
-                return None;
-            }
-            let provider = ProviderKind::from_key(provider_key).ok()?;
-            let provider_id = status
-                .provider_item_id
-                .clone()
-                .or_else(|| parse_conflict_candidate_provider_id(message))?;
-            let owner = state.tracks.iter().find(|candidate| {
-                candidate.id != track.id
-                    && candidate
-                        .provider_links
-                        .get(provider.as_key())
-                        .map(|link| link.provider_id == provider_id)
-                        .unwrap_or(false)
-            })?;
-
-            Some(TrackIdentityConflictDto {
-                provider: provider.as_key().to_string(),
-                provider_name: provider.display_name().to_string(),
-                provider_id,
-                owner_track: conflict_track_dto(state, owner),
-                conflicting_provider_links: provider_link_conflicts(track, owner),
-                evidence: identity_conflict_evidence(state, track, owner, status),
-                message: message.to_string(),
-            })
-        })
+        .open_identity_conflicts()
+        .filter_map(|conflict| build_identity_conflict_dto(state, track, conflict))
         .collect()
+}
+
+/// Builds the API DTO for one open typed conflict, resolving the owner track
+/// that currently holds the disputed provider ID. Returns `None` when no track
+/// owns that ID any more (the conflict is stale and no longer actionable).
+fn build_identity_conflict_dto(
+    state: &LibraryState,
+    track: &TrackEntity,
+    conflict: &TrackIdentityConflict,
+) -> Option<TrackIdentityConflictDto> {
+    let provider = conflict.provider;
+    let provider_id = conflict.candidate_provider_id.clone();
+    let owner = state.tracks.iter().find(|candidate| {
+        candidate.id != track.id
+            && candidate
+                .provider_links
+                .get(provider.as_key())
+                .map(|link| link.provider_id == provider_id)
+                .unwrap_or(false)
+    })?;
+
+    let message = format!(
+        "{} identity '{}' is already linked to {}. Review before merging or reject the candidate.",
+        provider.display_name(),
+        provider_id,
+        owner.metadata.display_label()
+    );
+
+    Some(TrackIdentityConflictDto {
+        provider: provider.as_key().to_string(),
+        provider_name: provider.display_name().to_string(),
+        provider_id,
+        owner_track: conflict_track_dto(state, owner),
+        conflicting_provider_links: provider_link_conflicts(track, owner),
+        evidence: identity_conflict_evidence(state, track, owner, conflict.confidence),
+        message,
+    })
 }
 
 fn conflict_track_dto(state: &LibraryState, track: &TrackEntity) -> ConflictTrackDto {
@@ -4433,7 +4432,7 @@ fn identity_conflict_evidence(
     state: &LibraryState,
     source: &TrackEntity,
     candidate: &TrackEntity,
-    status: &SyncStatusRecord,
+    provider_confidence: Option<f64>,
 ) -> TrackIdentityConflictEvidenceDto {
     let similarity = metadata_similarity(&source.metadata, &candidate.metadata);
     let duration_delta_seconds = match (
@@ -4446,10 +4445,10 @@ fn identity_conflict_evidence(
         _ => None,
     };
     let recommendation =
-        identity_conflict_recommendation(similarity, duration_delta_seconds, status.confidence);
+        identity_conflict_recommendation(similarity, duration_delta_seconds, provider_confidence);
 
     TrackIdentityConflictEvidenceDto {
-        provider_confidence: status.confidence,
+        provider_confidence,
         metadata_similarity: similarity,
         duration_delta_seconds,
         source_saved_tracks: saved_track_count(state, &source.id),
@@ -4498,19 +4497,6 @@ fn identity_conflict_recommendation(
         key: "needs_manual_review".to_string(),
         label: "Needs manual review".to_string(),
         detail: "The evidence is mixed. Compare album, version, duration, and provider pages before merging or rejecting.".to_string(),
-    }
-}
-
-fn parse_conflict_candidate_provider_id(message: &str) -> Option<String> {
-    let marker = "identity '";
-    let start = message.find(marker)? + marker.len();
-    let suffix = &message[start..];
-    let end = suffix.find('\'')?;
-    let provider_id = suffix[..end].trim();
-    if provider_id.is_empty() {
-        None
-    } else {
-        Some(provider_id.to_string())
     }
 }
 
@@ -4887,19 +4873,7 @@ fn coverage_matches(key: &str, track: &TrackEntity, filter: Option<&str>) -> boo
 }
 
 fn track_has_identity_conflict(track: &TrackEntity) -> bool {
-    track.provider_state.values().any(|status| {
-        status.state == SyncState::Error
-            && status
-                .message
-                .as_deref()
-                .map(is_identity_conflict_message)
-                .unwrap_or(false)
-    })
-}
-
-fn is_identity_conflict_message(message: &str) -> bool {
-    message.contains("conflicting provider IDs")
-        || message.contains("Cannot merge tracks because provider")
+    track.open_identity_conflicts().next().is_some()
 }
 
 async fn enrich_artwork_for_track_ids(
@@ -5390,8 +5364,7 @@ mod tests {
     use crate::domain::{
         LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
         ProviderConnectionConfig, ProviderKind, ProviderTrackLink, SavedTrackEntry,
-        SpotifyConnectionConfig, SyncStatusRecord, TrackEntity, TrackMetadata,
-        REJECTED_IDENTITY_CANDIDATE_MARKER,
+        SpotifyConnectionConfig, TrackEntity, TrackMetadata,
     };
 
     use super::{
@@ -5577,13 +5550,12 @@ mod tests {
             now,
         );
         let mut conflict = test_track("track-conflict", "Conflict");
-        conflict.provider_state.insert(
-            ProviderKind::Spotify.as_key().to_string(),
-            SyncStatusRecord::error(
-                "Skipped Spotify identity because it would merge tracks with conflicting provider IDs.",
-                now,
-            ),
-        );
+        assert!(conflict.record_identity_conflict(
+            ProviderKind::Spotify,
+            "spotify-candidate",
+            Some(0.9),
+            now,
+        ));
         let mut multi_provider = test_track_with_link(
             "track-both",
             "Multi-provider",
@@ -5651,15 +5623,12 @@ mod tests {
         );
         source.metadata.album = Some("Same Album".to_string());
         source.metadata.duration_seconds = Some(180);
-        source.provider_state.insert(
-            ProviderKind::YoutubeMusic.as_key().to_string(),
-            SyncStatusRecord::error_with_provider_item_id(
-                "Skipped YouTube Music identity 'youtube-owner' because it would merge tracks with conflicting provider IDs.",
-                "youtube-owner",
-                Some(0.99),
-                now,
-            ),
-        );
+        assert!(source.record_identity_conflict(
+            ProviderKind::YoutubeMusic,
+            "youtube-owner",
+            Some(0.99),
+            now,
+        ));
 
         let mut owner = test_track_with_link(
             "track-owner",
@@ -5722,17 +5691,15 @@ mod tests {
             "spotify-source",
             now,
         );
-        source.provider_state.insert(
-            ProviderKind::YoutubeMusic.as_key().to_string(),
-            SyncStatusRecord::unmatched_with_provider_item_id(
-                format!(
-                    "{REJECTED_IDENTITY_CANDIDATE_MARKER}: youtube-owner was marked not same track."
-                ),
-                "youtube-owner",
-                None,
-                now,
-            ),
-        );
+        // The candidate was reviewed and rejected: a typed tombstone, which the
+        // conflict queue and the identity-conflict coverage filter both ignore.
+        assert!(source.record_identity_conflict(
+            ProviderKind::YoutubeMusic,
+            "youtube-owner",
+            None,
+            now,
+        ));
+        assert!(source.reject_identity_conflict(ProviderKind::YoutubeMusic, "youtube-owner", now));
 
         let mut owner = test_track_with_link(
             "track-owner",
@@ -5757,16 +5724,19 @@ mod tests {
         state.tracks.push(owner);
 
         assert!(identity_conflict_rows(&state, None).is_empty());
-        assert!(coverage_matches(
-            "spotify-only",
-            &state.tracks[0],
-            Some("unmatched")
-        ));
         assert!(!coverage_matches(
             "spotify-only",
             &state.tracks[0],
             Some("identity-conflicts")
         ));
+        // Re-detecting the rejected candidate must not resurrect it.
+        assert!(!state.tracks[0].record_identity_conflict(
+            ProviderKind::YoutubeMusic,
+            "youtube-owner",
+            None,
+            now,
+        ));
+        assert!(identity_conflict_rows(&state, None).is_empty());
     }
 
     #[test]
@@ -5780,15 +5750,12 @@ mod tests {
             now,
         );
         source.metadata.duration_seconds = Some(90);
-        source.provider_state.insert(
-            ProviderKind::YoutubeMusic.as_key().to_string(),
-            SyncStatusRecord::error_with_provider_item_id(
-                "Skipped YouTube Music identity 'youtube-owner' because it would merge tracks with conflicting provider IDs.",
-                "youtube-owner",
-                Some(0.88),
-                now,
-            ),
-        );
+        assert!(source.record_identity_conflict(
+            ProviderKind::YoutubeMusic,
+            "youtube-owner",
+            Some(0.88),
+            now,
+        ));
 
         let mut owner = test_track_with_link(
             "track-owner",
@@ -6232,18 +6199,11 @@ mod tests {
             fixture.now,
         );
         source.metadata.duration_seconds = fixture.source_duration_seconds;
-        source.provider_state.insert(
-            fixture.candidate_provider.as_key().to_string(),
-            SyncStatusRecord::error_with_provider_item_id(
-                format!(
-                    "Skipped {} identity '{}' because it would merge tracks with conflicting provider IDs.",
-                    fixture.candidate_provider.display_name(),
-                    fixture.candidate_provider_id
-                ),
-                fixture.candidate_provider_id,
-                fixture.confidence,
-                fixture.now,
-            ),
+        source.record_identity_conflict(
+            fixture.candidate_provider,
+            fixture.candidate_provider_id,
+            fixture.confidence,
+            fixture.now,
         );
 
         let mut owner = test_track_with_link(

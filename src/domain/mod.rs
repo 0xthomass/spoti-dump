@@ -29,5 +29,5 @@ pub use sync::{
 };
 pub use track::{
     IdentityConflictStatus, LinkSource, ProviderTrackArtwork, ProviderTrackLink, TrackEntity,
-    TrackIdentityConflict, TrackMetadata, REJECTED_IDENTITY_CANDIDATE_MARKER,
+    TrackIdentityConflict, TrackMetadata,
 };
