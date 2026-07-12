@@ -10,14 +10,13 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::model::{
-    LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
+use crate::domain::{
+    new_canonical_id, LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
     ProviderConnectionConfig, ProviderCooldown, ProviderHealth, ProviderKind, ProviderPlaylistLink,
     ProviderTrackArtwork, ProviderTrackLink, SavedTrackEntry, SpotifyConnectionConfig,
     SyncStatusRecord, TrackEntity, TrackMetadata, YoutubeMusicConnectionConfig,
     LIBRARY_STATE_FORMAT_VERSION,
 };
-use crate::state::new_canonical_id;
 
 pub const DUMP_DIR: &str = "dump";
 pub const LIBRARY_DB_FILE: &str = "library.db";
@@ -1388,6 +1387,7 @@ fn load_tracks(connection: &Connection) -> Result<Vec<TrackEntity>> {
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
             provider_state: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
         })
     })?;
 
@@ -2175,6 +2175,7 @@ fn find_or_create_track(
         provider_links,
         provider_artwork: BTreeMap::new(),
         provider_state: Default::default(),
+        identity_conflicts: Vec::new(),
     });
     track_id
 }

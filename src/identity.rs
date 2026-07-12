@@ -3,13 +3,12 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use chrono::Utc;
 
-use crate::matching::cleaned_title;
-use crate::model::{
-    LibraryState, LinkSource, ProviderKind, SyncState, SyncStatusRecord, TrackMetadata,
-    REJECTED_IDENTITY_CANDIDATE_MARKER,
+use crate::domain::{
+    LibraryState, LinkSource, ProviderKind, SyncState, SyncStatusRecord, TrackIdentityApplyResult,
+    TrackMetadata, REJECTED_IDENTITY_CANDIDATE_MARKER,
 };
+use crate::matching::cleaned_title;
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
-use crate::state::TrackIdentityApplyResult;
 
 const SPOTIFY_IDENTITY_SEARCHES_PER_RUN: usize = 75;
 const YOUTUBE_MUSIC_IDENTITY_SEARCHES_PER_RUN: usize = 150;
@@ -393,7 +392,7 @@ mod tests {
         reconcile_provider_identities, reconcile_provider_identities_with_options,
         IdentityReconcileOptions,
     };
-    use crate::model::{
+    use crate::domain::{
         LibraryState, LinkSource, ProviderKind, ProviderLibrarySnapshot, PurgeReport, SyncState,
         SyncStatusRecord, SyncSummary, TrackEntity, TrackMetadata,
         REJECTED_IDENTITY_CANDIDATE_MARKER,
@@ -680,6 +679,7 @@ mod tests {
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
             provider_state: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
         });
         let provider = StaticIdentityProvider {
             provider: ProviderKind::YoutubeMusic,
@@ -759,6 +759,7 @@ mod tests {
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
             provider_state: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
         }
     }
 }

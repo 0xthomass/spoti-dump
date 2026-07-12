@@ -23,18 +23,17 @@ use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
 use uuid::Uuid;
 
-use crate::matching::metadata_similarity;
-use crate::model::{
-    LibraryState, LinkSource, ProviderConnection, ProviderConnectionConfig, ProviderCooldown,
-    ProviderHealth, ProviderKind, ProviderTrackArtwork, SyncState, SyncStatusRecord, TrackEntity,
-    TrackMetadata, YoutubeMusicConnectionConfig, REJECTED_IDENTITY_CANDIDATE_MARKER,
+use crate::domain::{
+    merge_provider_snapshot, LibraryState, LinkSource, ProviderConnection,
+    ProviderConnectionConfig, ProviderCooldown, ProviderHealth, ProviderKind, ProviderTrackArtwork,
+    SyncState, SyncStatusRecord, TrackEntity, TrackIdentityApplyResult,
+    TrackMergeConflictResolution, TrackMetadata, YoutubeMusicConnectionConfig,
+    REJECTED_IDENTITY_CANDIDATE_MARKER,
 };
+use crate::matching::metadata_similarity;
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 use crate::providers::spotify::SpotifyProvider;
 use crate::providers::youtube_music::YoutubeMusicProvider;
-use crate::state::{
-    merge_provider_snapshot, TrackIdentityApplyResult, TrackMergeConflictResolution,
-};
 use crate::storage;
 
 const PAGE_SIZE: usize = 50;
@@ -2624,7 +2623,7 @@ fn merge_conflict_resolution_label(choice: MergeConflictResolutionChoice) -> &'s
 }
 
 fn resolved_provider_conflict_dtos(
-    conflicts: &[crate::state::ResolvedTrackMergeConflict],
+    conflicts: &[crate::domain::ResolvedTrackMergeConflict],
 ) -> Vec<ResolvedProviderConflictDto> {
     conflicts
         .iter()
@@ -3256,7 +3255,7 @@ async fn build_connected_provider_allowing_failed_health(
 async fn sync_provider_and_persist(
     provider: &dyn StreamingProvider,
     state: &mut LibraryState,
-) -> Result<crate::model::SyncSummary, ApiError> {
+) -> Result<crate::domain::SyncSummary, ApiError> {
     sync_provider_and_persist_with_progress(provider, state, None).await
 }
 
@@ -3264,7 +3263,7 @@ async fn sync_provider_and_persist_with_progress(
     provider: &dyn StreamingProvider,
     state: &mut LibraryState,
     progress: Option<ProgressHandler>,
-) -> Result<crate::model::SyncSummary, ApiError> {
+) -> Result<crate::domain::SyncSummary, ApiError> {
     match provider
         .sync_library_with_progress(state, true, progress)
         .await
@@ -4723,7 +4722,7 @@ trait ProviderLinkLike {
     fn source_label(&self) -> &str;
 }
 
-impl ProviderLinkLike for crate::model::ProviderTrackLink {
+impl ProviderLinkLike for crate::domain::ProviderTrackLink {
     fn provider_id(&self) -> &str {
         &self.provider_id
     }
@@ -4733,7 +4732,7 @@ impl ProviderLinkLike for crate::model::ProviderTrackLink {
     }
 }
 
-impl ProviderLinkLike for crate::model::ProviderPlaylistLink {
+impl ProviderLinkLike for crate::domain::ProviderPlaylistLink {
     fn provider_id(&self) -> &str {
         &self.provider_id
     }
@@ -5419,7 +5418,7 @@ mod tests {
     use chrono::Utc;
     use rusqlite::types::ValueRef;
 
-    use crate::model::{
+    use crate::domain::{
         LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderConnection,
         ProviderConnectionConfig, ProviderKind, ProviderTrackLink, SavedTrackEntry,
         SpotifyConnectionConfig, SyncStatusRecord, TrackEntity, TrackMetadata,
@@ -6247,6 +6246,7 @@ mod tests {
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
             provider_state: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
         }
     }
 

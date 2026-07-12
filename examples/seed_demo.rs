@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 
 use chrono::Utc;
-use spoti_dump::model::{
-    LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderKind, ProviderTrackArtwork,
-    ProviderTrackLink, SavedTrackEntry, SyncStatusRecord, TrackEntity, TrackMetadata,
+use spoti_dump::domain::{
+    new_canonical_id, LibraryState, LinkSource, PlaylistEntity, PlaylistEntry, ProviderKind,
+    ProviderTrackArtwork, ProviderTrackLink, SavedTrackEntry, SyncStatusRecord, TrackEntity,
+    TrackMetadata,
 };
-use spoti_dump::state::new_canonical_id;
 
 struct SeedTrack {
     title: &'static str,
@@ -202,6 +202,7 @@ fn main() -> anyhow::Result<()> {
             provider_links,
             provider_artwork,
             provider_state,
+            identity_conflicts: Vec::new(),
         });
         track_ids.push(track_id);
     }

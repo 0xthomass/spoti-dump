@@ -5,13 +5,13 @@ use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use tempfile::tempdir;
 
-use spoti_dump::model::{
-    LibraryState, LinkSource, ObservedPlaylist, ObservedPlaylistTrack, ObservedSavedTrack,
-    ObservedTrack, PlaylistEntity, PlaylistEntry, ProviderCooldown, ProviderHealth, ProviderKind,
-    ProviderLibrarySnapshot, ProviderTrackArtwork, SavedTrackEntry, SpotifyConnectionConfig,
-    SyncState, SyncStatusRecord, TrackEntity, TrackMetadata,
+use spoti_dump::domain::{
+    merge_provider_snapshot, IdentityConflictStatus, LibraryState, LinkSource, ObservedPlaylist,
+    ObservedPlaylistTrack, ObservedSavedTrack, ObservedTrack, PlaylistEntity, PlaylistEntry,
+    ProviderCooldown, ProviderHealth, ProviderKind, ProviderLibrarySnapshot, ProviderTrackArtwork,
+    SavedTrackEntry, SpotifyConnectionConfig, SyncState, SyncStatusRecord, TrackEntity,
+    TrackMergeConflictResolution, TrackMetadata,
 };
-use spoti_dump::state::{merge_provider_snapshot, TrackMergeConflictResolution};
 use spoti_dump::storage::{
     create_manual_library_backup_in, database_health_in, database_path_in, export_csv,
     list_library_backups_in, list_provider_connections_in, list_provider_cooldowns_in,
@@ -309,6 +309,85 @@ fn explicit_conflict_merge_requires_and_records_provider_link_choice() {
 }
 
 #[test]
+fn merge_by_metadata_match_records_identity_conflict_instead_of_overwriting_link() {
+    let mut state = LibraryState::new();
+    let now = Utc::now();
+    state
+        .tracks
+        .push(track_entity("track-a", "Fallout 3 Theme"));
+    assert!(state.upsert_track_link(
+        "track-a",
+        ProviderKind::Spotify,
+        "established-id",
+        LinkSource::Export,
+        Some(1.0),
+        now,
+    ));
+
+    // The observed track matches by metadata similarity (identical metadata,
+    // no ISRC) but carries a different Spotify ID than the established link.
+    let snapshot = ProviderLibrarySnapshot {
+        provider: ProviderKind::Spotify,
+        captured_at: now,
+        saved_tracks: vec![ObservedSavedTrack {
+            added_at: None,
+            track: ObservedTrack {
+                metadata: state.tracks[0].metadata.clone(),
+                provider_id: Some("candidate-id".to_string()),
+                artwork: None,
+            },
+        }],
+        playlists: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let summary = merge_provider_snapshot(&mut state, snapshot);
+
+    assert_eq!(state.tracks.len(), 1);
+    assert_eq!(
+        state.tracks[0]
+            .provider_links
+            .get(ProviderKind::Spotify.as_key())
+            .map(|link| link.provider_id.as_str()),
+        Some("established-id")
+    );
+    assert_eq!(state.tracks[0].identity_conflicts.len(), 1);
+    let conflict = &state.tracks[0].identity_conflicts[0];
+    assert_eq!(conflict.provider, ProviderKind::Spotify);
+    assert_eq!(conflict.candidate_provider_id, "candidate-id");
+    assert_eq!(conflict.status, IdentityConflictStatus::Open);
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("candidate-id")));
+    // No synced status may claim the rejected candidate ID.
+    assert_ne!(
+        state.tracks[0]
+            .provider_state
+            .get(ProviderKind::Spotify.as_key())
+            .and_then(|status| status.provider_item_id.as_deref()),
+        Some("candidate-id")
+    );
+    assert_eq!(state.saved_tracks.len(), 1);
+    state.validate().unwrap();
+}
+
+#[test]
+fn validation_rejects_duplicate_identity_conflicts_on_a_track() {
+    let mut state = LibraryState::new();
+    let now = Utc::now();
+    let mut track = track_entity("track-a", "Fallout 3 Theme");
+    assert!(track.record_identity_conflict(ProviderKind::Spotify, "candidate-id", None, now));
+    assert!(!track.record_identity_conflict(ProviderKind::Spotify, "candidate-id", None, now));
+    track
+        .identity_conflicts
+        .push(track.identity_conflicts[0].clone());
+    state.tracks.push(track);
+
+    let error = state.validate().unwrap_err().to_string();
+    assert!(error.contains("Duplicate identity conflict"));
+}
+
+#[test]
 fn merge_provider_snapshot_keeps_saved_tracks_append_only_when_unseen_later() {
     let captured_at = Utc::now();
     let initial_snapshot = ProviderLibrarySnapshot {
@@ -434,6 +513,7 @@ fn library_state_round_trips_with_unmatched_statuses() {
             },
             provider_links: BTreeMap::new(),
             provider_artwork,
+            identity_conflicts: Vec::new(),
             provider_state: BTreeMap::new(),
         }],
         saved_tracks: vec![SavedTrackEntry {
@@ -501,6 +581,7 @@ fn csv_export_dumps_normalized_database_tables() {
             },
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
             provider_state: track_provider_state,
         }],
         saved_tracks: vec![SavedTrackEntry {
@@ -576,6 +657,7 @@ fn removing_saved_track_prunes_orphan_track() {
             },
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
             provider_state: BTreeMap::new(),
         }],
         saved_tracks: vec![SavedTrackEntry {
@@ -607,6 +689,7 @@ fn removing_playlist_entry_keeps_track_when_still_saved_elsewhere() {
             },
             provider_links: BTreeMap::new(),
             provider_artwork: BTreeMap::new(),
+            identity_conflicts: Vec::new(),
             provider_state: BTreeMap::new(),
         }],
         saved_tracks: vec![SavedTrackEntry {
@@ -651,6 +734,7 @@ fn removing_track_everywhere_clears_saved_and_playlist_references() {
                 },
                 provider_links: BTreeMap::new(),
                 provider_artwork: BTreeMap::new(),
+                identity_conflicts: Vec::new(),
                 provider_state: BTreeMap::new(),
             },
             TrackEntity {
@@ -664,6 +748,7 @@ fn removing_track_everywhere_clears_saved_and_playlist_references() {
                 },
                 provider_links: BTreeMap::new(),
                 provider_artwork: BTreeMap::new(),
+                identity_conflicts: Vec::new(),
                 provider_state: BTreeMap::new(),
             },
         ],
@@ -1056,6 +1141,7 @@ fn track_entity(id: &str, title: &str) -> TrackEntity {
         },
         provider_links: BTreeMap::new(),
         provider_artwork: BTreeMap::new(),
+        identity_conflicts: Vec::new(),
         provider_state: BTreeMap::new(),
     }
 }

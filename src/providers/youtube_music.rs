@@ -11,12 +11,12 @@ use serde_json::{json, Value};
 use tokio::time::sleep;
 use ytmusicapi::{BrowserAuth, Privacy, YTMusicClient};
 
-use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
-use crate::model::{
+use crate::domain::{
     LibraryState, LinkSource, ObservedArtwork, ObservedPlaylist, ObservedPlaylistTrack,
     ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
     SyncStatusRecord, SyncSummary, TrackMetadata, YoutubeMusicConnectionConfig,
 };
+use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 
 const YTM_DOMAIN: &str = "https://music.youtube.com";

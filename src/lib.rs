@@ -1,9 +1,8 @@
+pub mod domain;
 pub mod identity;
 pub mod matching;
-pub mod model;
 pub mod provider;
 pub mod providers;
-pub mod state;
 pub mod storage;
 pub mod web_app;
 
@@ -12,11 +11,13 @@ use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::model::{LibraryState, MergeSummary, ProviderCooldown, ProviderKind, SyncSummary};
+use crate::domain::{
+    merge_provider_snapshot, LibraryState, MergeSummary, ProviderCooldown, ProviderKind,
+    SyncSummary,
+};
 use crate::provider::{ProviderCapability, StreamingProvider};
 use crate::providers::spotify::SpotifyProvider;
 use crate::providers::youtube_music::YoutubeMusicProvider;
-use crate::state::merge_provider_snapshot;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -365,7 +366,8 @@ async fn build_provider(
     match provider {
         ProviderKind::Spotify => {
             if let Some(connection) = storage::read_provider_connection(ProviderKind::Spotify)? {
-                if let crate::model::ProviderConnectionConfig::Spotify(config) = connection.config {
+                if let crate::domain::ProviderConnectionConfig::Spotify(config) = connection.config
+                {
                     return Ok(Box::new(
                         SpotifyProvider::from_connection(&config, capability).await?,
                     ));
@@ -376,7 +378,7 @@ async fn build_provider(
         ProviderKind::YoutubeMusic => {
             if let Some(connection) = storage::read_provider_connection(ProviderKind::YoutubeMusic)?
             {
-                if let crate::model::ProviderConnectionConfig::YoutubeMusic(config) =
+                if let crate::domain::ProviderConnectionConfig::YoutubeMusic(config) =
                     connection.config
                 {
                     return Ok(Box::new(YoutubeMusicProvider::from_connection(&config)?));
@@ -587,7 +589,7 @@ fn print_identity_summary(summary: &identity::IdentityReconcileSummary) {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::ProviderKind;
+    use crate::domain::ProviderKind;
 
     use super::ensure_provider_supports_library_reset;
 

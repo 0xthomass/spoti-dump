@@ -1,6 +1,6 @@
 use strsim::jaro_winkler;
 
-use crate::model::TrackMetadata;
+use crate::domain::TrackMetadata;
 
 const MIN_ACCEPTABLE_SCORE: f64 = 0.78;
 const MIN_DECISIVE_MARGIN: f64 = 0.03;

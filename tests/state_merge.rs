@@ -1,22 +1,21 @@
-//! Characterization tests for the canonical mutation engine in `src/state.rs`.
+//! Characterization tests for the canonical mutation engine in `src/domain/`.
 //!
-//! These lock in the *current* behavior of `merge_provider_snapshot` and the
-//! related public `LibraryState` mutators before an upcoming refactor. Where the
-//! present behavior is surprising (URL always overwritten, merge path skips
-//! sanitization, appended-not-inserted playlist order) the assertions and their
-//! comments document exactly what happens today rather than what is ideal.
+//! These lock in the behavior of `merge_provider_snapshot` and the related
+//! public `LibraryState` mutators. Where the behavior is surprising (URL
+//! always overwritten, merge path skips sanitization, appended-not-inserted
+//! playlist order) the assertions and their comments document exactly what
+//! happens rather than what is ideal.
 
 use std::collections::BTreeMap;
 
 use chrono::Utc;
 
-use spoti_dump::model::{
-    LibraryState, LinkSource, ObservedArtwork, ObservedPlaylist, ObservedPlaylistTrack,
-    ObservedSavedTrack, ObservedTrack, PlaylistEntity, PlaylistEntry, ProviderKind,
-    ProviderLibrarySnapshot, SavedTrackEntry, SyncState, SyncStatusRecord, TrackEntity,
-    TrackMetadata,
+use spoti_dump::domain::{
+    merge_provider_snapshot, IdentityConflictStatus, LibraryState, LinkSource, ObservedArtwork,
+    ObservedPlaylist, ObservedPlaylistTrack, ObservedSavedTrack, ObservedTrack, PlaylistEntity,
+    PlaylistEntry, ProviderKind, ProviderLibrarySnapshot, SavedTrackEntry, SyncState,
+    SyncStatusRecord, TrackEntity, TrackMetadata,
 };
-use spoti_dump::state::merge_provider_snapshot;
 
 // ---------------------------------------------------------------------------
 // Local helper builders (mirroring the style of tests/snapshot.rs).
@@ -111,6 +110,7 @@ fn track_entity(id: &str, metadata: TrackMetadata) -> TrackEntity {
         metadata,
         provider_links: BTreeMap::new(),
         provider_artwork: BTreeMap::new(),
+        identity_conflicts: Vec::new(),
         provider_state: BTreeMap::new(),
     }
 }
@@ -573,13 +573,84 @@ fn merge_stores_blank_metadata_verbatim_without_sanitizing_or_skipping() {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Known bug (wave-3 fix): ISRC/fuzzy match must not clobber an existing link.
+// 9. Status merges preserve timestamps; added_at merges compare instants.
 // ---------------------------------------------------------------------------
 
-// TODO(wave-3): asserts post-fix behavior
 #[test]
-#[ignore]
-fn isrc_match_should_preserve_existing_provider_link_instead_of_overwriting() {
+fn winning_status_record_keeps_the_other_sides_timestamps() {
+    let key = ProviderKind::Spotify.as_key().to_string();
+    let seen_at = Utc::now();
+    let mut target = track_entity("target", metadata("Song", &["Artist"], None, None, None));
+    target.provider_state.insert(
+        key.clone(),
+        SyncStatusRecord::missing("Missing at provider", seen_at),
+    );
+    let mut source = track_entity("source", metadata("Song", &["Artist"], None, None, None));
+    source.provider_state.insert(
+        key.clone(),
+        SyncStatusRecord {
+            state: SyncState::Error,
+            message: Some("Push failed".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut library = LibraryState::new();
+    library.tracks.push(target);
+    library.tracks.push(source);
+
+    library.merge_track_into("source", "target").unwrap();
+
+    // Error outranks Missing so the source record wins, but the target's
+    // timestamps survive the replacement instead of being discarded.
+    let status = library.tracks[0].provider_state.get(&key).unwrap();
+    assert_eq!(status.state, SyncState::Error);
+    assert_eq!(status.message.as_deref(), Some("Push failed"));
+    assert_eq!(status.last_seen_at, Some(seen_at));
+    assert_eq!(status.last_attempt_at, Some(seen_at));
+}
+
+#[test]
+fn merge_added_at_keeps_the_chronologically_earlier_instant_across_formats() {
+    let mut library = LibraryState::new();
+    library.tracks.push(track_entity(
+        "t1",
+        metadata("Song", &["Artist"], None, None, None),
+    ));
+    library.tracks.push(track_entity(
+        "t2",
+        metadata("Song", &["Artist"], None, None, None),
+    ));
+    // Lexically "2024-01-01T22:00:00-05:00" sorts BEFORE "2024-01-02T00:00:00Z",
+    // but as an instant it is 2024-01-02T03:00:00Z, i.e. LATER.
+    library.saved_tracks.push(SavedTrackEntry {
+        id: "saved-1".to_string(),
+        track_id: "t1".to_string(),
+        added_at: Some("2024-01-02T00:00:00Z".to_string()),
+        provider_state: BTreeMap::new(),
+    });
+    library.saved_tracks.push(SavedTrackEntry {
+        id: "saved-2".to_string(),
+        track_id: "t2".to_string(),
+        added_at: Some("2024-01-01T22:00:00-05:00".to_string()),
+        provider_state: BTreeMap::new(),
+    });
+
+    library.merge_track_into("t2", "t1").unwrap();
+
+    assert_eq!(library.saved_tracks.len(), 1);
+    assert_eq!(
+        library.saved_tracks[0].added_at.as_deref(),
+        Some("2024-01-02T00:00:00Z"),
+        "the chronologically earlier timestamp wins even when lexical order disagrees"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 10. ISRC/fuzzy match must not clobber an existing link.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn isrc_match_preserves_existing_provider_link_and_records_conflict() {
     let mut library = LibraryState::new();
     let now = Utc::now();
     library.tracks.push(track_entity(
@@ -602,10 +673,8 @@ fn isrc_match_should_preserve_existing_provider_link_instead_of_overwriting() {
     ));
 
     // The export matches t1 by ISRC (its Spotify id "new-id" is unknown), yet it
-    // carries a DIFFERENT Spotify id than the established link. Today
-    // `upsert_track_from_observation` silently overwrites "old-id" with "new-id".
-    let summary = merge_provider_snapshot(
-        &mut library,
+    // carries a DIFFERENT Spotify id than the established link.
+    let snapshot = || {
         provider_snapshot(
             ProviderKind::Spotify,
             vec![saved(
@@ -622,15 +691,38 @@ fn isrc_match_should_preserve_existing_provider_link_instead_of_overwriting() {
                 ),
             )],
             Vec::new(),
-        ),
-    );
+        )
+    };
+    let summary = merge_provider_snapshot(&mut library, snapshot());
 
-    // Desired post-fix behavior: keep the established link and surface the mismatch
-    // rather than clobbering it.
+    // The established link is kept and the mismatch is surfaced as an open
+    // identity conflict plus a merge warning instead of clobbering the link.
     assert_eq!(library.tracks.len(), 1);
     assert_eq!(spotify_link_id(&library.tracks[0]), Some("old-id"));
     assert!(
         !summary.warnings.is_empty(),
         "the conflicting provider id should be recorded as a warning"
     );
+    assert_eq!(library.tracks[0].identity_conflicts.len(), 1);
+    let conflict = &library.tracks[0].identity_conflicts[0];
+    assert_eq!(conflict.provider, ProviderKind::Spotify);
+    assert_eq!(conflict.candidate_provider_id, "new-id");
+    assert_eq!(conflict.status, IdentityConflictStatus::Open);
+    // No synced status may claim the rejected id.
+    assert_ne!(
+        library.tracks[0]
+            .provider_state
+            .get(ProviderKind::Spotify.as_key())
+            .and_then(|status| status.provider_item_id.as_deref()),
+        Some("new-id")
+    );
+    // The saved entry is still recorded; only the identity link is disputed.
+    assert_eq!(library.saved_tracks.len(), 1);
+    library.validate().unwrap();
+
+    // Re-observing the same conflict neither duplicates it nor warns again.
+    let summary = merge_provider_snapshot(&mut library, snapshot());
+    assert!(summary.warnings.is_empty());
+    assert_eq!(library.tracks[0].identity_conflicts.len(), 1);
+    library.validate().unwrap();
 }

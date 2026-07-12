@@ -17,12 +17,12 @@ use tiny_http::{Response, Server};
 use tokio::time::sleep;
 use url::Url;
 
-use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
-use crate::model::{
+use crate::domain::{
     LibraryState, LinkSource, ObservedArtwork, ObservedPlaylist, ObservedPlaylistTrack,
     ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
     SpotifyConnectionConfig, SyncStatusRecord, SyncSummary, TrackMetadata,
 };
+use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 
 const REDIRECT_URI: &str = "http://127.0.0.1:8000/callback";
@@ -1697,8 +1697,8 @@ mod tests {
         spotify_retry_delay, spotify_search_queries, SpotifyPlaylistItem,
         SPOTIFY_READ_RETRY_POLICY, SPOTIFY_WRITE_RETRY_POLICY,
     };
+    use crate::domain::TrackMetadata;
     use crate::matching::MatchCandidate;
-    use crate::model::TrackMetadata;
 
     #[test]
     fn parses_current_spotify_playlist_item_shape() {
