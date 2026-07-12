@@ -69,7 +69,7 @@ impl SearchFilter {
 
 impl YoutubeMusicProvider {
     pub fn new() -> Result<Self> {
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
         let headers_path = env::var("YOUTUBE_MUSIC_HEADERS_PATH")
             .ok()
             .map(PathBuf::from)

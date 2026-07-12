@@ -6,8 +6,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, Request, State};
+use axum::http::{header, HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{delete, get, get_service, post};
 use axum::{Json, Router};
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower_http::services::{ServeDir, ServeFile};
+use url::Url;
 use uuid::Uuid;
 
 use crate::matching::metadata_similarity;
@@ -1051,6 +1053,90 @@ struct SpotifyOembedResponse {
     thumbnail_height: Option<u32>,
 }
 
+/// Returns `true` if `host` (a `Host` header value, i.e. `host[:port]`) refers
+/// to a loopback address we are willing to serve state-changing requests for.
+fn is_loopback_host(host: &str) -> bool {
+    // Parse through `Url` so port, userinfo (`user@host`) and other trickery are
+    // normalised the same way a browser would; a bare hostname has no scheme so
+    // we prefix a synthetic one.
+    match Url::parse(&format!("http://{host}")) {
+        Ok(url) => matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")),
+        Err(_) => false,
+    }
+}
+
+/// Returns `true` if `origin` is an `http` origin pointing at a loopback host.
+/// Loopback is served over plain HTTP, so only the `http` scheme is accepted.
+fn is_loopback_http_origin(origin: &str) -> bool {
+    match Url::parse(origin) {
+        Ok(url) => {
+            url.scheme() == "http"
+                && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Decides whether a request is allowed through the cross-origin guard.
+///
+/// Safe methods (GET/HEAD/OPTIONS) always pass. For any state-changing method
+/// the request must satisfy every check that applies to it:
+/// - `Sec-Fetch-Site`, if present, must be `same-origin`, `same-site` or `none`.
+/// - `Host`, if present, must be a loopback host.
+/// - `Origin`, if present, must be an `http` loopback origin. A missing `Origin`
+///   is allowed (curl, some same-origin browser fetches, other CLI tools).
+fn is_request_origin_allowed(method: &Method, headers: &HeaderMap) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return true;
+    }
+
+    if let Some(site) = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+    {
+        if !matches!(site, "same-origin" | "same-site" | "none") {
+            return false;
+        }
+    }
+
+    if let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !is_loopback_host(host) {
+            return false;
+        }
+    }
+
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !is_loopback_http_origin(origin) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Axum middleware that blocks cross-origin state-changing requests so that a
+/// web page the user happens to visit cannot drive the local API (which is
+/// bound to loopback) into destructive operations.
+async fn cross_origin_guard(request: Request, next: Next) -> Response {
+    if is_request_origin_allowed(request.method(), request.headers()) {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(ErrorPayload {
+                error: "Cross-origin request blocked.".to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
 pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
     let database_path = storage::library_state_path();
     if !database_path.exists() {
@@ -1190,7 +1276,8 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         .route("/database/tables/:table_name", get(api_raw_table))
         .route("/backups", get(api_backups))
         .route("/backups/manual", post(api_create_manual_backup))
-        .route("/backups/restore", post(api_restore_backup));
+        .route("/backups/restore", post(api_restore_backup))
+        .layer(middleware::from_fn(cross_origin_guard));
 
     let frontend_service = get_service(
         ServeDir::new(&frontend_dist)
@@ -4508,7 +4595,7 @@ fn playlist_summaries(state: &LibraryState, query: Option<&str>) -> Vec<Playlist
         })
         .collect::<Vec<_>>();
 
-    rows.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    rows.sort_by_key(|left| left.name.to_lowercase());
     rows
 }
 
@@ -5342,10 +5429,101 @@ mod tests {
     use super::{
         bulk_merge_identity_conflict_rows, coverage_matches, extract_retry_after_seconds,
         identity_conflict_rows, identity_conflict_rows_filtered, identity_gap_rows,
-        normalize_manual_provider_track_id, provider_cooldown_from_error, provider_health_failed,
-        provider_preflight_payload, provider_push_plan_payload, raw_table_value_to_string,
-        IdentityConflictFilters,
+        is_request_origin_allowed, normalize_manual_provider_track_id,
+        provider_cooldown_from_error, provider_health_failed, provider_preflight_payload,
+        provider_push_plan_payload, raw_table_value_to_string, IdentityConflictFilters,
     };
+    use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method};
+
+    /// Builds a `HeaderMap` from `(name, value)` pairs for the guard tests.
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn cross_origin_guard_rejects_cross_site_origin() {
+        // A POST from an attacker-controlled page must be blocked even though it
+        // targets the loopback host.
+        let headers = header_map(&[
+            (header::HOST.as_str(), "127.0.0.1:7878"),
+            (header::ORIGIN.as_str(), "https://evil.example.com"),
+        ]);
+        assert!(!is_request_origin_allowed(&Method::POST, &headers));
+
+        // An http origin on a non-loopback host is likewise rejected.
+        let headers = header_map(&[
+            (header::HOST.as_str(), "127.0.0.1:7878"),
+            (header::ORIGIN.as_str(), "http://evil.example.com"),
+        ]);
+        assert!(!is_request_origin_allowed(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn cross_origin_guard_allows_same_origin_request() {
+        let headers = header_map(&[
+            (header::HOST.as_str(), "127.0.0.1:7878"),
+            (header::ORIGIN.as_str(), "http://127.0.0.1:7878"),
+            ("sec-fetch-site", "same-origin"),
+        ]);
+        assert!(is_request_origin_allowed(&Method::POST, &headers));
+
+        // localhost (any port) is treated as loopback too.
+        let headers = header_map(&[
+            (header::HOST.as_str(), "localhost:7878"),
+            (header::ORIGIN.as_str(), "http://localhost:7878"),
+        ]);
+        assert!(is_request_origin_allowed(&Method::DELETE, &headers));
+    }
+
+    #[test]
+    fn cross_origin_guard_allows_request_without_origin() {
+        // curl / CLI tools and some same-origin browser fetches omit Origin.
+        let headers = header_map(&[(header::HOST.as_str(), "127.0.0.1:7878")]);
+        assert!(is_request_origin_allowed(&Method::POST, &headers));
+
+        // No headers at all is also allowed for state-changing methods.
+        assert!(is_request_origin_allowed(&Method::POST, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn cross_origin_guard_rejects_evil_host() {
+        let headers = header_map(&[(header::HOST.as_str(), "evil.example.com")]);
+        assert!(!is_request_origin_allowed(&Method::POST, &headers));
+
+        // A look-alike host that merely embeds the loopback literal is rejected.
+        let headers = header_map(&[(header::HOST.as_str(), "127.0.0.1.evil.example.com")]);
+        assert!(!is_request_origin_allowed(&Method::POST, &headers));
+    }
+
+    #[test]
+    fn cross_origin_guard_allows_safe_methods_regardless_of_headers() {
+        // GET must stay reachable even from a cross-site context (e.g. the
+        // Spotify OAuth callback redirect).
+        let headers = header_map(&[
+            (header::HOST.as_str(), "evil.example.com"),
+            (header::ORIGIN.as_str(), "https://evil.example.com"),
+        ]);
+        assert!(is_request_origin_allowed(&Method::GET, &headers));
+        assert!(is_request_origin_allowed(&Method::HEAD, &headers));
+        assert!(is_request_origin_allowed(&Method::OPTIONS, &headers));
+    }
+
+    #[test]
+    fn cross_origin_guard_rejects_disallowed_sec_fetch_site() {
+        let headers = header_map(&[
+            (header::HOST.as_str(), "127.0.0.1:7878"),
+            (header::ORIGIN.as_str(), "http://127.0.0.1:7878"),
+            ("sec-fetch-site", "cross-site"),
+        ]);
+        assert!(!is_request_origin_allowed(&Method::POST, &headers));
+    }
 
     #[test]
     fn redacts_provider_credentials_from_raw_database_browser() {

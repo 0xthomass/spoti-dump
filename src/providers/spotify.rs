@@ -140,7 +140,7 @@ struct SpotifySearchItems {
 
 impl SpotifyProvider {
     pub async fn new(capability: ProviderCapability) -> Result<Self> {
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
         let access_token = get_access_token(capability).await?;
         Ok(Self {
             client: build_http_client()?,
@@ -1356,9 +1356,12 @@ async fn get_access_token_from_authorization_code(
     let response: AccessTokenResponse =
         response.json().await.context("Failed to parse response")?;
 
-    if let Some(refresh_token) = response.refresh_token {
-        println!("Your Spotify refresh token is: {}", refresh_token);
-        println!("Please set it as SPOTIFY_REFRESH_TOKEN in your .env file.");
+    if response.refresh_token.is_some() {
+        println!(
+            "Received a Spotify refresh token. Its value is not printed for security; \
+             use the in-app Spotify connection flow to store it, or copy it from the \
+             Spotify authorization response yourself if you want to set SPOTIFY_REFRESH_TOKEN."
+        );
     }
 
     Ok(response.access_token)
