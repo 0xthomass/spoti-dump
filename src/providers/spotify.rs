@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::env;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -14,23 +15,32 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tiny_http::{Response, Server};
+use tokio::sync::Mutex;
 use tokio::time::sleep;
 use url::Url;
 
 use crate::domain::{
     LibraryState, LinkSource, ObservedArtwork, ObservedPlaylist, ObservedPlaylistTrack,
-    ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
-    SpotifyConnectionConfig, SyncStatusRecord, SyncSummary, TrackMetadata,
+    ObservedSavedTrack, ObservedTrack, ProviderConnection, ProviderConnectionConfig, ProviderKind,
+    ProviderLibrarySnapshot, PurgeReport, SpotifyConnectionConfig, SyncStatusRecord, SyncSummary,
+    TrackMetadata,
 };
-use crate::error::ProviderError;
+use crate::error::{provider_failure, ProviderError, ProviderFailure};
 use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
 
 const REDIRECT_URI: &str = "http://127.0.0.1:8000/callback";
 const SCOPE_READ: &str = "user-library-read playlist-read-private";
-const SCOPE_WRITE: &str =
-    "user-library-modify playlist-read-private playlist-modify-public playlist-modify-private";
+// The push path reads the current library (GET /v1/me/tracks) and playlists
+// before modifying them, so a Write-capability token must carry the read scopes
+// it exercises in addition to the modify scopes. Otherwise pushes 403.
+const SCOPE_WRITE: &str = "user-library-read user-library-modify playlist-read-private playlist-modify-public playlist-modify-private";
 const SCOPE_ALL: &str = "user-library-read user-library-modify playlist-read-private playlist-modify-public playlist-modify-private";
+/// Seconds shaved off a token's advertised lifetime so we refresh before the
+/// server-side expiry actually lands.
+const TOKEN_EXPIRY_SAFETY_MARGIN_SECS: u64 = 60;
+/// Consecutive per-item push failures tolerated before aborting the whole push.
+const PUSH_CONSECUTIVE_FAILURE_LIMIT: usize = 5;
 const SPOTIFY_READ_REQUEST_ATTEMPTS: usize = 6;
 const SPOTIFY_WRITE_REQUEST_ATTEMPTS: usize = 12;
 const SPOTIFY_READ_RATE_LIMIT_FALLBACK_SECS: u64 = 30;
@@ -64,7 +74,7 @@ const SPOTIFY_WRITE_RETRY_POLICY: SpotifyRetryPolicy = SpotifyRetryPolicy {
 #[derive(Clone)]
 pub struct SpotifyProvider {
     client: reqwest::Client,
-    access_token: String,
+    tokens: Arc<SpotifyTokenManager>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +82,122 @@ struct AccessTokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     scope: Option<String>,
+    expires_in: Option<u64>,
+}
+
+/// Credentials required to mint a fresh access token from Spotify.
+///
+/// Held in memory for the life of the provider. Never logged.
+struct RefreshMaterials {
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+}
+
+/// The mutable half of the token manager, guarded by the manager's mutex.
+struct SpotifyTokenState {
+    access_token: String,
+    /// Absolute instant (with the safety margin already applied) after which the
+    /// token is considered stale. `None` when the lifetime is unknown (a bare
+    /// access token that cannot be reasoned about proactively).
+    expires_at: Option<Instant>,
+}
+
+/// Owns the Spotify access token and its lifecycle.
+///
+/// A single [`Mutex`] serializes refreshes so concurrent request paths never
+/// stampede the token endpoint. [`get_valid_token`](Self::get_valid_token)
+/// refreshes proactively when the token is stale;
+/// [`refresh_after_unauthorized`](Self::refresh_after_unauthorized) forces a
+/// refresh after a 401 so the caller can retry once. When no
+/// [`RefreshMaterials`] are available (an env flow that never obtained a refresh
+/// token) both paths fail with a clear, actionable error instead of silently
+/// wedging.
+struct SpotifyTokenManager {
+    client: reqwest::Client,
+    refresh: Option<RefreshMaterials>,
+    state: Mutex<SpotifyTokenState>,
+}
+
+impl SpotifyTokenManager {
+    fn new(
+        client: reqwest::Client,
+        access_token: String,
+        expires_at: Option<Instant>,
+        refresh: Option<RefreshMaterials>,
+    ) -> Self {
+        Self {
+            client,
+            refresh,
+            state: Mutex::new(SpotifyTokenState {
+                access_token,
+                expires_at,
+            }),
+        }
+    }
+
+    /// Returns a token that is valid now, refreshing proactively if it has gone
+    /// stale.
+    async fn get_valid_token(&self) -> Result<String> {
+        let mut state = self.state.lock().await;
+        if token_is_stale(state.expires_at) {
+            self.refresh_locked(&mut state).await?;
+        }
+        Ok(state.access_token.clone())
+    }
+
+    /// Forces a single refresh after a request came back `401 Unauthorized`, so
+    /// the caller can retry the request once with a fresh token.
+    async fn refresh_after_unauthorized(&self) -> Result<String> {
+        let mut state = self.state.lock().await;
+        self.refresh_locked(&mut state).await?;
+        Ok(state.access_token.clone())
+    }
+
+    async fn refresh_locked(&self, state: &mut SpotifyTokenState) -> Result<()> {
+        let Some(materials) = self.refresh.as_ref() else {
+            return Err(anyhow::Error::new(ProviderError::auth_failed(
+                "Spotify access token expired and no refresh token is available to renew it. \
+                 Set SPOTIFY_REFRESH_TOKEN or reconnect Spotify so a refresh token can be stored.",
+            )));
+        };
+        let response = refresh_access_token_with(
+            &self.client,
+            &materials.refresh_token,
+            &materials.client_id,
+            &materials.client_secret,
+        )
+        .await?;
+        state.access_token = response.access_token;
+        state.expires_at = expires_at_from(response.expires_in);
+        Ok(())
+    }
+}
+
+/// Everything obtained during initial credential acquisition, ready to seed a
+/// [`SpotifyTokenManager`].
+struct AcquiredToken {
+    access_token: String,
+    expires_at: Option<Instant>,
+    refresh: Option<RefreshMaterials>,
+}
+
+/// Whether a token whose (margin-adjusted) expiry is `expires_at` should be
+/// refreshed before use. Pure so the staleness decision is unit-testable.
+fn token_is_stale(expires_at: Option<Instant>) -> bool {
+    match expires_at {
+        Some(expires_at) => Instant::now() >= expires_at,
+        None => false,
+    }
+}
+
+/// Converts Spotify's `expires_in` (seconds) into an absolute refresh deadline,
+/// shaving off [`TOKEN_EXPIRY_SAFETY_MARGIN_SECS`] so we renew a little early.
+fn expires_at_from(expires_in: Option<u64>) -> Option<Instant> {
+    expires_in.map(|seconds| {
+        Instant::now()
+            + Duration::from_secs(seconds.saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN_SECS))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,18 +268,18 @@ struct SpotifySearchItems {
 impl SpotifyProvider {
     pub async fn new(capability: ProviderCapability) -> Result<Self> {
         dotenvy::dotenv().ok();
-        let access_token = get_access_token(capability).await?;
-        Ok(Self {
-            client: build_http_client()?,
-            access_token,
-        })
+        let client = build_http_client()?;
+        let acquired = acquire_env_token(&client, capability).await?;
+        Ok(Self::from_acquired(client, acquired))
     }
 
     pub async fn from_connection(
         config: &SpotifyConnectionConfig,
         capability: ProviderCapability,
     ) -> Result<Self> {
-        let response = refresh_access_token(
+        let client = build_http_client()?;
+        let response = refresh_access_token_with(
+            &client,
             &config.refresh_token,
             &config.client_id,
             &config.client_secret,
@@ -165,25 +291,90 @@ impl SpotifyProvider {
             ))));
         }
 
-        Ok(Self {
-            client: build_http_client()?,
+        let acquired = AcquiredToken {
             access_token: response.access_token,
-        })
+            expires_at: expires_at_from(response.expires_in),
+            refresh: Some(RefreshMaterials {
+                client_id: config.client_id.clone(),
+                client_secret: config.client_secret.clone(),
+                refresh_token: config.refresh_token.clone(),
+            }),
+        };
+        Ok(Self::from_acquired(client, acquired))
+    }
+
+    fn from_acquired(client: reqwest::Client, acquired: AcquiredToken) -> Self {
+        let tokens = SpotifyTokenManager::new(
+            client.clone(),
+            acquired.access_token,
+            acquired.expires_at,
+            acquired.refresh,
+        );
+        Self {
+            client,
+            tokens: Arc::new(tokens),
+        }
     }
 
     pub async fn verify_connection(&self) -> Result<()> {
-        let response = send_request_with_retry(
-            self.client
-                .get("https://api.spotify.com/v1/me")
-                .headers(self.auth_headers()?),
-        )
-        .await?;
+        let response = self
+            .send_read(self.client.get("https://api.spotify.com/v1/me"))
+            .await?;
 
         if !response.status().is_success() {
             return Err(response_error("Failed to verify Spotify connection", response).await);
         }
 
         Ok(())
+    }
+
+    /// Sends a bearer-authenticated read request through the token manager.
+    ///
+    /// The passed builder must carry every part of the request **except** the
+    /// `Authorization` header — the token is injected here so it is always
+    /// current and can be swapped on a reactive refresh.
+    async fn send_read(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_authed(request, SPOTIFY_READ_RETRY_POLICY, SPOTIFY_READ_DELAY)
+            .await
+    }
+
+    /// Sends a bearer-authenticated write request through the token manager.
+    async fn send_write(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        self.send_authed(request, SPOTIFY_WRITE_RETRY_POLICY, SPOTIFY_WRITE_DELAY)
+            .await
+    }
+
+    /// Attaches a valid bearer token and sends `request` under `policy`.
+    ///
+    /// On a `401 Unauthorized` the token manager is asked to refresh once and the
+    /// request is replayed a single time with the fresh token. Any other status
+    /// (including a `401` that survives the retry) is returned to the caller for
+    /// classification.
+    async fn send_authed(
+        &self,
+        request: reqwest::RequestBuilder,
+        policy: SpotifyRetryPolicy,
+        delay: Duration,
+    ) -> Result<reqwest::Response> {
+        // Preserve a clone before the request is consumed so the one reactive
+        // retry after a forced refresh can rebuild it with a new token.
+        let retry_spare = request.try_clone();
+
+        let token = self.tokens.get_valid_token().await?;
+        sleep(delay).await;
+        let response = send_request_with_retry_policy(bearer(request, &token), policy).await?;
+
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+
+        let Some(retry_request) = retry_spare else {
+            return Ok(response);
+        };
+
+        let token = self.tokens.refresh_after_unauthorized().await?;
+        sleep(delay).await;
+        send_request_with_retry_policy(bearer(retry_request, &token), policy).await
     }
 
     pub fn authorization_url(
@@ -283,13 +474,11 @@ impl SpotifyProvider {
         &self,
         url: &str,
     ) -> Result<Option<Vec<T>>> {
-        let headers = self.auth_headers()?;
         let mut items = Vec::new();
         let mut next_url = Some(url.to_string());
 
         while let Some(url) = next_url {
-            let response =
-                send_request_with_retry(self.client.get(&url).headers(headers.clone())).await?;
+            let response = self.send_read(self.client.get(&url)).await?;
 
             if response.status() == StatusCode::FORBIDDEN {
                 return Ok(None);
@@ -310,15 +499,6 @@ impl SpotifyProvider {
         }
 
         Ok(Some(items))
-    }
-
-    fn auth_headers(&self) -> Result<HeaderMap> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.access_token))?,
-        );
-        Ok(headers)
     }
 
     async fn resolve_track(
@@ -345,20 +525,19 @@ impl SpotifyProvider {
     ) -> Result<Vec<MatchCandidate>> {
         let queries = spotify_search_queries(metadata);
 
-        let headers = self.auth_headers()?;
         let mut candidates = Vec::new();
         let mut seen_ids = HashSet::new();
 
         for query in queries {
             sleep(SPOTIFY_SEARCH_DELAY).await;
-            let response = send_request_with_retry(
-                self.client
-                    .get("https://api.spotify.com/v1/search")
-                    .headers(headers.clone())
-                    .query(&[("q", query.as_str()), ("type", "track"), ("limit", "10")]),
-            )
-            .await
-            .context("Failed to search Spotify tracks")?;
+            let response = self
+                .send_read(
+                    self.client
+                        .get("https://api.spotify.com/v1/search")
+                        .query(&[("q", query.as_str()), ("type", "track"), ("limit", "10")]),
+                )
+                .await
+                .context("Failed to search Spotify tracks")?;
 
             if !response.status().is_success() {
                 return Err(response_error("Failed to search Spotify tracks", response).await);
@@ -400,20 +579,18 @@ impl SpotifyProvider {
     }
 
     async fn create_playlist(&self, name: &str, description: Option<&str>) -> Result<String> {
-        let mut headers = self.auth_headers()?;
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        let response = send_write_request_with_retry(
-            self.client
-                .post("https://api.spotify.com/v1/me/playlists")
-                .headers(headers)
-                .json(&json!({
-                    "name": name,
-                    "description": description.unwrap_or("Synced by spoti-dump"),
-                    "public": false
-                })),
-        )
-        .await?;
+        let response = self
+            .send_write(
+                self.client
+                    .post("https://api.spotify.com/v1/me/playlists")
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                    .json(&json!({
+                        "name": name,
+                        "description": description.unwrap_or("Synced by spoti-dump"),
+                        "public": false
+                    })),
+            )
+            .await?;
 
         if !response.status().is_success() {
             return Err(response_error("Failed to create playlist", response).await);
@@ -438,31 +615,31 @@ impl SpotifyProvider {
             return Ok(());
         }
 
-        let mut headers = self.auth_headers()?;
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         let url = playlist_items_url(playlist_id);
 
         let first_chunk = track_uris.iter().take(100).cloned().collect::<Vec<_>>();
-        let response = send_write_request_with_retry(
-            self.client
-                .put(&url)
-                .headers(headers.clone())
-                .json(&json!({ "uris": first_chunk })),
-        )
-        .await?;
+        let response = self
+            .send_write(
+                self.client
+                    .put(&url)
+                    .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                    .json(&json!({ "uris": first_chunk })),
+            )
+            .await?;
 
         if !response.status().is_success() {
             return Err(response_error("Failed to replace Spotify playlist items", response).await);
         }
 
         for chunk in track_uris.iter().skip(100).collect::<Vec<_>>().chunks(100) {
-            let response = send_write_request_with_retry(
-                self.client
-                    .post(&url)
-                    .headers(headers.clone())
-                    .json(&json!({ "uris": chunk })),
-            )
-            .await?;
+            let response = self
+                .send_write(
+                    self.client
+                        .post(&url)
+                        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                        .json(&json!({ "uris": chunk })),
+                )
+                .await?;
 
             if !response.status().is_success() {
                 return Err(
@@ -504,9 +681,21 @@ impl SpotifyProvider {
             .collect())
     }
 
-    async fn save_tracks(&self, track_ids: &[String]) -> Result<()> {
+    /// Saves `track_ids` to the library in chunks, returning the set of provider
+    /// ids whose chunk failed to save.
+    ///
+    /// Per-chunk failures are recorded and skipped so one bad chunk does not sink
+    /// the whole push; a typed rate-limit/auth failure or a tripped circuit
+    /// breaker still aborts with `Err`. Track ids already present in the library
+    /// count as successes (they are simply not re-sent).
+    async fn save_tracks(
+        &self,
+        track_ids: &[String],
+        breaker: &mut PushCircuitBreaker,
+    ) -> Result<HashSet<String>> {
+        let mut failed = HashSet::new();
         if track_ids.is_empty() {
-            return Ok(());
+            return Ok(failed);
         }
 
         let existing_ids = self.current_saved_track_ids().await?;
@@ -516,12 +705,8 @@ impl SpotifyProvider {
             .cloned()
             .collect::<Vec<_>>();
         if track_ids.is_empty() {
-            return Ok(());
+            return Ok(failed);
         }
-
-        let mut headers = self.auth_headers()?;
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
 
         for chunk in track_ids.chunks(40) {
             let uris = chunk
@@ -529,21 +714,34 @@ impl SpotifyProvider {
                 .map(|track_id| Self::spotify_uri(track_id))
                 .collect::<Vec<_>>()
                 .join(",");
-            let response = send_write_request_with_retry(
-                self.client
-                    .put(spotify_library_url())
-                    .headers(headers.clone())
-                    .query(&[("uris", uris)])
-                    .body(String::new()),
-            )
-            .await?;
+            let result = self
+                .send_write(
+                    self.client
+                        .put(spotify_library_url())
+                        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+                        .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
+                        .query(&[("uris", uris)])
+                        .body(String::new()),
+                )
+                .await;
 
-            if !response.status().is_success() {
-                return Err(response_error("Failed to save tracks", response).await);
+            match push_chunk_outcome(result, "Failed to save tracks").await {
+                Ok(()) => breaker.record_success(),
+                Err(error) => {
+                    if is_fatal_push_error(&error) {
+                        return Err(error);
+                    }
+                    for track_id in chunk {
+                        failed.insert(track_id.clone());
+                    }
+                    if breaker.record_failure() {
+                        return Err(push_circuit_breaker_error());
+                    }
+                }
             }
         }
 
-        Ok(())
+        Ok(failed)
     }
 
     async fn remove_library_items(&self, uris: &[String]) -> Result<()> {
@@ -551,18 +749,16 @@ impl SpotifyProvider {
             return Ok(());
         }
 
-        let mut headers = self.auth_headers()?;
-        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-
         for chunk in uris.chunks(40) {
-            let response = send_write_request_with_retry(
-                self.client
-                    .delete(spotify_library_url())
-                    .headers(headers.clone())
-                    .query(&[("uris", chunk.join(","))])
-                    .body(String::new()),
-            )
-            .await?;
+            let response = self
+                .send_write(
+                    self.client
+                        .delete(spotify_library_url())
+                        .header(CONTENT_LENGTH, HeaderValue::from_static("0"))
+                        .query(&[("uris", chunk.join(","))])
+                        .body(String::new()),
+                )
+                .await?;
 
             if !response.status().is_success() {
                 return Err(
@@ -836,15 +1032,37 @@ impl StreamingProvider for SpotifyProvider {
             );
         }
 
-        if force {
+        // One circuit breaker spans the whole push (saved tracks and playlists):
+        // 5 consecutive per-item failures anywhere aborts the operation.
+        let mut push_breaker = PushCircuitBreaker::new(PUSH_CONSECUTIVE_FAILURE_LIMIT);
+
+        let failed_saved_ids = if force {
             let track_ids = resolved_saved_tracks
                 .iter()
                 .map(|(_, provider_id, _)| provider_id.clone())
                 .collect::<Vec<_>>();
-            self.save_tracks(&track_ids).await?;
-        }
+            self.save_tracks(&track_ids, &mut push_breaker).await?
+        } else {
+            HashSet::new()
+        };
 
         for (saved_track_id, provider_id, confidence) in resolved_saved_tracks {
+            if force && failed_saved_ids.contains(&provider_id) {
+                let message =
+                    format!("Failed to save track {provider_id} to Spotify; recorded for retry.");
+                summary.warnings.push(message.clone());
+                state.set_saved_track_status(
+                    &saved_track_id,
+                    ProviderKind::Spotify,
+                    SyncStatusRecord::error_with_provider_item_id(
+                        message,
+                        provider_id,
+                        Some(confidence),
+                        now,
+                    ),
+                );
+                continue;
+            }
             summary.saved_tracks_synced += 1;
             state.set_saved_track_status(
                 &saved_track_id,
@@ -954,6 +1172,11 @@ impl StreamingProvider for SpotifyProvider {
                 );
             }
 
+            // Set when a playlist's push fails non-fatally: its entries are then
+            // marked errored (not synced) and the loop moves on to the next
+            // playlist rather than aborting the whole run.
+            let mut playlist_push_failed: Option<String> = None;
+
             if force {
                 if playlist.entries.is_empty() && is_spotify_system_playlist_name(&playlist.name) {
                     state.set_playlist_status(
@@ -966,6 +1189,41 @@ impl StreamingProvider for SpotifyProvider {
                             ),
                             now,
                         ),
+                    );
+                    emit_progress(
+                        progress.as_ref(),
+                        ProviderProgress {
+                            stage: "Pushing playlists".to_string(),
+                            detail: Some(playlist.name.clone()),
+                            saved_tracks_done: saved_done,
+                            saved_tracks_total: Some(saved_total),
+                            playlists_done: playlist_index + 1,
+                            playlists_total: Some(playlist_total),
+                            playlist_entries_done,
+                            playlist_entries_total: Some(playlist_entries_total),
+                        },
+                    );
+                    continue;
+                }
+
+                // Guard against clobbering a non-empty destination with an empty
+                // list when a transient matching failure resolved nothing.
+                if should_skip_empty_playlist_replace(
+                    resolved_track_uris.len(),
+                    playlist.entries.len(),
+                ) {
+                    let message = format!(
+                        "Skipped Spotify playlist '{}': none of its {} tracks resolved to Spotify \
+                         identities, so the destination was left untouched to avoid clearing it. \
+                         Run library identity sync and retry.",
+                        playlist.name,
+                        playlist.entries.len()
+                    );
+                    summary.warnings.push(message.clone());
+                    state.set_playlist_status(
+                        &playlist.playlist_id,
+                        ProviderKind::Spotify,
+                        SyncStatusRecord::unmatched(message, now),
                     );
                     emit_progress(
                         progress.as_ref(),
@@ -1013,37 +1271,71 @@ impl StreamingProvider for SpotifyProvider {
                     created
                 };
 
-                if let Err(error) = self
+                match self
                     .replace_playlist_tracks(&playlist_provider_id, &resolved_track_uris)
                     .await
                 {
-                    state.set_playlist_status(
-                        &playlist.playlist_id,
-                        ProviderKind::Spotify,
-                        SyncStatusRecord::error(
-                            format!(
-                                "Failed to sync Spotify playlist '{}': {error}",
-                                playlist.name
+                    Ok(()) => {
+                        push_breaker.record_success();
+                        state.set_playlist_status(
+                            &playlist.playlist_id,
+                            ProviderKind::Spotify,
+                            SyncStatusRecord::synced(
+                                Some(playlist_provider_id),
+                                Some(1.0),
+                                Some("Synced to Spotify".to_string()),
+                                now,
                             ),
-                            now,
-                        ),
-                    );
-                    return Err(error);
+                        );
+                    }
+                    Err(error) if is_fatal_push_error(&error) => {
+                        state.set_playlist_status(
+                            &playlist.playlist_id,
+                            ProviderKind::Spotify,
+                            SyncStatusRecord::error(
+                                format!(
+                                    "Failed to sync Spotify playlist '{}': {error}",
+                                    playlist.name
+                                ),
+                                now,
+                            ),
+                        );
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        let message = format!(
+                            "Failed to sync Spotify playlist '{}': {error}",
+                            playlist.name
+                        );
+                        summary.warnings.push(message.clone());
+                        state.set_playlist_status(
+                            &playlist.playlist_id,
+                            ProviderKind::Spotify,
+                            SyncStatusRecord::error(message.clone(), now),
+                        );
+                        playlist_push_failed = Some(message);
+                        if push_breaker.record_failure() {
+                            return Err(push_circuit_breaker_error());
+                        }
+                    }
                 }
-
-                state.set_playlist_status(
-                    &playlist.playlist_id,
-                    ProviderKind::Spotify,
-                    SyncStatusRecord::synced(
-                        Some(playlist_provider_id),
-                        Some(1.0),
-                        Some("Synced to Spotify".to_string()),
-                        now,
-                    ),
-                );
             }
 
             for (entry_id, provider_id, confidence) in matched_entries {
+                if let Some(reason) = playlist_push_failed.as_ref() {
+                    state.set_playlist_entry_status(
+                        &playlist.playlist_id,
+                        &entry_id,
+                        ProviderKind::Spotify,
+                        SyncStatusRecord::error_with_provider_item_id(
+                            reason.clone(),
+                            provider_id,
+                            Some(confidence),
+                            now,
+                        ),
+                    );
+                    continue;
+                }
                 summary.playlist_entries_synced += 1;
                 state.set_playlist_entry_status(
                     &playlist.playlist_id,
@@ -1289,7 +1581,10 @@ fn best_candidate_for_profiles(
         })
 }
 
-async fn get_access_token(capability: ProviderCapability) -> Result<String> {
+async fn acquire_env_token(
+    client: &reqwest::Client,
+    capability: ProviderCapability,
+) -> Result<AcquiredToken> {
     let redirect_uri =
         Url::parse(REDIRECT_URI).expect("Hard-coded redirect URI should always be valid");
 
@@ -1299,9 +1594,19 @@ async fn get_access_token(capability: ProviderCapability) -> Result<String> {
 
     if let Ok(refresh_token) = env::var("SPOTIFY_REFRESH_TOKEN") {
         if !refresh_token.is_empty() {
-            let response = refresh_access_token(&refresh_token, &client_id, &client_secret).await?;
+            let response =
+                refresh_access_token_with(client, &refresh_token, &client_id, &client_secret)
+                    .await?;
             if token_has_required_scopes(response.scope.as_deref(), capability) {
-                return Ok(response.access_token);
+                return Ok(AcquiredToken {
+                    access_token: response.access_token,
+                    expires_at: expires_at_from(response.expires_in),
+                    refresh: Some(RefreshMaterials {
+                        client_id,
+                        client_secret,
+                        refresh_token,
+                    }),
+                });
             }
 
             eprintln!(
@@ -1310,19 +1615,25 @@ async fn get_access_token(capability: ProviderCapability) -> Result<String> {
         }
     }
 
-    get_access_token_from_authorization_code(capability, &client_id, &client_secret, &redirect_uri)
-        .await
+    acquire_token_via_authorization_code(
+        client,
+        capability,
+        &client_id,
+        &client_secret,
+        &redirect_uri,
+    )
+    .await
 }
 
-async fn get_access_token_from_authorization_code(
+async fn acquire_token_via_authorization_code(
+    client: &reqwest::Client,
     capability: ProviderCapability,
     client_id: &str,
     client_secret: &str,
     redirect_uri: &Url,
-) -> Result<String> {
-    let (code, _) = get_authorization_code(capability, client_id, redirect_uri)?;
+) -> Result<AcquiredToken> {
+    let (code, _) = get_authorization_code(capability, client_id, redirect_uri).await?;
 
-    let client = build_http_client()?;
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -1368,23 +1679,70 @@ async fn get_access_token_from_authorization_code(
     let response: AccessTokenResponse =
         response.json().await.context("Failed to parse response")?;
 
-    if response.refresh_token.is_some() {
-        println!(
-            "Received a Spotify refresh token. Its value is not printed for security; \
-             use the in-app Spotify connection flow to store it, or copy it from the \
-             Spotify authorization response yourself if you want to set SPOTIFY_REFRESH_TOKEN."
-        );
-    }
+    let expires_at = expires_at_from(response.expires_in);
+    let refresh = match response.refresh_token {
+        Some(refresh_token) => {
+            // Persist the connection so later runs reuse it instead of forcing a
+            // fresh browser authorization every time.
+            match persist_spotify_connection(client_id, client_secret, &refresh_token) {
+                Ok(()) => println!(
+                    "Stored the Spotify connection; later runs will reuse it without re-authorizing."
+                ),
+                Err(error) => eprintln!(
+                    "Warning: authorized with Spotify but could not persist the connection for \
+                     reuse ({error}). You may be prompted to authorize again next run."
+                ),
+            }
+            Some(RefreshMaterials {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+                refresh_token,
+            })
+        }
+        None => {
+            eprintln!(
+                "Spotify did not return a refresh token, so this session cannot renew its access \
+                 token automatically once it expires. Reconnect Spotify to store a refresh token."
+            );
+            None
+        }
+    };
 
-    Ok(response.access_token)
+    Ok(AcquiredToken {
+        access_token: response.access_token,
+        expires_at,
+        refresh,
+    })
 }
 
-async fn refresh_access_token(
+/// Persists a Spotify [`ProviderConnection`] so subsequent runs reuse it. The
+/// `.env` file remains the source of `client_id`/`client_secret`; only the
+/// refresh token (obtained via OAuth) is added here. Secrets are never logged.
+fn persist_spotify_connection(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let connection = ProviderConnection {
+        provider: ProviderKind::Spotify,
+        connected_at: now,
+        updated_at: now,
+        config: ProviderConnectionConfig::Spotify(SpotifyConnectionConfig {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            refresh_token: refresh_token.to_string(),
+        }),
+    };
+    crate::storage::save_provider_connection(&connection)
+}
+
+async fn refresh_access_token_with(
+    client: &reqwest::Client,
     refresh_token: &str,
     client_id: &str,
     client_secret: &str,
 ) -> Result<AccessTokenResponse> {
-    let client = build_http_client()?;
     let mut headers = HeaderMap::new();
     headers.insert(
         CONTENT_TYPE,
@@ -1447,6 +1805,9 @@ fn required_scopes(capability: ProviderCapability) -> &'static [&'static str] {
     match capability {
         ProviderCapability::Read => &["user-library-read", "playlist-read-private"],
         ProviderCapability::Write => &[
+            // The push path reads before it writes, so Write requires the read
+            // scopes it uses in addition to the modify scopes.
+            "user-library-read",
             "user-library-modify",
             "playlist-read-private",
             "playlist-modify-public",
@@ -1462,7 +1823,7 @@ fn required_scopes(capability: ProviderCapability) -> &'static [&'static str] {
     }
 }
 
-fn get_authorization_code(
+async fn get_authorization_code(
     capability: ProviderCapability,
     client_id: &str,
     redirect_uri: &Url,
@@ -1491,7 +1852,8 @@ fn get_authorization_code(
 
     let host = redirect_uri
         .host_str()
-        .context("Redirect URI must include a host")?;
+        .context("Redirect URI must include a host")?
+        .to_string();
     let port = redirect_uri
         .port_or_known_default()
         .context("Redirect URI must include a port")?;
@@ -1507,37 +1869,135 @@ fn get_authorization_code(
         }
     }
 
-    let server = Server::http(&server_addr)
-        .map_err(|error| anyhow::anyhow!("Failed to start local callback server: {}", error))?;
     println!("Waiting for Spotify authorization... (will time out in 2 minutes)");
 
-    if let Ok(Some(request)) = server.recv_timeout(Duration::from_secs(120)) {
-        let callback_url = format!("http://{host}:{port}{}", request.url());
-        let url = Url::parse(&callback_url)?;
-        let code = url
-            .query_pairs()
-            .find(|(key, _)| key == "code")
-            .map(|(_, value)| value.into_owned())
-            .context("No code found in callback URL")?;
-        let returned_state = url
-            .query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned())
-            .context("No state found in callback URL")?;
-
-        let response = Response::from_string(
-            "Spotify authorization received. You can close this tab and return to the CLI.",
-        );
-        let _ = request.respond(response);
-
-        if returned_state != state {
-            anyhow::bail!("OAuth state mismatch");
+    // `tiny_http`'s bind/accept/recv are blocking, so run them on the blocking
+    // pool instead of stalling the async runtime. `Ok(Some(raw_url))` carries the
+    // callback path+query, `Ok(None)` means the wait timed out.
+    let raw_callback_url = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let server = Server::http(&server_addr)
+            .map_err(|error| anyhow::anyhow!("Failed to start local callback server: {error}"))?;
+        match server.recv_timeout(Duration::from_secs(120)) {
+            Ok(Some(request)) => {
+                let raw_url = request.url().to_string();
+                let response = Response::from_string(
+                    "Spotify authorization received. You can close this tab and return to the CLI.",
+                );
+                let _ = request.respond(response);
+                Ok(Some(raw_url))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("Local callback server error: {error}")),
         }
+    })
+    .await
+    .context("Spotify authorization callback task failed")??;
 
-        return Ok((code, returned_state));
+    let Some(raw_callback_url) = raw_callback_url else {
+        anyhow::bail!("Timed out waiting for Spotify authorization callback");
+    };
+
+    let callback_url = format!("http://{host}:{port}{raw_callback_url}");
+    let url = Url::parse(&callback_url)?;
+
+    // Spotify redirects with `?error=access_denied` (or similar) when the user
+    // declines the consent screen; surface that clearly instead of a generic
+    // "no code" failure.
+    if let Some(error) = url
+        .query_pairs()
+        .find(|(key, _)| key == "error")
+        .map(|(_, value)| value.into_owned())
+    {
+        anyhow::bail!(
+            "Spotify authorization was not granted (error: {error}). If you declined the consent \
+             screen, re-run the command and approve access."
+        );
     }
 
-    anyhow::bail!("Timed out waiting for Spotify authorization callback")
+    let code = url
+        .query_pairs()
+        .find(|(key, _)| key == "code")
+        .map(|(_, value)| value.into_owned())
+        .context("No code found in callback URL")?;
+    let returned_state = url
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .context("No state found in callback URL")?;
+
+    if returned_state != state {
+        anyhow::bail!("OAuth state mismatch");
+    }
+
+    Ok((code, returned_state))
+}
+
+/// Attaches the bearer token to a request builder just before it is sent, so a
+/// reactive refresh can swap in a fresh token on the retry.
+fn bearer(request: reqwest::RequestBuilder, token: &str) -> reqwest::RequestBuilder {
+    request.header(AUTHORIZATION, format!("Bearer {token}"))
+}
+
+/// Trips a push after too many *consecutive* per-item failures. A single
+/// success resets the count, so isolated hiccups are tolerated while a sustained
+/// outage aborts fast instead of hammering every remaining item.
+struct PushCircuitBreaker {
+    consecutive_failures: usize,
+    limit: usize,
+}
+
+impl PushCircuitBreaker {
+    fn new(limit: usize) -> Self {
+        Self {
+            consecutive_failures: 0,
+            limit,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    /// Records a failure and returns `true` if the breaker has now tripped.
+    fn record_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        self.consecutive_failures >= self.limit
+    }
+}
+
+fn push_circuit_breaker_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Aborting Spotify push after {PUSH_CONSECUTIVE_FAILURE_LIMIT} consecutive item failures; \
+         the provider appears unhealthy. Resolve the underlying issue and re-run the sync."
+    )
+}
+
+/// Collapses a raw send result into success or a classified error at the
+/// boundary, so calling loops match on the typed failure rather than the raw
+/// HTTP status.
+async fn push_chunk_outcome(result: Result<reqwest::Response>, context: &str) -> Result<()> {
+    match result {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(response_error(context, response).await),
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether a push error must abort the whole operation instead of being recorded
+/// against a single item. Typed rate-limit and auth failures are fatal because
+/// pushing further items cannot succeed until they are resolved.
+fn is_fatal_push_error(error: &anyhow::Error) -> bool {
+    matches!(
+        provider_failure(error).map(ProviderError::failure),
+        Some(ProviderFailure::RateLimited { .. } | ProviderFailure::AuthFailed)
+    )
+}
+
+/// Whether a playlist replace should be skipped to avoid clobbering a non-empty
+/// destination with an empty track list when every entry failed to resolve.
+/// Pure so the data-loss guard is unit-testable in isolation.
+fn should_skip_empty_playlist_replace(resolved_uris: usize, canonical_entries: usize) -> bool {
+    resolved_uris == 0 && canonical_entries > 0
 }
 
 async fn response_error(context: &str, response: reqwest::Response) -> anyhow::Error {
@@ -1595,16 +2055,11 @@ fn build_http_client() -> Result<reqwest::Client> {
         .build()?)
 }
 
+/// Read-tier wrapper used by the token endpoints (which carry client
+/// credentials, not a bearer token, so they bypass the token manager).
 async fn send_request_with_retry(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
     sleep(SPOTIFY_READ_DELAY).await;
     send_request_with_retry_policy(request, SPOTIFY_READ_RETRY_POLICY).await
-}
-
-async fn send_write_request_with_retry(
-    request: reqwest::RequestBuilder,
-) -> Result<reqwest::Response> {
-    sleep(SPOTIFY_WRITE_DELAY).await;
-    send_request_with_retry_policy(request, SPOTIFY_WRITE_RETRY_POLICY).await
 }
 
 async fn send_request_with_retry_policy(
@@ -1735,20 +2190,25 @@ fn is_spotify_system_playlist_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
     use reqwest::StatusCode;
 
     use super::{
-        best_candidate_for_profiles, is_spotify_system_playlist_name, parse_retry_after_seconds,
-        playlist_items_url, should_defer_spotify_retry, should_retry_spotify_status,
-        song_artist_from_video_title, spotify_library_url, spotify_match_profiles,
-        spotify_retry_delay, spotify_search_queries, SpotifyPlaylistItem,
-        SPOTIFY_READ_RETRY_POLICY, SPOTIFY_WRITE_RETRY_POLICY,
+        best_candidate_for_profiles, expires_at_from, is_fatal_push_error,
+        is_spotify_system_playlist_name, parse_retry_after_seconds, playlist_items_url,
+        required_scopes, should_defer_spotify_retry, should_retry_spotify_status,
+        should_skip_empty_playlist_replace, song_artist_from_video_title, spotify_library_url,
+        spotify_match_profiles, spotify_retry_delay, spotify_search_queries,
+        token_has_required_scopes, token_is_stale, PushCircuitBreaker, SpotifyPlaylistItem,
+        PUSH_CONSECUTIVE_FAILURE_LIMIT, SCOPE_ALL, SCOPE_WRITE, SPOTIFY_READ_RETRY_POLICY,
+        SPOTIFY_WRITE_RETRY_POLICY, TOKEN_EXPIRY_SAFETY_MARGIN_SECS,
     };
     use crate::domain::TrackMetadata;
+    use crate::error::ProviderError;
     use crate::matching::MatchCandidate;
+    use crate::provider::ProviderCapability;
 
     #[test]
     fn parses_current_spotify_playlist_item_shape() {
@@ -1913,5 +2373,121 @@ mod tests {
         assert_eq!(parse_retry_after_seconds("1.2"), Some(2));
         assert_eq!(parse_retry_after_seconds(" 12 "), Some(12));
         assert_eq!(parse_retry_after_seconds("not-a-duration"), None);
+    }
+
+    #[test]
+    fn write_scope_covers_every_scope_the_push_path_uses() {
+        // The scopes the push path actually exercises: it reads the current
+        // library and playlists (user-library-read, playlist-read-private) and
+        // modifies both (user-library-modify, playlist-modify-*).
+        let push_required = [
+            "user-library-read",
+            "user-library-modify",
+            "playlist-read-private",
+            "playlist-modify-public",
+            "playlist-modify-private",
+        ];
+        let write_scopes: std::collections::HashSet<&str> =
+            SCOPE_WRITE.split_whitespace().collect();
+
+        // push-required scopes ⊆ Write scope set
+        for scope in push_required {
+            assert!(
+                write_scopes.contains(scope),
+                "SCOPE_WRITE is missing push scope {scope}"
+            );
+        }
+
+        // The validation table for Write must also require what the push uses,
+        // and a token granted SCOPE_WRITE must satisfy it.
+        let table: std::collections::HashSet<&str> = required_scopes(ProviderCapability::Write)
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(table, write_scopes);
+        assert!(token_has_required_scopes(
+            Some(SCOPE_WRITE),
+            ProviderCapability::Write
+        ));
+
+        // SCOPE_ALL stays consistent (a superset that also satisfies Write).
+        let all_scopes: std::collections::HashSet<&str> = SCOPE_ALL.split_whitespace().collect();
+        assert!(write_scopes.is_subset(&all_scopes));
+        assert!(token_has_required_scopes(
+            Some(SCOPE_ALL),
+            ProviderCapability::Write
+        ));
+    }
+
+    #[test]
+    fn token_staleness_respects_expiry_and_safety_margin() {
+        // Unknown lifetime is never treated as stale (can't reason about it).
+        assert!(!token_is_stale(None));
+        // An expiry already in the past is stale.
+        assert!(token_is_stale(Some(
+            Instant::now() - Duration::from_secs(1)
+        )));
+        // A comfortably future expiry is fresh.
+        assert!(!token_is_stale(Some(
+            Instant::now() + Duration::from_secs(120)
+        )));
+
+        // A long-lived token is fresh once the safety margin is applied.
+        assert!(!token_is_stale(expires_at_from(Some(3600))));
+        // A token whose whole lifetime is within the safety margin is stale now.
+        assert!(token_is_stale(expires_at_from(Some(
+            TOKEN_EXPIRY_SAFETY_MARGIN_SECS
+        ))));
+        // No advertised lifetime => no computed expiry.
+        assert!(expires_at_from(None).is_none());
+    }
+
+    #[test]
+    fn skips_playlist_replace_only_when_all_entries_failed_to_resolve() {
+        // All entries failed to resolve on a non-empty playlist => skip.
+        assert!(should_skip_empty_playlist_replace(0, 5));
+        // Some resolved => proceed (partial push is allowed).
+        assert!(!should_skip_empty_playlist_replace(3, 5));
+        // Genuinely empty canonical playlist => proceed (clearing is intended).
+        assert!(!should_skip_empty_playlist_replace(0, 0));
+        // Defensive: resolved without canonical entries => proceed.
+        assert!(!should_skip_empty_playlist_replace(2, 0));
+    }
+
+    #[test]
+    fn circuit_breaker_trips_after_consecutive_failures_and_resets_on_success() {
+        let mut breaker = PushCircuitBreaker::new(PUSH_CONSECUTIVE_FAILURE_LIMIT);
+
+        // The first (limit - 1) failures do not trip.
+        for _ in 0..PUSH_CONSECUTIVE_FAILURE_LIMIT - 1 {
+            assert!(!breaker.record_failure());
+        }
+        // A success resets the streak, so we can fail again without tripping.
+        breaker.record_success();
+        for _ in 0..PUSH_CONSECUTIVE_FAILURE_LIMIT - 1 {
+            assert!(!breaker.record_failure());
+        }
+        // The limit-th consecutive failure trips the breaker.
+        assert!(breaker.record_failure());
+    }
+
+    #[test]
+    fn only_rate_limit_and_auth_failures_abort_the_push() {
+        let rate_limited = anyhow::Error::new(ProviderError::rate_limited(
+            "429",
+            Some(Duration::from_secs(30)),
+        ));
+        let auth = anyhow::Error::new(ProviderError::auth_failed("401"));
+        let http = anyhow::Error::new(ProviderError::http("500", 500));
+        let invalid = anyhow::Error::new(ProviderError::invalid_argument("400"));
+        let network = anyhow::Error::new(ProviderError::network("connect reset"));
+        let plain = anyhow::anyhow!("some non-provider error");
+
+        assert!(is_fatal_push_error(&rate_limited));
+        assert!(is_fatal_push_error(&auth));
+        assert!(!is_fatal_push_error(&http));
+        assert!(!is_fatal_push_error(&invalid));
+        assert!(!is_fatal_push_error(&network));
+        assert!(!is_fatal_push_error(&plain));
     }
 }
