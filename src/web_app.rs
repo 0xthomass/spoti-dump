@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, Query, Request, State};
@@ -18,16 +20,17 @@ use rusqlite::types::ValueRef;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tower_http::services::{ServeDir, ServeFile};
 use url::Url;
 use uuid::Uuid;
 
 use crate::domain::{
-    merge_provider_snapshot, LibraryState, LinkSource, ProviderConnection,
-    ProviderConnectionConfig, ProviderCooldown, ProviderHealth, ProviderKind, ProviderTrackArtwork,
-    SyncState, SyncStatusRecord, TrackEntity, TrackIdentityApplyResult, TrackIdentityConflict,
-    TrackMergeConflictResolution, TrackMetadata, YoutubeMusicConnectionConfig,
+    merge_provider_snapshot, LibraryState, LinkSource, PlaylistEntity, PlaylistEntry,
+    ProviderConnection, ProviderConnectionConfig, ProviderCooldown, ProviderHealth, ProviderKind,
+    ProviderTrackArtwork, SavedTrackEntry, SyncState, SyncStatusRecord, TrackEntity,
+    TrackIdentityApplyResult, TrackIdentityConflict, TrackMergeConflictResolution, TrackMetadata,
+    YoutubeMusicConnectionConfig,
 };
 use crate::matching::metadata_similarity;
 use crate::provider::{ProgressHandler, ProviderCapability, ProviderProgress, StreamingProvider};
@@ -40,13 +43,50 @@ const PAGE_SIZE: usize = 50;
 const RAW_PAGE_SIZE: usize = 120;
 const BULK_IDENTITY_CONFLICT_EXAMPLE_LIMIT: usize = 10;
 const BULK_IDENTITY_CONFLICT_MERGE_LIMIT: usize = 250;
+/// How long a track that yielded no artwork is skipped before enrichment
+/// retries it, to prevent refetch storms for artwork-less tracks.
+const ARTWORK_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+/// Upper bound on how many tracks a single background enrichment pass fetches,
+/// so one browse request cannot schedule an unbounded run of external lookups.
+const ARTWORK_ENRICHMENT_BATCH: usize = 50;
+/// Concurrent external artwork fetches within one enrichment pass.
+const ARTWORK_FETCH_CONCURRENCY: usize = 4;
 
 struct AppContext {
     http_client: reqwest::Client,
     spotify_redirect_uri: String,
     pending_spotify_auth: Mutex<HashMap<String, PendingSpotifyAuth>>,
     operations: StdMutex<HashMap<String, OperationRecord>>,
-    state_mutation: Mutex<()>,
+    /// Canonical library state, held in memory and loaded once at startup.
+    /// Browse/read handlers take a read lock; mutating handlers take the write
+    /// lock, mutate, and persist write-through before dropping it. SQLite is
+    /// never read again after startup except for raw-table browsing/restore.
+    library: RwLock<LibraryState>,
+    /// Bumped by every user-initiated canonical mutation (mutating handlers and
+    /// delete-propagation reconciles). Long-running operations snapshot it
+    /// before their off-lock provider I/O and re-check it at commit time to
+    /// detect concurrent user edits. Artwork enrichment deliberately does not
+    /// bump it: artwork is self-healing bookkeeping, not a user edit.
+    library_version: AtomicU64,
+    /// One-permit gate so at most one background artwork enrichment pass runs at
+    /// a time (debounce): browse handlers try to schedule a pass and give up if
+    /// one is already in flight.
+    artwork_semaphore: Arc<Semaphore>,
+    /// Track IDs that recently yielded no artwork, with the time we last tried,
+    /// so enrichment does not hammer external services for artwork-less tracks.
+    artwork_negative_cache: StdMutex<HashMap<String, Instant>>,
+}
+
+impl AppContext {
+    /// Records a user-initiated canonical mutation so long-running operations
+    /// can detect concurrent edits.
+    fn bump_library_version(&self) {
+        self.library_version.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+
+    fn library_version(&self) -> u64 {
+        self.library_version.load(AtomicOrdering::SeqCst)
+    }
 }
 
 #[derive(Clone)]
@@ -279,8 +319,8 @@ fn truncate_message(raw: &str, max_chars: usize) -> String {
     format!("{shortened}…")
 }
 
-fn ensure_provider_not_cooling_down(provider: ProviderKind) -> Result<(), ApiError> {
-    if let Some(cooldown) = storage::read_provider_cooldown(provider).map_err(ApiError::from)? {
+async fn ensure_provider_not_cooling_down(provider: ProviderKind) -> Result<(), ApiError> {
+    if let Some(cooldown) = runtime_db(move || storage::read_provider_cooldown(provider)).await? {
         return Err(ApiError::rate_limited(format!(
             "{} is cooling down until {} because the provider recently rejected requests: {}",
             provider.display_name(),
@@ -291,8 +331,8 @@ fn ensure_provider_not_cooling_down(provider: ProviderKind) -> Result<(), ApiErr
     Ok(())
 }
 
-fn ensure_provider_health_allows_operation(provider: ProviderKind) -> Result<(), ApiError> {
-    if let Some(health) = storage::read_provider_health(provider).map_err(ApiError::from)? {
+async fn ensure_provider_health_allows_operation(provider: ProviderKind) -> Result<(), ApiError> {
+    if let Some(health) = runtime_db(move || storage::read_provider_health(provider)).await? {
         if !health.ok {
             return Err(ApiError::bad_request(format!(
                 "Last {} connection check failed: {}. Relink or run Check Connection before starting sync.",
@@ -307,9 +347,9 @@ fn ensure_provider_health_allows_operation(provider: ProviderKind) -> Result<(),
     Ok(())
 }
 
-fn library_identity_skip_reason(provider: ProviderKind) -> Result<Option<String>, ApiError> {
-    if storage::read_provider_connection(provider)
-        .map_err(ApiError::from)?
+async fn library_identity_skip_reason(provider: ProviderKind) -> Result<Option<String>, ApiError> {
+    if runtime_db(move || storage::read_provider_connection(provider))
+        .await?
         .is_none()
     {
         return Ok(Some(format!(
@@ -318,7 +358,7 @@ fn library_identity_skip_reason(provider: ProviderKind) -> Result<Option<String>
         )));
     }
 
-    if let Some(cooldown) = storage::read_provider_cooldown(provider).map_err(ApiError::from)? {
+    if let Some(cooldown) = runtime_db(move || storage::read_provider_cooldown(provider)).await? {
         return Ok(Some(format!(
             "Skipped {} identity sync because the provider is cooling down until {}: {}",
             provider.display_name(),
@@ -327,7 +367,7 @@ fn library_identity_skip_reason(provider: ProviderKind) -> Result<Option<String>
         )));
     }
 
-    if let Some(health) = storage::read_provider_health(provider).map_err(ApiError::from)? {
+    if let Some(health) = runtime_db(move || storage::read_provider_health(provider)).await? {
         if !health.ok {
             return Ok(Some(format!(
                 "Skipped {} identity sync because the last connection check failed: {}",
@@ -361,14 +401,14 @@ fn provider_health_failed(provider: ProviderKind, message: impl Into<String>) ->
     }
 }
 
-fn save_provider_health(health: ProviderHealth) -> Result<(), ApiError> {
-    storage::save_provider_health(&health).map_err(ApiError::from)
+async fn save_provider_health(health: ProviderHealth) -> Result<(), ApiError> {
+    runtime_db(move || storage::save_provider_health(&health)).await
 }
 
 /// Records a cooldown and/or unhealthy state after an identity-sync provider
 /// failure, classifying the failure from the typed provider error in the
 /// `anyhow` chain. A missing source (e.g. a plain bad-request) records nothing.
-fn remember_identity_provider_failure(
+async fn remember_identity_provider_failure(
     provider: ProviderKind,
     error: Option<&anyhow::Error>,
 ) -> Result<(), ApiError> {
@@ -377,14 +417,15 @@ fn remember_identity_provider_failure(
     };
 
     if let Some(cooldown) = policy::cooldown_from_error(provider, error) {
-        storage::save_provider_cooldown(&cooldown).map_err(ApiError::from)?;
+        runtime_db(move || storage::save_provider_cooldown(&cooldown)).await?;
     }
 
     if policy::is_connection_health_failure(error) {
         save_provider_health(provider_health_failed(
             provider,
             sanitize_error_message(&error.to_string()),
-        ))?;
+        ))
+        .await?;
     }
 
     Ok(())
@@ -1115,6 +1156,9 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
     let frontend_dist = ensure_frontend_dist()?;
     let spotify_redirect_uri = format!("http://127.0.0.1:{port}/auth/spotify/callback");
     let operations = load_recovered_operations()?;
+    // Load the canonical state once. Every request then reads from (or mutates
+    // and writes through) this in-memory copy instead of re-opening SQLite.
+    let library = storage::read_library_state_or_new()?;
     let shared = Arc::new(AppContext {
         http_client: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -1122,7 +1166,10 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         spotify_redirect_uri: spotify_redirect_uri.clone(),
         pending_spotify_auth: Mutex::new(HashMap::new()),
         operations: StdMutex::new(operations),
-        state_mutation: Mutex::new(()),
+        library: RwLock::new(library),
+        library_version: AtomicU64::new(0),
+        artwork_semaphore: Arc::new(Semaphore::new(1)),
+        artwork_negative_cache: StdMutex::new(HashMap::new()),
     });
 
     let listener = TcpListener::bind(("127.0.0.1", port))
@@ -1322,18 +1369,21 @@ async fn spotify_callback(
     }
 
     let now = Utc::now();
-    storage::save_provider_connection(&ProviderConnection {
-        provider: ProviderKind::Spotify,
-        connected_at: now,
-        updated_at: now,
-        config: ProviderConnectionConfig::Spotify(config),
+    runtime_db(move || {
+        storage::save_provider_connection(&ProviderConnection {
+            provider: ProviderKind::Spotify,
+            connected_at: now,
+            updated_at: now,
+            config: ProviderConnectionConfig::Spotify(config),
+        })?;
+        storage::clear_provider_cooldown(ProviderKind::Spotify)
     })
-    .map_err(ApiError::from)?;
-    storage::clear_provider_cooldown(ProviderKind::Spotify).map_err(ApiError::from)?;
+    .await?;
     save_provider_health(provider_health_ok(
         ProviderKind::Spotify,
         "Connection verified during Spotify link.",
-    ))?;
+    ))
+    .await?;
 
     Ok(Html(
         r#"<!doctype html>
@@ -1352,8 +1402,10 @@ async fn spotify_callback(
     .into_response())
 }
 
-async fn api_overview() -> Result<Json<OverviewResponse>, ApiError> {
-    let state = read_state().await?;
+async fn api_overview(
+    State(context): State<Arc<AppContext>>,
+) -> Result<Json<OverviewResponse>, ApiError> {
+    let state = context.library.read().await;
     Ok(Json(overview_payload(&state)))
 }
 
@@ -1409,15 +1461,25 @@ async fn api_restore_backup(
     State(context): State<Arc<AppContext>>,
     Json(request): Json<RestoreBackupRequest>,
 ) -> Result<Json<RestoreBackupResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
     let backup_type = request.backup_type;
     let file_name = request.file_name;
+    // A restore replaces the entire canonical database, so it must exclude all
+    // other access: hold the write lock across the (local, blocking) restore and
+    // the reload that refreshes the in-memory copy from the restored file.
+    let mut guard = context.library.write().await;
     let summary = tokio::task::spawn_blocking(move || {
         storage::restore_library_backup(&backup_type, &file_name)
     })
     .await
     .context("Failed to join restore backup task")?
     .map_err(|error| ApiError::bad_request(sanitize_error_message(&error.to_string())))?;
+    let reloaded = tokio::task::spawn_blocking(storage::read_library_state)
+        .await
+        .context("Failed to join post-restore reload task")?
+        .map_err(ApiError::from)?;
+    *guard = reloaded;
+    context.bump_library_version();
+    drop(guard);
 
     Ok(Json(RestoreBackupResponse {
         message: format!(
@@ -1433,16 +1495,12 @@ async fn api_restore_backup(
 async fn api_providers(
     State(context): State<Arc<AppContext>>,
 ) -> Result<Json<ProvidersResponse>, ApiError> {
+    // Gather the runtime-database rows off-lock first, then read the in-memory
+    // state without holding it across any await.
     let connections = read_provider_connections().await?;
-    let state = read_state_or_new().await?;
-    let cooldowns = tokio::task::spawn_blocking(storage::list_provider_cooldowns)
-        .await
-        .context("Failed to join provider cooldown task")?
-        .map_err(ApiError::from)?;
-    let healths = tokio::task::spawn_blocking(storage::list_provider_healths)
-        .await
-        .context("Failed to join provider health task")?
-        .map_err(ApiError::from)?;
+    let cooldowns = runtime_db(storage::list_provider_cooldowns).await?;
+    let healths = runtime_db(storage::list_provider_healths).await?;
+    let state = context.library.read().await;
     Ok(Json(ProvidersResponse {
         spotify_redirect_uri: context.spotify_redirect_uri.clone(),
         providers: provider_connection_payloads(&state, &connections, &cooldowns, &healths),
@@ -1450,18 +1508,12 @@ async fn api_providers(
 }
 
 async fn api_provider_preflight(
+    State(context): State<Arc<AppContext>>,
     Path(provider): Path<ProviderKind>,
 ) -> Result<Json<ProviderPreflightDto>, ApiError> {
-    let state = read_state_or_new().await?;
     let connections = read_provider_connections().await?;
-    let cooldowns = tokio::task::spawn_blocking(storage::list_provider_cooldowns)
-        .await
-        .context("Failed to join provider cooldown task")?
-        .map_err(ApiError::from)?;
-    let healths = tokio::task::spawn_blocking(storage::list_provider_healths)
-        .await
-        .context("Failed to join provider health task")?
-        .map_err(ApiError::from)?;
+    let cooldowns = runtime_db(storage::list_provider_cooldowns).await?;
+    let healths = runtime_db(storage::list_provider_healths).await?;
     let connection = connections
         .iter()
         .find(|connection| connection.provider == provider);
@@ -1470,24 +1522,25 @@ async fn api_provider_preflight(
         .find(|cooldown| cooldown.provider == provider);
     let health = healths.iter().find(|health| health.provider == provider);
 
+    let state = context.library.read().await;
+    let identity_conflicts = identity_conflict_rows(&state, None).len();
     Ok(Json(provider_preflight_payload(
-        &state, provider, connection, cooldown, health,
+        &state,
+        provider,
+        connection,
+        cooldown,
+        health,
+        identity_conflicts,
     )))
 }
 
 async fn api_provider_push_plan(
+    State(context): State<Arc<AppContext>>,
     Path(provider): Path<ProviderKind>,
 ) -> Result<Json<ProviderPushPlanDto>, ApiError> {
-    let state = read_state_or_new().await?;
     let connections = read_provider_connections().await?;
-    let cooldowns = tokio::task::spawn_blocking(storage::list_provider_cooldowns)
-        .await
-        .context("Failed to join provider cooldown task")?
-        .map_err(ApiError::from)?;
-    let healths = tokio::task::spawn_blocking(storage::list_provider_healths)
-        .await
-        .context("Failed to join provider health task")?
-        .map_err(ApiError::from)?;
+    let cooldowns = runtime_db(storage::list_provider_cooldowns).await?;
+    let healths = runtime_db(storage::list_provider_healths).await?;
     let connection = connections
         .iter()
         .find(|connection| connection.provider == provider);
@@ -1496,6 +1549,7 @@ async fn api_provider_push_plan(
         .find(|cooldown| cooldown.provider == provider);
     let health = healths.iter().find(|health| health.provider == provider);
 
+    let state = context.library.read().await;
     Ok(Json(provider_push_plan_payload(
         &state, provider, connection, cooldown, health,
     )))
@@ -1528,7 +1582,8 @@ async fn api_start_provider_verify(
             finished_at: None,
             last_persisted_at: None,
         },
-    )?;
+    )
+    .await?;
 
     let background_context = context.clone();
     let background_operation_id = operation_id.clone();
@@ -1542,8 +1597,9 @@ async fn api_start_provider_verify(
                     save_provider_health(provider_health_ok(
                         provider,
                         "Connection check succeeded.",
-                    ))?;
-                    storage::clear_provider_cooldown(provider).map_err(ApiError::from)?;
+                    ))
+                    .await?;
+                    runtime_db(move || storage::clear_provider_cooldown(provider)).await?;
                     Ok::<MessageResponse, ApiError>(MessageResponse::new(format!(
                         "{} connection check succeeded.",
                         provider.display_name()
@@ -1551,13 +1607,13 @@ async fn api_start_provider_verify(
                 }
                 Err(error) => {
                     let message = sanitize_error_message(&error.to_string());
-                    save_provider_health(provider_health_failed(provider, message.clone()))?;
+                    save_provider_health(provider_health_failed(provider, message.clone())).await?;
                     Err(ApiError::bad_request(message).with_source(error))
                 }
             }
         }
         .await;
-        finish_operation(background_context, &background_operation_id, result);
+        finish_operation(background_context, &background_operation_id, result).await;
     });
 
     Ok(Json(OperationStartResponse { operation_id }))
@@ -1627,18 +1683,21 @@ async fn api_connect_youtube_music(
         .map_err(|error| ApiError::bad_request(sanitize_error_message(&error.to_string())))?;
 
     let now = Utc::now();
-    storage::save_provider_connection(&ProviderConnection {
-        provider: ProviderKind::YoutubeMusic,
-        connected_at: now,
-        updated_at: now,
-        config: ProviderConnectionConfig::YoutubeMusic(config),
+    runtime_db(move || {
+        storage::save_provider_connection(&ProviderConnection {
+            provider: ProviderKind::YoutubeMusic,
+            connected_at: now,
+            updated_at: now,
+            config: ProviderConnectionConfig::YoutubeMusic(config),
+        })?;
+        storage::clear_provider_cooldown(ProviderKind::YoutubeMusic)
     })
-    .map_err(ApiError::from)?;
-    storage::clear_provider_cooldown(ProviderKind::YoutubeMusic).map_err(ApiError::from)?;
+    .await?;
     save_provider_health(provider_health_ok(
         ProviderKind::YoutubeMusic,
         "Connection verified during YouTube Music link.",
-    ))?;
+    ))
+    .await?;
 
     Ok(Json(MessageResponse::new(
         "Linked YouTube Music. Test call succeeded.",
@@ -1648,7 +1707,7 @@ async fn api_connect_youtube_music(
 async fn api_disconnect_provider(
     Path(provider): Path<ProviderKind>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    storage::delete_provider_connection(provider).map_err(ApiError::from)?;
+    runtime_db(move || storage::delete_provider_connection(provider)).await?;
     Ok(Json(MessageResponse::new(format!(
         "Disconnected {} from the app.",
         provider.display_name()
@@ -1682,7 +1741,8 @@ async fn api_start_provider_export(
             finished_at: None,
             last_persisted_at: None,
         },
-    )?;
+    )
+    .await?;
 
     let background_context = context.clone();
     let background_operation_id = operation_id.clone();
@@ -1694,14 +1754,18 @@ async fn api_start_provider_export(
         let result = async {
             let provider_client =
                 build_connected_provider(provider, ProviderCapability::Read).await?;
-            let _state_guard = background_context.state_mutation.lock().await;
-            let mut state = read_state_or_new().await?;
+            // Provider network I/O runs with no library lock held; the snapshot
+            // is merged onto the current in-memory state afterwards.
             let snapshot = provider_client
                 .export_library_with_progress(Some(progress))
                 .await
                 .map_err(ApiError::from)?;
-            let summary = merge_provider_snapshot(&mut state, snapshot);
-            write_state(state).await?;
+            let summary = {
+                let mut guard = background_context.library.write().await;
+                let summary = merge_provider_snapshot(&mut guard, snapshot);
+                persist_library(&guard).await?;
+                summary
+            };
             Ok::<MessageResponse, ApiError>(MessageResponse::with_warnings(
                 format!(
                     "Merged {} saved tracks and {} playlists from {}.",
@@ -1713,7 +1777,7 @@ async fn api_start_provider_export(
             ))
         }
         .await;
-        finish_operation(background_context, &background_operation_id, result);
+        finish_operation(background_context, &background_operation_id, result).await;
     });
 
     Ok(Json(OperationStartResponse { operation_id }))
@@ -1724,14 +1788,18 @@ async fn api_provider_export(
     Path(provider): Path<ProviderKind>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let provider_client = build_connected_provider(provider, ProviderCapability::Read).await?;
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state_or_new().await?;
+    // Export network I/O runs off-lock; merge onto current state under the write
+    // lock (the merge is incremental, so concurrent user edits survive).
     let snapshot = provider_client
         .export_library()
         .await
         .map_err(ApiError::from)?;
-    let summary = merge_provider_snapshot(&mut state, snapshot);
-    write_state(state).await?;
+    let summary = {
+        let mut guard = context.library.write().await;
+        let summary = merge_provider_snapshot(&mut guard, snapshot);
+        persist_library(&guard).await?;
+        summary
+    };
 
     Ok(Json(MessageResponse::with_warnings(
         format!(
@@ -1771,7 +1839,8 @@ async fn api_start_provider_identity(
             finished_at: None,
             last_persisted_at: None,
         },
-    )?;
+    )
+    .await?;
 
     let background_context = context.clone();
     let background_operation_id = operation_id.clone();
@@ -1783,18 +1852,25 @@ async fn api_start_provider_identity(
         let result = async {
             let provider_client =
                 build_connected_provider(provider, ProviderCapability::Read).await?;
-            let _state_guard = background_context.state_mutation.lock().await;
-            let mut state = read_state().await?;
+            // Snapshot the state and its version under a brief read lock, then
+            // run the provider identity I/O on the clone with no lock held.
+            let (mut working, base_version) = {
+                let guard = background_context.library.read().await;
+                (guard.clone(), background_context.library_version())
+            };
             let summary = crate::identity::reconcile_provider_identities(
                 provider_client.as_ref(),
-                &mut state,
+                &mut working,
                 Some(progress),
             )
             .await
             .map_err(ApiError::from)?;
             let deferred =
                 summary.unprocessed_due_rate_limit + summary.unprocessed_due_safety_limit;
-            write_state(state).await?;
+            let concurrent_warning =
+                commit_identity_results(&background_context, working, base_version).await?;
+            let mut warnings = summary.warnings;
+            warnings.extend(concurrent_warning);
             Ok::<MessageResponse, ApiError>(MessageResponse::with_warnings(
                 format!(
                     "{} identity sync performed {} provider identity lookups, added {} links, merged {} duplicate track rows, skipped {} merge conflicts, flagged {} invalid metadata rows, removed {} duplicate saved rows, left {} unmatched, and deferred {} tracks for a later run.",
@@ -1808,14 +1884,49 @@ async fn api_start_provider_identity(
                     summary.unmatched,
                     deferred
                 ),
-                summary.warnings,
+                warnings,
             ))
         }
         .await;
-        finish_operation(background_context, &background_operation_id, result);
+        finish_operation(background_context, &background_operation_id, result).await;
     });
 
     Ok(Json(OperationStartResponse { operation_id }))
+}
+
+/// Commits the results of an identity run that mutated `working` (a clone taken
+/// while `base_version` was current) back into the canonical state.
+///
+/// Identity's mutations (track merges, duplicate removals, conflict tombstones,
+/// link additions) reshape the library across dimensions and cannot be cleanly
+/// re-applied item-by-item onto a concurrently edited state. So this uses an
+/// optimistic version check: if no user mutation happened while the provider I/O
+/// ran (`library_version` unchanged), the current state still equals the clone's
+/// base and committing the clone wholesale is exactly correct. If a user edit
+/// did land, clobbering it would lose data, so the network-derived identity
+/// results are discarded; only the cheap, safe, non-network duplicate-saved
+/// consolidation is re-run against the *current* state, and a warning tells the
+/// user to re-run identity. This never loses a user edit and never corrupts
+/// state, at the cost of an occasional identity re-run in the rare
+/// edited-during-sync case. Returns an extra warning to surface, if any.
+async fn commit_identity_results(
+    context: &Arc<AppContext>,
+    working: LibraryState,
+    base_version: u64,
+) -> Result<Option<String>, ApiError> {
+    let mut guard = context.library.write().await;
+    if context.library_version() == base_version {
+        *guard = working;
+        persist_library(&guard).await?;
+        Ok(None)
+    } else {
+        if guard.consolidate_duplicate_saved_tracks() > 0 {
+            persist_library(&guard).await?;
+        }
+        Ok(Some(
+            "Detected library edits made while identity sync was running, so the provider identity results were not applied to avoid overwriting your changes. Re-run identity sync.".to_string(),
+        ))
+    }
 }
 
 async fn api_start_library_identity(
@@ -1844,7 +1955,8 @@ async fn api_start_library_identity(
             finished_at: None,
             last_persisted_at: None,
         },
-    )?;
+    )
+    .await?;
 
     let background_context = context.clone();
     let background_operation_id = operation_id.clone();
@@ -1854,8 +1966,13 @@ async fn api_start_library_identity(
             background_operation_id.clone(),
         );
         let result = async {
-            let _state_guard = background_context.state_mutation.lock().await;
-            let mut state = read_state().await?;
+            // Snapshot state + version once, then run every provider's identity
+            // I/O against the clone with no lock held. Results are committed once
+            // at the end via the same version-checked path as a single provider.
+            let (mut working, base_version) = {
+                let guard = background_context.library.read().await;
+                (guard.clone(), background_context.library_version())
+            };
             let mut warnings = Vec::new();
             let mut providers_ran = 0_usize;
             let mut links_added = 0_usize;
@@ -1872,11 +1989,11 @@ async fn api_start_library_identity(
                     stage: format!("Preparing {} identity sync", provider.display_name()),
                     detail: Some("Checking connection, health, and cooldown state.".to_string()),
                     saved_tracks_done: 0,
-                    saved_tracks_total: Some(state.tracks.len()),
+                    saved_tracks_total: Some(working.tracks.len()),
                     ..Default::default()
                 });
 
-                if let Some(reason) = library_identity_skip_reason(provider)? {
+                if let Some(reason) = library_identity_skip_reason(provider).await? {
                     warnings.push(reason);
                     continue;
                 }
@@ -1886,7 +2003,8 @@ async fn api_start_library_identity(
                         Ok(provider_client) => provider_client,
                         Err(error) => {
                             let message = sanitize_error_message(&error.message);
-                            remember_identity_provider_failure(provider, error.source.as_ref())?;
+                            remember_identity_provider_failure(provider, error.source.as_ref())
+                                .await?;
                             warnings.push(format!(
                                 "Skipped {} identity sync: {}",
                                 provider.display_name(),
@@ -1900,13 +2018,13 @@ async fn api_start_library_identity(
                     stage: format!("Resolving {} identities", provider.display_name()),
                     detail: Some("Searching provider catalog for missing canonical IDs.".to_string()),
                     saved_tracks_done: 0,
-                    saved_tracks_total: Some(state.tracks.len()),
+                    saved_tracks_total: Some(working.tracks.len()),
                     ..Default::default()
                 });
 
                 let summary = match crate::identity::reconcile_provider_identities(
                     provider_client.as_ref(),
-                    &mut state,
+                    &mut working,
                     Some(progress.clone()),
                 )
                 .await
@@ -1914,8 +2032,7 @@ async fn api_start_library_identity(
                     Ok(summary) => summary,
                     Err(error) => {
                         let message = sanitize_error_message(&error.to_string());
-                        remember_identity_provider_failure(provider, Some(&error))?;
-                        write_state(state.clone()).await?;
+                        remember_identity_provider_failure(provider, Some(&error)).await?;
                         warnings.push(format!(
                             "{} identity sync stopped early: {}",
                             provider.display_name(),
@@ -1936,20 +2053,25 @@ async fn api_start_library_identity(
                 deferred +=
                     summary.unprocessed_due_rate_limit + summary.unprocessed_due_safety_limit;
                 warnings.extend(summary.warnings);
-                storage::clear_provider_cooldown(provider).map_err(ApiError::from)?;
+                runtime_db(move || storage::clear_provider_cooldown(provider)).await?;
                 save_provider_health(provider_health_ok(
                     provider,
                     format!("{} identity sync succeeded.", provider.display_name()),
-                ))?;
-                write_state(state.clone()).await?;
+                ))
+                .await?;
             }
 
+            let track_total = working.tracks.len();
             progress(ProviderProgress {
                 stage: "Library identity sync complete".to_string(),
-                saved_tracks_done: state.tracks.len(),
-                saved_tracks_total: Some(state.tracks.len()),
+                saved_tracks_done: track_total,
+                saved_tracks_total: Some(track_total),
                 ..Default::default()
             });
+
+            let concurrent_warning =
+                commit_identity_results(&background_context, working, base_version).await?;
+            warnings.extend(concurrent_warning);
 
             let message = if providers_ran == 0 {
                 "Library identity sync did not run against any provider.".to_string()
@@ -1964,7 +2086,7 @@ async fn api_start_library_identity(
             ))
         }
         .await;
-        finish_operation(background_context, &background_operation_id, result);
+        finish_operation(background_context, &background_operation_id, result).await;
     });
 
     Ok(Json(OperationStartResponse { operation_id }))
@@ -2026,7 +2148,8 @@ async fn start_provider_sync_operation(
             finished_at: None,
             last_persisted_at: None,
         },
-    )?;
+    )
+    .await?;
 
     let background_context = context.clone();
     let background_operation_id = operation_id.clone();
@@ -2045,7 +2168,6 @@ async fn start_provider_sync_operation(
                 },
             )
             .await?;
-            let _state_guard = background_context.state_mutation.lock().await;
             let purge_report = if reset_destination {
                 progress(ProviderProgress {
                     stage: "Resetting destination".to_string(),
@@ -2064,16 +2186,25 @@ async fn start_provider_sync_operation(
             } else {
                 None
             };
-            let mut state = read_state().await?;
+            // Snapshot the state (clearing this provider's playlist links for a
+            // reset), run the push against the clone with no lock held, then
+            // reconcile the provider-scoped results back into the current state.
+            let mut working = {
+                let guard = background_context.library.read().await;
+                guard.clone()
+            };
             if reset_destination {
-                state.clear_playlist_provider_state(provider);
+                working.clear_playlist_provider_state(provider);
             }
-            let summary = sync_provider_and_persist_with_progress(
-                provider_client.as_ref(),
-                &mut state,
-                Some(progress.clone()),
-            )
-            .await?;
+            let sync_result = provider_client
+                .sync_library_with_progress(&mut working, true, Some(progress.clone()))
+                .await;
+            {
+                let mut guard = background_context.library.write().await;
+                reapply_provider_sync(&mut guard, &working, provider);
+                persist_library(&guard).await?;
+            }
+            let summary = sync_result.map_err(ApiError::from)?;
             let reset_prefix = purge_report
                 .map(|report| {
                     format!(
@@ -2094,7 +2225,7 @@ async fn start_provider_sync_operation(
             ))
         }
         .await;
-        finish_operation(background_context, &background_operation_id, result);
+        finish_operation(background_context, &background_operation_id, result).await;
     });
 
     Ok(Json(OperationStartResponse { operation_id }))
@@ -2105,9 +2236,17 @@ async fn api_provider_sync(
     Path(provider): Path<ProviderKind>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     let provider_client = build_connected_provider(provider, ProviderCapability::Write).await?;
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
-    let summary = sync_provider_and_persist(provider_client.as_ref(), &mut state).await?;
+    let mut working = {
+        let guard = context.library.read().await;
+        guard.clone()
+    };
+    let sync_result = provider_client.sync_library(&mut working, true).await;
+    {
+        let mut guard = context.library.write().await;
+        reapply_provider_sync(&mut guard, &working, provider);
+        persist_library(&guard).await?;
+    }
+    let summary = sync_result.map_err(ApiError::from)?;
     Ok(Json(MessageResponse::with_warnings(
         format!(
             "Synced {} saved tracks and {} playlist entries into {}.",
@@ -2151,44 +2290,39 @@ async fn api_saved_tracks(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<SavedTracksQuery>,
 ) -> Result<Json<PageResponse<SavedTrackItemDto>>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let page = normalized_page(query.page);
-    let mut rows = saved_track_rows(&state, query.q.as_deref());
-    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    let track_ids = page_rows
-        .iter()
-        .map(|item| item.track_id.clone())
-        .collect::<Vec<_>>();
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-        rows = saved_track_rows(&state, query.q.as_deref());
-        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    }
-
-    Ok(Json(PageResponse::new(
-        page_rows,
-        rows.len(),
-        page,
-        PAGE_SIZE,
-    )))
+    let (page_rows, total, track_ids) = {
+        let state = context.library.read().await;
+        let rows = saved_track_rows(&state, query.q.as_deref());
+        let page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+        let track_ids = page_rows
+            .iter()
+            .map(|item| item.track_id.clone())
+            .collect::<Vec<_>>();
+        (page_rows, rows.len(), track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(PageResponse::new(page_rows, total, page, PAGE_SIZE)))
 }
 
 async fn api_delete_saved_track(
     State(context): State<Arc<AppContext>>,
     Path(saved_track_id): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let connections = read_provider_connections().await?;
-    let linked_track_ids = saved_track_provider_links(&state, &saved_track_id)?;
-    if !state.remove_saved_track(&saved_track_id) {
-        return Err(ApiError::not_found(format!(
-            "Unknown saved track '{saved_track_id}'."
-        )));
-    }
-    write_state(state).await?;
+    let linked_track_ids = {
+        let mut state = context.library.write().await;
+        let linked_track_ids = saved_track_provider_links(&state, &saved_track_id)?;
+        if !state.remove_saved_track(&saved_track_id) {
+            return Err(ApiError::not_found(format!(
+                "Unknown saved track '{saved_track_id}'."
+            )));
+        }
+        persist_library(&state).await?;
+        context.bump_library_version();
+        linked_track_ids
+    };
+    // Provider network propagation runs with no library lock held.
     let warnings = propagate_saved_track_delete(&connections, &linked_track_ids).await;
     Ok(Json(MessageResponse::with_warnings(
         "Removed saved track from the canonical library.",
@@ -2200,36 +2334,25 @@ async fn api_tracks(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<TracksQuery>,
 ) -> Result<Json<PageResponse<TrackListItemDto>>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let page = normalized_page(query.page);
-    let mut rows = track_rows(&state, query.q.as_deref(), query.coverage.as_deref());
-    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    let track_ids = page_rows
-        .iter()
-        .map(|item| item.track_id.clone())
-        .collect::<Vec<_>>();
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-        rows = track_rows(&state, query.q.as_deref(), query.coverage.as_deref());
-        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    }
-
-    Ok(Json(PageResponse::new(
-        page_rows,
-        rows.len(),
-        page,
-        PAGE_SIZE,
-    )))
+    let (page_rows, total, track_ids) = {
+        let state = context.library.read().await;
+        let rows = track_rows(&state, query.q.as_deref(), query.coverage.as_deref());
+        let page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+        let track_ids = page_rows
+            .iter()
+            .map(|item| item.track_id.clone())
+            .collect::<Vec<_>>();
+        (page_rows, rows.len(), track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(PageResponse::new(page_rows, total, page, PAGE_SIZE)))
 }
 
 async fn api_identity_conflicts(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<IdentityConflictsQuery>,
 ) -> Result<Json<PageResponse<TrackIdentityConflictQueueItemDto>>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let page = normalized_page(query.page);
     let filters = IdentityConflictFilters {
         query: query.q.as_deref(),
@@ -2237,76 +2360,54 @@ async fn api_identity_conflicts(
         recommendation: query.recommendation.as_deref(),
         impact: query.impact.as_deref(),
     };
-    let mut rows = identity_conflict_rows_filtered(&state, filters);
-    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    let track_ids = page_rows
-        .iter()
-        .flat_map(|item| {
-            [
-                item.source_track.track_id.clone(),
-                item.conflict.owner_track.track_id.clone(),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-        rows = identity_conflict_rows_filtered(&state, filters);
-        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    }
-
-    Ok(Json(PageResponse::new(
-        page_rows,
-        rows.len(),
-        page,
-        PAGE_SIZE,
-    )))
+    let (page_rows, total, track_ids) = {
+        let state = context.library.read().await;
+        let rows = identity_conflict_rows_filtered(&state, filters);
+        let page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+        let track_ids = page_rows
+            .iter()
+            .flat_map(|item| {
+                [
+                    item.source_track.track_id.clone(),
+                    item.conflict.owner_track.track_id.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        (page_rows, rows.len(), track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(PageResponse::new(page_rows, total, page, PAGE_SIZE)))
 }
 
 async fn api_identity_gaps(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<IdentityGapsQuery>,
 ) -> Result<Json<PageResponse<TrackIdentityGapQueueItemDto>>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let page = normalized_page(query.page);
-    let mut rows = identity_gap_rows(&state, query.provider, query.q.as_deref());
-    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    let track_ids = page_rows
-        .iter()
-        .map(|item| item.track.track_id.clone())
-        .collect::<Vec<_>>();
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-        rows = identity_gap_rows(&state, query.provider, query.q.as_deref());
-        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    }
-
-    Ok(Json(PageResponse::new(
-        page_rows,
-        rows.len(),
-        page,
-        PAGE_SIZE,
-    )))
+    let (page_rows, total, track_ids) = {
+        let state = context.library.read().await;
+        let rows = identity_gap_rows(&state, query.provider, query.q.as_deref());
+        let page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+        let track_ids = page_rows
+            .iter()
+            .map(|item| item.track.track_id.clone())
+            .collect::<Vec<_>>();
+        (page_rows, rows.len(), track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(PageResponse::new(page_rows, total, page, PAGE_SIZE)))
 }
 
 async fn api_track_detail(
     State(context): State<Arc<AppContext>>,
     Path(track_id): Path<String>,
 ) -> Result<Json<TrackDetailDto>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
-    if enrich_artwork_for_track_ids(
-        &context.http_client,
-        &mut state,
-        std::slice::from_ref(&track_id),
-    )
-    .await?
-    {
-        write_state(state.clone()).await?;
-    }
-    build_track_detail(&state, &track_id).map(Json)
+    let detail = {
+        let state = context.library.read().await;
+        build_track_detail(&state, &track_id)?
+    };
+    schedule_artwork_enrichment(&context, vec![track_id]);
+    Ok(Json(detail))
 }
 
 async fn api_update_track(
@@ -2314,8 +2415,6 @@ async fn api_update_track(
     Path(track_id): Path<String>,
     Json(request): Json<UpdateTrackRequest>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let metadata = TrackMetadata {
         title: request.title,
         artists: request
@@ -2328,10 +2427,12 @@ async fn api_update_track(
         duration_seconds: request.duration_seconds,
         isrc: normalize_optional_text(request.isrc),
     };
+    let mut state = context.library.write().await;
     state
         .update_track_metadata(&track_id, metadata)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
     Ok(Json(MessageResponse::new(
         "Updated canonical track metadata.",
     )))
@@ -2343,9 +2444,8 @@ async fn api_apply_track_identity(
     Json(request): Json<ApplyTrackIdentityRequest>,
 ) -> Result<Json<ApplyTrackIdentityResponse>, ApiError> {
     let provider_id = normalize_manual_provider_track_id(request.provider, &request.provider_id)?;
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let now = Utc::now();
+    let mut state = context.library.write().await;
     let result = state
         .apply_track_identity(
             &track_id,
@@ -2370,7 +2470,9 @@ async fn api_apply_track_identity(
             now,
         ),
     );
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
+    drop(state);
 
     let (result_key, message) = match &result {
         TrackIdentityApplyResult::Linked { .. } => (
@@ -2416,10 +2518,9 @@ async fn api_merge_track(
     Path(source_track_id): Path<String>,
     Json(request): Json<MergeTrackRequest>,
 ) -> Result<Json<MergeTrackResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let now = Utc::now();
     let resolution = track_merge_conflict_resolution(request.conflict_resolution);
+    let mut state = context.library.write().await;
     let result = state
         .merge_track_into_resolving_conflicts(
             &source_track_id,
@@ -2429,7 +2530,9 @@ async fn api_merge_track(
         )
         .map_err(|error| ApiError::bad_request(sanitize_error_message(&error.to_string())))?;
     state.validate().map_err(ApiError::from)?;
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
+    drop(state);
 
     let resolved_conflicts = resolved_provider_conflict_dtos(&result.resolved_conflicts);
     let conflict_count = resolved_conflicts.len();
@@ -2449,8 +2552,7 @@ async fn api_identity_conflicts_bulk_merge_plan(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<BulkMergeIdentityConflictsPlanQuery>,
 ) -> Result<Json<BulkMergeIdentityConflictsPlanDto>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let state = read_state().await?;
+    let state = context.library.read().await;
     let rows = bulk_merge_identity_conflict_rows(
         &state,
         query.q.as_deref(),
@@ -2472,8 +2574,7 @@ async fn api_identity_conflicts_bulk_merge(
     State(context): State<Arc<AppContext>>,
     Json(request): Json<BulkMergeIdentityConflictsRequest>,
 ) -> Result<Json<BulkMergeIdentityConflictsResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
+    let mut state = context.library.write().await;
     let candidates = bulk_merge_identity_conflict_rows(
         &state,
         request.q.as_deref(),
@@ -2498,13 +2599,20 @@ async fn api_identity_conflicts_bulk_merge(
     let mut warnings = bulk_merge_identity_conflict_warnings();
 
     for candidate in candidates.into_iter().take(max_merges) {
-        let Some(active_conflict) = active_bulk_merge_identity_conflict(
-            &state,
-            &candidate.source_track.track_id,
-            &candidate.conflict.owner_track.track_id,
-            &candidate.conflict.provider,
-            &candidate.conflict.provider_id,
-        ) else {
+        // Re-validate each candidate against the current (mutating) state, using
+        // freshly built indexes because every merge changes the track set.
+        let active_conflict = {
+            let indexes = ConflictIndexes::build(&state);
+            active_bulk_merge_identity_conflict(
+                &state,
+                &candidate.source_track.track_id,
+                &candidate.conflict.owner_track.track_id,
+                &candidate.conflict.provider,
+                &candidate.conflict.provider_id,
+                &indexes,
+            )
+        };
+        let Some(active_conflict) = active_conflict else {
             skipped_count += 1;
             continue;
         };
@@ -2543,7 +2651,9 @@ async fn api_identity_conflicts_bulk_merge(
     }
 
     state.validate().map_err(ApiError::from)?;
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
+    drop(state);
 
     Ok(Json(BulkMergeIdentityConflictsResponse {
         message: format!(
@@ -2631,13 +2741,14 @@ fn active_bulk_merge_identity_conflict(
     target_track_id: &str,
     provider_key: &str,
     provider_id: &str,
+    indexes: &ConflictIndexes<'_>,
 ) -> Option<TrackIdentityConflictQueueItemDto> {
     let source_track = state
         .tracks
         .iter()
         .find(|track| track.id == source_track_id)?;
-    let source_track_dto = conflict_track_dto(state, source_track);
-    identity_conflicts_for_track(state, source_track)
+    let source_track_dto = conflict_track_dto(source_track, indexes);
+    identity_conflicts_for_track(source_track, indexes)
         .into_iter()
         .find(|conflict| {
             conflict.provider == provider_key
@@ -2661,14 +2772,14 @@ async fn api_reject_track_identity_conflict(
         return Err(ApiError::bad_request("Provider ID cannot be empty."));
     }
 
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
+    let mut state = context.library.write().await;
+    let indexes = ConflictIndexes::build(&state);
     let track = state
         .tracks
         .iter()
         .find(|track| track.id == track_id)
         .ok_or_else(|| ApiError::not_found(format!("Unknown track '{track_id}'.")))?;
-    let conflict = identity_conflicts_for_track(&state, track)
+    let conflict = identity_conflicts_for_track(track, &indexes)
         .into_iter()
         .find(|conflict| {
             conflict.provider == request.provider.as_key()
@@ -2682,6 +2793,7 @@ async fn api_reject_track_identity_conflict(
         })?;
     let provider_name = conflict.provider_name.clone();
     let candidate_provider_id = conflict.provider_id.clone();
+    drop(indexes);
     let now = Utc::now();
     // Flip the typed conflict into a permanent rejected tombstone so the
     // candidate is never re-proposed by future identity syncs.
@@ -2695,7 +2807,9 @@ async fn api_reject_track_identity_conflict(
             "That identity conflict is no longer active for this track.".to_string(),
         ));
     }
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
+    drop(state);
 
     Ok(Json(MessageResponse::new(format!(
         "Marked {provider_name} candidate {candidate_provider_id} as not the same track. The source row remains unresolved for that provider."
@@ -2706,26 +2820,40 @@ async fn api_delete_track(
     State(context): State<Arc<AppContext>>,
     Path(track_id): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let connections = read_provider_connections().await?;
-    let linked_track_ids = track_provider_links(&state, &track_id)?;
-    let affected_playlist_ids = playlist_ids_for_track(&state, &track_id);
-    if !state.remove_track_everywhere(&track_id) {
-        return Err(ApiError::not_found(format!("Unknown track '{track_id}'.")));
-    }
-    write_state(state.clone()).await?;
+    let (mut working, linked_track_ids, affected_playlist_ids) = {
+        let mut state = context.library.write().await;
+        let linked_track_ids = track_provider_links(&state, &track_id)?;
+        let affected_playlist_ids = playlist_ids_for_track(&state, &track_id);
+        if !state.remove_track_everywhere(&track_id) {
+            return Err(ApiError::not_found(format!("Unknown track '{track_id}'.")));
+        }
+        persist_library(&state).await?;
+        context.bump_library_version();
+        (state.clone(), linked_track_ids, affected_playlist_ids)
+    };
 
+    // Provider propagation runs off-lock against the detached clone.
     let mut warnings = propagate_saved_track_delete(&connections, &linked_track_ids).await;
     warnings.extend(
         propagate_playlist_subset_to_connected_providers(
             &connections,
-            &mut state,
+            &mut working,
             &affected_playlist_ids,
         )
         .await,
     );
-    write_state(state).await?;
+
+    // Reconcile the affected playlists' provider bookkeeping back into the
+    // current state (scoped to those playlists, so concurrent edits elsewhere
+    // survive), then persist.
+    if !affected_playlist_ids.is_empty() {
+        let synced = playlist_subset_state(&working, &affected_playlist_ids);
+        let mut state = context.library.write().await;
+        merge_subset_state(&mut state, &synced);
+        persist_library(&state).await?;
+        context.bump_library_version();
+    }
 
     Ok(Json(MessageResponse::with_warnings(
         "Removed track from saved tracks and playlists.",
@@ -2737,55 +2865,45 @@ async fn api_playlists(
     State(context): State<Arc<AppContext>>,
     Query(query): Query<PlaylistsQuery>,
 ) -> Result<Json<PageResponse<PlaylistSummaryDto>>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let page = normalized_page(query.page);
-    let mut rows = playlist_summaries(&state, query.q.as_deref());
-    let mut page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    let playlist_ids = page_rows
-        .iter()
-        .map(|item| item.playlist_id.clone())
-        .collect::<Vec<_>>();
-    let track_ids = playlist_artwork_track_ids(&state, &playlist_ids);
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-        rows = playlist_summaries(&state, query.q.as_deref());
-        page_rows = paginate_vec(&rows, page, PAGE_SIZE);
-    }
-
-    Ok(Json(PageResponse::new(
-        page_rows,
-        rows.len(),
-        page,
-        PAGE_SIZE,
-    )))
+    let (page_rows, total, track_ids) = {
+        let state = context.library.read().await;
+        let rows = playlist_summaries(&state, query.q.as_deref());
+        let page_rows = paginate_vec(&rows, page, PAGE_SIZE);
+        let playlist_ids = page_rows
+            .iter()
+            .map(|item| item.playlist_id.clone())
+            .collect::<Vec<_>>();
+        let track_ids = playlist_artwork_track_ids(&state, &playlist_ids);
+        (page_rows, rows.len(), track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(PageResponse::new(page_rows, total, page, PAGE_SIZE)))
 }
 
 async fn api_playlist_detail(
     State(context): State<Arc<AppContext>>,
     Path(playlist_id): Path<String>,
 ) -> Result<Json<PlaylistDetailDto>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
-    let track_ids = state
-        .playlists
-        .iter()
-        .find(|playlist| playlist.id == playlist_id)
-        .map(|playlist| {
-            playlist
-                .entries
-                .iter()
-                .map(|entry| entry.track_id.clone())
-                .collect::<Vec<_>>()
-        })
-        .ok_or_else(|| ApiError::not_found(format!("Unknown playlist '{playlist_id}'.")))?;
-
-    if enrich_artwork_for_track_ids(&context.http_client, &mut state, &track_ids).await? {
-        write_state(state.clone()).await?;
-    }
-
-    build_playlist_detail(&state, &playlist_id).map(Json)
+    let (detail, track_ids) = {
+        let state = context.library.read().await;
+        let track_ids = state
+            .playlists
+            .iter()
+            .find(|playlist| playlist.id == playlist_id)
+            .map(|playlist| {
+                playlist
+                    .entries
+                    .iter()
+                    .map(|entry| entry.track_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .ok_or_else(|| ApiError::not_found(format!("Unknown playlist '{playlist_id}'.")))?;
+        let detail = build_playlist_detail(&state, &playlist_id)?;
+        (detail, track_ids)
+    };
+    schedule_artwork_enrichment(&context, track_ids);
+    Ok(Json(detail))
 }
 
 async fn api_update_playlist(
@@ -2793,8 +2911,7 @@ async fn api_update_playlist(
     Path(playlist_id): Path<String>,
     Json(request): Json<UpdatePlaylistRequest>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
+    let mut state = context.library.write().await;
     state
         .update_playlist_details(
             &playlist_id,
@@ -2802,7 +2919,8 @@ async fn api_update_playlist(
             normalize_optional_text(request.description),
         )
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    write_state(state).await?;
+    persist_library(&state).await?;
+    context.bump_library_version();
     Ok(Json(MessageResponse::new(
         "Updated canonical playlist details.",
     )))
@@ -2812,16 +2930,19 @@ async fn api_delete_playlist(
     State(context): State<Arc<AppContext>>,
     Path(playlist_id): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let connections = read_provider_connections().await?;
-    let linked_playlist_ids = playlist_provider_links(&state, &playlist_id)?;
-    if !state.remove_playlist(&playlist_id) {
-        return Err(ApiError::not_found(format!(
-            "Unknown playlist '{playlist_id}'."
-        )));
-    }
-    write_state(state).await?;
+    let linked_playlist_ids = {
+        let mut state = context.library.write().await;
+        let linked_playlist_ids = playlist_provider_links(&state, &playlist_id)?;
+        if !state.remove_playlist(&playlist_id) {
+            return Err(ApiError::not_found(format!(
+                "Unknown playlist '{playlist_id}'."
+            )));
+        }
+        persist_library(&state).await?;
+        context.bump_library_version();
+        linked_playlist_ids
+    };
     let warnings = propagate_playlist_delete(&connections, &linked_playlist_ids).await;
     Ok(Json(MessageResponse::with_warnings(
         "Deleted playlist from the canonical library.",
@@ -2833,22 +2954,32 @@ async fn api_delete_playlist_entry(
     State(context): State<Arc<AppContext>>,
     Path((playlist_id, entry_id)): Path<(String, String)>,
 ) -> Result<Json<MessageResponse>, ApiError> {
-    let _state_guard = context.state_mutation.lock().await;
-    let mut state = read_state().await?;
     let connections = read_provider_connections().await?;
-    if !state.remove_playlist_entry(&playlist_id, &entry_id) {
-        return Err(ApiError::not_found(format!(
-            "Unknown playlist entry '{entry_id}' for playlist '{playlist_id}'."
-        )));
-    }
-    write_state(state.clone()).await?;
+    let mut working = {
+        let mut state = context.library.write().await;
+        if !state.remove_playlist_entry(&playlist_id, &entry_id) {
+            return Err(ApiError::not_found(format!(
+                "Unknown playlist entry '{entry_id}' for playlist '{playlist_id}'."
+            )));
+        }
+        persist_library(&state).await?;
+        context.bump_library_version();
+        state.clone()
+    };
     let warnings = propagate_playlist_subset_to_connected_providers(
         &connections,
-        &mut state,
+        &mut working,
         std::slice::from_ref(&playlist_id),
     )
     .await;
-    write_state(state).await?;
+    // Reconcile the affected playlist's provider bookkeeping back into current.
+    let synced = playlist_subset_state(&working, std::slice::from_ref(&playlist_id));
+    {
+        let mut state = context.library.write().await;
+        merge_subset_state(&mut state, &synced);
+        persist_library(&state).await?;
+        context.bump_library_version();
+    }
     Ok(Json(MessageResponse::with_warnings(
         "Removed playlist entry from the canonical library.",
         warnings,
@@ -3136,25 +3267,32 @@ fn merge_subset_state(state: &mut LibraryState, subset: &LibraryState) {
     state.touch();
 }
 
-async fn read_state() -> Result<LibraryState, ApiError> {
-    tokio::task::spawn_blocking(storage::read_library_state)
-        .await
-        .context("Failed to join database read task")?
-        .map_err(ApiError::from)
-}
-
-async fn read_state_or_new() -> Result<LibraryState, ApiError> {
-    tokio::task::spawn_blocking(storage::read_library_state_or_new)
-        .await
-        .context("Failed to join database read task")?
-        .map_err(ApiError::from)
-}
-
-async fn write_state(state: LibraryState) -> Result<(), ApiError> {
-    tokio::task::spawn_blocking(move || storage::write_library_state(&state))
+/// Write-through persist of the in-memory canonical state. Callers hold the
+/// library write lock, mutate `*guard`, then call this before dropping the lock
+/// so persistence stays ordered with the in-memory copy. The change-guarded
+/// [`storage::write_library_state`] skips redundant writes/backups, and the
+/// blocking SQLite work runs on a blocking thread. This clones the state to move
+/// it into the blocking task; the clone cost is paid only on actual mutations.
+async fn persist_library(state: &LibraryState) -> Result<(), ApiError> {
+    let snapshot = state.clone();
+    tokio::task::spawn_blocking(move || storage::write_library_state(&snapshot))
         .await
         .context("Failed to join database write task")?
         .map(|_| ())
+        .map_err(ApiError::from)
+}
+
+/// Runs a blocking runtime-database (`runtime.db`) call on a blocking thread so
+/// the async worker is never parked on SQLite. Used for the small provider
+/// health/cooldown/connection lookups that previously ran inline.
+async fn runtime_db<T, F>(operation: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .context("Failed to join runtime database task")?
         .map_err(ApiError::from)
 }
 
@@ -3185,8 +3323,8 @@ async fn build_connected_provider(
     provider: ProviderKind,
     capability: ProviderCapability,
 ) -> Result<Box<dyn StreamingProvider>, ApiError> {
-    ensure_provider_not_cooling_down(provider)?;
-    ensure_provider_health_allows_operation(provider)?;
+    ensure_provider_not_cooling_down(provider).await?;
+    ensure_provider_health_allows_operation(provider).await?;
     build_connected_provider_allowing_failed_health(provider, capability).await
 }
 
@@ -3194,61 +3332,118 @@ async fn build_connected_provider_allowing_failed_health(
     provider: ProviderKind,
     capability: ProviderCapability,
 ) -> Result<Box<dyn StreamingProvider>, ApiError> {
-    ensure_provider_not_cooling_down(provider)?;
-    let connection =
-        tokio::task::spawn_blocking(move || storage::read_provider_connection(provider))
-            .await
-            .context("Failed to join provider connection read task")?
-            .map_err(ApiError::from)?
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "{} is not connected in the app yet.",
-                    provider.display_name()
-                ))
-            })?;
+    ensure_provider_not_cooling_down(provider).await?;
+    let connection = runtime_db(move || storage::read_provider_connection(provider))
+        .await?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "{} is not connected in the app yet.",
+                provider.display_name()
+            ))
+        })?;
 
     build_provider_from_connection(&connection, capability).await
 }
 
-async fn sync_provider_and_persist(
-    provider: &dyn StreamingProvider,
-    state: &mut LibraryState,
-) -> Result<crate::domain::SyncSummary, ApiError> {
-    sync_provider_and_persist_with_progress(provider, state, None).await
+/// Re-applies the provider-scoped results of a push/sync — which ran against a
+/// detached clone (`result`) during off-lock network I/O — onto the current
+/// canonical state, item by item and only for `provider`'s key. Sync's only
+/// state mutations are provider-link and per-provider status upserts keyed by
+/// stable IDs, so copying just those fields for items that still exist keeps
+/// concurrent user edits to other dimensions (metadata, membership, artwork, the
+/// other provider) intact. Items the user deleted meanwhile are absent from the
+/// current state and skipped. Each provider-scoped field is set to the clone's
+/// value or removed when the clone no longer carries it, so a reset-push (which
+/// clears this provider's playlist dimension before re-pushing) is reflected
+/// exactly.
+fn reapply_provider_sync(
+    current: &mut LibraryState,
+    result: &LibraryState,
+    provider: ProviderKind,
+) {
+    let key = provider.as_key();
+
+    let result_tracks: HashMap<&str, &TrackEntity> = result
+        .tracks
+        .iter()
+        .map(|track| (track.id.as_str(), track))
+        .collect();
+    for track in &mut current.tracks {
+        let Some(source) = result_tracks.get(track.id.as_str()) else {
+            continue;
+        };
+        reapply_map_entry(&mut track.provider_links, &source.provider_links, key);
+        reapply_map_entry(&mut track.provider_state, &source.provider_state, key);
+    }
+
+    let result_saved: HashMap<&str, &SavedTrackEntry> = result
+        .saved_tracks
+        .iter()
+        .map(|saved| (saved.id.as_str(), saved))
+        .collect();
+    for saved in &mut current.saved_tracks {
+        let Some(source) = result_saved.get(saved.id.as_str()) else {
+            continue;
+        };
+        reapply_map_entry(&mut saved.provider_state, &source.provider_state, key);
+    }
+
+    let result_playlists: HashMap<&str, &PlaylistEntity> = result
+        .playlists
+        .iter()
+        .map(|playlist| (playlist.id.as_str(), playlist))
+        .collect();
+    for playlist in &mut current.playlists {
+        let Some(source) = result_playlists.get(playlist.id.as_str()) else {
+            continue;
+        };
+        reapply_map_entry(&mut playlist.provider_links, &source.provider_links, key);
+        reapply_map_entry(&mut playlist.provider_state, &source.provider_state, key);
+        let source_entries: HashMap<&str, &PlaylistEntry> = source
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry))
+            .collect();
+        for entry in &mut playlist.entries {
+            let Some(source_entry) = source_entries.get(entry.id.as_str()) else {
+                continue;
+            };
+            reapply_map_entry(&mut entry.provider_state, &source_entry.provider_state, key);
+        }
+    }
+
+    current.touch();
 }
 
-async fn sync_provider_and_persist_with_progress(
-    provider: &dyn StreamingProvider,
-    state: &mut LibraryState,
-    progress: Option<ProgressHandler>,
-) -> Result<crate::domain::SyncSummary, ApiError> {
-    match provider
-        .sync_library_with_progress(state, true, progress)
-        .await
-    {
-        Ok(summary) => {
-            write_state(state.clone()).await?;
-            Ok(summary)
+/// Copies a single provider key's value from `source` into `target`, removing it
+/// from `target` when `source` no longer carries that key.
+fn reapply_map_entry<V: Clone>(
+    target: &mut BTreeMap<String, V>,
+    source: &BTreeMap<String, V>,
+    key: &str,
+) {
+    match source.get(key) {
+        Some(value) => {
+            target.insert(key.to_string(), value.clone());
         }
-        Err(error) => {
-            write_state(state.clone()).await?;
-            Err(ApiError::from(error))
+        None => {
+            target.remove(key);
         }
     }
 }
 
-fn insert_operation(
+async fn insert_operation(
     context: &Arc<AppContext>,
     mut operation: OperationRecord,
 ) -> Result<(), ApiError> {
     if !matches!(operation.kind, OperationKind::IdentityAll) {
-        ensure_provider_not_cooling_down(operation.provider)?;
+        ensure_provider_not_cooling_down(operation.provider).await?;
     }
     if !matches!(
         operation.kind,
         OperationKind::Verify | OperationKind::IdentityAll
     ) {
-        ensure_provider_health_allows_operation(operation.provider)?;
+        ensure_provider_health_allows_operation(operation.provider).await?;
     }
     let persisted = {
         let mut operations = context
@@ -3267,18 +3462,23 @@ fn insert_operation(
         operations.insert(operation.id.clone(), operation.clone());
         operation
     };
-    persist_operation(&persisted)
+    runtime_db(move || persist_operation_blocking(&persisted)).await
 }
 
-fn persist_operation(operation: &OperationRecord) -> Result<(), ApiError> {
-    let payload_json =
-        serde_json::to_string(operation).map_err(|error| ApiError::internal(error.to_string()))?;
+/// Serializes and persists an operation record to `runtime.db`. Runs on a
+/// blocking thread via [`runtime_db`] or [`tokio::task::spawn_blocking`]; never
+/// call it directly from an async context.
+fn persist_operation_blocking(operation: &OperationRecord) -> Result<()> {
+    let payload_json = serde_json::to_string(operation)?;
     storage::save_ui_operation_json(
         &operation.id,
         operation_status_key(operation.status),
         &payload_json,
     )
-    .map_err(ApiError::from)
+}
+
+fn persist_operation(operation: &OperationRecord) -> Result<(), ApiError> {
+    persist_operation_blocking(operation).map_err(ApiError::from)
 }
 
 fn load_recovered_operations() -> Result<HashMap<String, OperationRecord>> {
@@ -3342,14 +3542,18 @@ fn progress_handler_for_operation(
             None
         };
         if let Some(operation) = persist {
-            if let Err(error) = persist_operation(&operation) {
-                eprintln!("Failed to persist operation progress: {}", error.message);
-            }
+            // Persist on a blocking thread so the provider's network loop (which
+            // invokes this synchronous callback) is never parked on SQLite.
+            tokio::task::spawn_blocking(move || {
+                if let Err(error) = persist_operation_blocking(&operation) {
+                    eprintln!("Failed to persist operation progress: {error}");
+                }
+            });
         }
     })
 }
 
-fn finish_operation(
+async fn finish_operation(
     context: Arc<AppContext>,
     operation_id: &str,
     result: Result<MessageResponse, ApiError>,
@@ -3413,26 +3617,31 @@ fn finish_operation(
     } else {
         None
     };
-    if let Some(provider) = cooldown_to_clear {
-        if let Err(error) = storage::clear_provider_cooldown(provider) {
-            eprintln!("Failed to clear provider cooldown: {error}");
+    // The remaining work is all blocking runtime-database I/O; run it on a
+    // blocking thread so this finaliser never parks the async worker on SQLite.
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(provider) = cooldown_to_clear {
+            if let Err(error) = storage::clear_provider_cooldown(provider) {
+                eprintln!("Failed to clear provider cooldown: {error}");
+            }
         }
-    }
-    if let Some(cooldown) = cooldown_to_save {
-        if let Err(error) = storage::save_provider_cooldown(&cooldown) {
-            eprintln!("Failed to persist provider cooldown: {error}");
+        if let Some(cooldown) = cooldown_to_save {
+            if let Err(error) = storage::save_provider_cooldown(&cooldown) {
+                eprintln!("Failed to persist provider cooldown: {error}");
+            }
         }
-    }
-    if let Some(health) = health_to_save {
-        if let Err(error) = storage::save_provider_health(&health) {
-            eprintln!("Failed to persist provider health: {error}");
+        if let Some(health) = health_to_save {
+            if let Err(error) = storage::save_provider_health(&health) {
+                eprintln!("Failed to persist provider health: {error}");
+            }
         }
-    }
-    if let Some(operation) = persisted {
-        if let Err(error) = persist_operation(&operation) {
-            eprintln!("Failed to persist finished operation: {}", error.message);
+        if let Some(operation) = persisted {
+            if let Err(error) = persist_operation_blocking(&operation) {
+                eprintln!("Failed to persist finished operation: {error}");
+            }
         }
-    }
+    })
+    .await;
 }
 
 fn operation_response(operation: &OperationRecord) -> OperationResponse {
@@ -3473,6 +3682,10 @@ fn provider_connection_payloads(
     cooldowns: &[ProviderCooldown],
     healths: &[ProviderHealth],
 ) -> Vec<ProviderConnectionDto> {
+    // The open-conflict count is provider-independent, so compute the whole
+    // conflict set once and reuse it for every provider's preflight instead of
+    // rescanning per provider on each `/api/providers` poll.
+    let identity_conflicts = identity_conflict_rows(state, None).len();
     ProviderKind::all()
         .iter()
         .copied()
@@ -3496,7 +3709,12 @@ fn provider_connection_payloads(
                 cooldown_until: cooldown.map(|cooldown| cooldown.blocked_until.to_rfc3339()),
                 cooldown_reason: cooldown.map(|cooldown| cooldown.reason.clone()),
                 preflight: provider_preflight_payload(
-                    state, provider, connection, cooldown, health,
+                    state,
+                    provider,
+                    connection,
+                    cooldown,
+                    health,
+                    identity_conflicts,
                 ),
             }
         })
@@ -3519,6 +3737,7 @@ fn provider_preflight_payload(
     connection: Option<&ProviderConnection>,
     cooldown: Option<&ProviderCooldown>,
     health: Option<&ProviderHealth>,
+    identity_conflicts: usize,
 ) -> ProviderPreflightDto {
     let provider_key = provider.as_key();
     let track_index = build_track_index(state);
@@ -3602,7 +3821,6 @@ fn provider_preflight_payload(
         );
     }
 
-    let identity_conflicts = identity_conflict_rows(state, None).len();
     let mut reset_blockers = Vec::new();
     if provider.supports_library_reset() {
         if saved_tracks_missing_identity > 0 || playlist_entries_missing_identity > 0 {
@@ -3659,10 +3877,18 @@ fn provider_push_plan_payload(
     cooldown: Option<&ProviderCooldown>,
     health: Option<&ProviderHealth>,
 ) -> ProviderPushPlanDto {
+    let identity_conflicts = identity_conflict_rows(state, None).len();
     ProviderPushPlanDto {
         provider: provider.as_key().to_string(),
         provider_name: provider.display_name().to_string(),
-        preflight: provider_preflight_payload(state, provider, connection, cooldown, health),
+        preflight: provider_preflight_payload(
+            state,
+            provider,
+            connection,
+            cooldown,
+            health,
+            identity_conflicts,
+        ),
         saved_tracks: push_saved_track_plan_section(state, provider),
         playlist_entries: push_playlist_entry_plan_section(state, provider),
         playlists: push_playlist_plan_section(state, provider),
@@ -3674,6 +3900,7 @@ fn push_saved_track_plan_section(
     provider: ProviderKind,
 ) -> PushPlanSectionDto {
     let track_index = build_track_index(state);
+    let indexes = ConflictIndexes::build(state);
     let skipped_examples = state
         .saved_tracks
         .iter()
@@ -3682,7 +3909,7 @@ fn push_saved_track_plan_section(
             if track.provider_links.contains_key(provider.as_key()) {
                 return None;
             }
-            Some(conflict_track_dto(state, track))
+            Some(conflict_track_dto(track, &indexes))
         })
         .take(10)
         .collect::<Vec<_>>();
@@ -3705,6 +3932,7 @@ fn push_playlist_entry_plan_section(
     provider: ProviderKind,
 ) -> PushPlanSectionDto {
     let track_index = build_track_index(state);
+    let indexes = ConflictIndexes::build(state);
     let total = state.playlist_entry_count();
     let mut pushable = 0;
     let mut skipped_examples = Vec::new();
@@ -3720,7 +3948,7 @@ fn push_playlist_entry_plan_section(
         if track.provider_links.contains_key(provider.as_key()) {
             pushable += 1;
         } else if skipped_examples.len() < 10 {
-            skipped_examples.push(conflict_track_dto(state, track));
+            skipped_examples.push(conflict_track_dto(track, &indexes));
         }
     }
 
@@ -3987,12 +4215,27 @@ fn saved_track_rows(state: &LibraryState, query: Option<&str>) -> Vec<SavedTrack
     }
 
     rows.sort_by(|left, right| {
-        right
-            .added_at
-            .cmp(&left.added_at)
+        // Order newest-added first, parsing the stored timestamps to real
+        // datetimes so mixed formats (RFC3339, date-only) sort chronologically
+        // rather than lexically. Rows without a parseable date sort last.
+        compare_added_at_desc(left.added_at.as_deref(), right.added_at.as_deref())
             .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
     });
     rows
+}
+
+/// Compares two optional `added_at` strings for a newest-first ordering, parsing
+/// them to `DateTime` so ordering is chronological. Unparseable/missing values
+/// sort after any real date.
+fn compare_added_at_desc(left: Option<&str>, right: Option<&str>) -> Ordering {
+    let left = left.and_then(crate::domain::mutate::parse_added_at);
+    let right = right.and_then(crate::domain::mutate::parse_added_at);
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
 }
 
 fn track_rows(
@@ -4090,11 +4333,15 @@ fn identity_conflict_rows_filtered(
     let query_filter = normalized_query(filters.query);
     let recommendation_filter = normalized_filter_token(filters.recommendation);
     let impact_filter = normalized_filter_token(filters.impact);
+    // Build the per-request lookup maps once so the conflict scan below runs in
+    // roughly linear time instead of doing linear owner lookups and count scans
+    // per conflict.
+    let indexes = ConflictIndexes::build(state);
     let mut rows = Vec::new();
 
     for track in &state.tracks {
-        let source_track = conflict_track_dto(state, track);
-        for conflict in identity_conflicts_for_track(state, track) {
+        let source_track = conflict_track_dto(track, &indexes);
+        for conflict in identity_conflicts_for_track(track, &indexes) {
             if filters
                 .provider
                 .map(|provider| conflict.provider != provider.as_key())
@@ -4255,10 +4502,11 @@ fn identity_gap_rows(
     let providers = provider_filter
         .map(|provider| vec![provider])
         .unwrap_or_else(|| ProviderKind::all().to_vec());
+    let indexes = ConflictIndexes::build(state);
     let mut rows = Vec::new();
 
     for track in &state.tracks {
-        let track_dto = conflict_track_dto(state, track);
+        let track_dto = conflict_track_dto(track, &indexes);
         for provider in &providers {
             if track.provider_links.contains_key(provider.as_key()) {
                 continue;
@@ -4308,23 +4556,58 @@ fn identity_gap_rows(
     rows
 }
 
+/// Per-request lookup maps shared across the identity-conflict/gap builders.
+///
+/// The conflict path is called once per row and previously did a linear owner
+/// lookup and two linear count scans *per conflict*, making a page of conflicts
+/// roughly O(n²). Building these once and threading them through keeps the whole
+/// path linear:
+/// * `saved_counts` / `playlist_ref_counts` — how many saved rows / playlist
+///   entries reference each canonical track (used for the DTO impact figures).
+/// * `owner_by_provider_id` — the track that currently owns a given
+///   `(provider_key, provider_id)`, replacing the per-conflict linear search for
+///   the conflict's owner. Provider IDs are unique across tracks (enforced by
+///   [`LibraryState::validate`]), so each key maps to exactly one track.
+struct ConflictIndexes<'a> {
+    saved_counts: BTreeMap<String, usize>,
+    playlist_ref_counts: BTreeMap<String, usize>,
+    owner_by_provider_id: HashMap<(&'a str, &'a str), &'a TrackEntity>,
+}
+
+impl<'a> ConflictIndexes<'a> {
+    fn build(state: &'a LibraryState) -> Self {
+        let mut owner_by_provider_id = HashMap::new();
+        for track in &state.tracks {
+            for (provider_key, link) in &track.provider_links {
+                owner_by_provider_id
+                    .insert((provider_key.as_str(), link.provider_id.as_str()), track);
+            }
+        }
+        Self {
+            saved_counts: build_saved_track_counts(state),
+            playlist_ref_counts: build_playlist_reference_counts(state),
+            owner_by_provider_id,
+        }
+    }
+
+    fn saved_count(&self, track_id: &str) -> usize {
+        self.saved_counts.get(track_id).copied().unwrap_or(0)
+    }
+
+    fn playlist_ref_count(&self, track_id: &str) -> usize {
+        self.playlist_ref_counts.get(track_id).copied().unwrap_or(0)
+    }
+}
+
 fn build_track_detail(state: &LibraryState, track_id: &str) -> Result<TrackDetailDto, ApiError> {
     let track = state
         .tracks
         .iter()
         .find(|track| track.id == track_id)
         .ok_or_else(|| ApiError::not_found(format!("Unknown track '{track_id}'.")))?;
-    let saved_count = state
-        .saved_tracks
-        .iter()
-        .filter(|saved_track| saved_track.track_id == track.id)
-        .count();
-    let playlist_refs = state
-        .playlists
-        .iter()
-        .flat_map(|playlist| playlist.entries.iter())
-        .filter(|entry| entry.track_id == track.id)
-        .count();
+    let indexes = ConflictIndexes::build(state);
+    let saved_count = indexes.saved_count(&track.id);
+    let playlist_refs = indexes.playlist_ref_count(&track.id);
 
     Ok(TrackDetailDto {
         track_id: track.id.clone(),
@@ -4338,7 +4621,7 @@ fn build_track_detail(state: &LibraryState, track_id: &str) -> Result<TrackDetai
         coverage: coverage_dto(track),
         providers: provider_badges(&track.provider_links),
         provider_status: provider_status_details(&track.provider_state),
-        identity_conflicts: identity_conflicts_for_track(state, track),
+        identity_conflicts: identity_conflicts_for_track(track, &indexes),
         saved_count,
         playlist_refs,
         artwork_url: preferred_artwork_url(track),
@@ -4346,12 +4629,12 @@ fn build_track_detail(state: &LibraryState, track_id: &str) -> Result<TrackDetai
 }
 
 fn identity_conflicts_for_track(
-    state: &LibraryState,
     track: &TrackEntity,
+    indexes: &ConflictIndexes<'_>,
 ) -> Vec<TrackIdentityConflictDto> {
     track
         .open_identity_conflicts()
-        .filter_map(|conflict| build_identity_conflict_dto(state, track, conflict))
+        .filter_map(|conflict| build_identity_conflict_dto(track, conflict, indexes))
         .collect()
 }
 
@@ -4359,20 +4642,20 @@ fn identity_conflicts_for_track(
 /// that currently holds the disputed provider ID. Returns `None` when no track
 /// owns that ID any more (the conflict is stale and no longer actionable).
 fn build_identity_conflict_dto(
-    state: &LibraryState,
     track: &TrackEntity,
     conflict: &TrackIdentityConflict,
+    indexes: &ConflictIndexes<'_>,
 ) -> Option<TrackIdentityConflictDto> {
     let provider = conflict.provider;
     let provider_id = conflict.candidate_provider_id.clone();
-    let owner = state.tracks.iter().find(|candidate| {
-        candidate.id != track.id
-            && candidate
-                .provider_links
-                .get(provider.as_key())
-                .map(|link| link.provider_id == provider_id)
-                .unwrap_or(false)
-    })?;
+    // The disputed provider ID belongs to exactly one track (provider IDs are
+    // unique); a conflict against the track's own ID is impossible for an open
+    // conflict, so skip it defensively if the index points back at `track`.
+    let owner = indexes
+        .owner_by_provider_id
+        .get(&(provider.as_key(), provider_id.as_str()))
+        .copied()
+        .filter(|owner| owner.id != track.id)?;
 
     let message = format!(
         "{} identity '{}' is already linked to {}. Review before merging or reject the candidate.",
@@ -4385,14 +4668,14 @@ fn build_identity_conflict_dto(
         provider: provider.as_key().to_string(),
         provider_name: provider.display_name().to_string(),
         provider_id,
-        owner_track: conflict_track_dto(state, owner),
+        owner_track: conflict_track_dto(owner, indexes),
         conflicting_provider_links: provider_link_conflicts(track, owner),
-        evidence: identity_conflict_evidence(state, track, owner, conflict.confidence),
+        evidence: identity_conflict_evidence(track, owner, conflict.confidence, indexes),
         message,
     })
 }
 
-fn conflict_track_dto(state: &LibraryState, track: &TrackEntity) -> ConflictTrackDto {
+fn conflict_track_dto(track: &TrackEntity, indexes: &ConflictIndexes<'_>) -> ConflictTrackDto {
     ConflictTrackDto {
         track_id: track.id.clone(),
         title: track.metadata.title.clone(),
@@ -4400,8 +4683,8 @@ fn conflict_track_dto(state: &LibraryState, track: &TrackEntity) -> ConflictTrac
         album: track.metadata.album.clone(),
         coverage: coverage_dto(track),
         providers: provider_badges(&track.provider_links),
-        saved_count: saved_track_count(state, &track.id),
-        playlist_refs: playlist_reference_count(state, &track.id),
+        saved_count: indexes.saved_count(&track.id),
+        playlist_refs: indexes.playlist_ref_count(&track.id),
         artwork_url: preferred_artwork_url(track),
     }
 }
@@ -4429,10 +4712,10 @@ fn provider_link_conflicts(
 }
 
 fn identity_conflict_evidence(
-    state: &LibraryState,
     source: &TrackEntity,
     candidate: &TrackEntity,
     provider_confidence: Option<f64>,
+    indexes: &ConflictIndexes<'_>,
 ) -> TrackIdentityConflictEvidenceDto {
     let similarity = metadata_similarity(&source.metadata, &candidate.metadata);
     let duration_delta_seconds = match (
@@ -4451,10 +4734,10 @@ fn identity_conflict_evidence(
         provider_confidence,
         metadata_similarity: similarity,
         duration_delta_seconds,
-        source_saved_tracks: saved_track_count(state, &source.id),
-        source_playlist_entries: playlist_reference_count(state, &source.id),
-        candidate_saved_tracks: saved_track_count(state, &candidate.id),
-        candidate_playlist_entries: playlist_reference_count(state, &candidate.id),
+        source_saved_tracks: indexes.saved_count(&source.id),
+        source_playlist_entries: indexes.playlist_ref_count(&source.id),
+        candidate_saved_tracks: indexes.saved_count(&candidate.id),
+        candidate_playlist_entries: indexes.playlist_ref_count(&candidate.id),
         recommendation,
     }
 }
@@ -4498,23 +4781,6 @@ fn identity_conflict_recommendation(
         label: "Needs manual review".to_string(),
         detail: "The evidence is mixed. Compare album, version, duration, and provider pages before merging or rejecting.".to_string(),
     }
-}
-
-fn saved_track_count(state: &LibraryState, track_id: &str) -> usize {
-    state
-        .saved_tracks
-        .iter()
-        .filter(|saved_track| saved_track.track_id == track_id)
-        .count()
-}
-
-fn playlist_reference_count(state: &LibraryState, track_id: &str) -> usize {
-    state
-        .playlists
-        .iter()
-        .flat_map(|playlist| playlist.entries.iter())
-        .filter(|entry| entry.track_id == track_id)
-        .count()
 }
 
 fn playlist_summaries(state: &LibraryState, query: Option<&str>) -> Vec<PlaylistSummaryDto> {
@@ -4876,79 +5142,186 @@ fn track_has_identity_conflict(track: &TrackEntity) -> bool {
     track.open_identity_conflicts().next().is_some()
 }
 
-async fn enrich_artwork_for_track_ids(
-    client: &reqwest::Client,
-    state: &mut LibraryState,
-    track_ids: &[String],
-) -> Result<bool, ApiError> {
-    let targets = track_ids
-        .iter()
-        .filter_map(|track_id| {
-            let track = state.tracks.iter().find(|track| track.id == *track_id)?;
-            if preferred_artwork(track).is_some() {
-                return None;
-            }
+/// Resolved artwork for one track: which provider it came from, the URL, and
+/// its dimensions.
+type ResolvedArtwork = (ProviderKind, String, Option<u32>, Option<u32>);
 
-            Some((
-                track.id.clone(),
-                track
-                    .provider_links
-                    .get(ProviderKind::Spotify.as_key())
-                    .map(|link| link.provider_id.clone()),
-                track
-                    .provider_links
-                    .get(ProviderKind::YoutubeMusic.as_key())
-                    .map(|link| link.provider_id.clone()),
-            ))
-        })
-        .collect::<Vec<_>>();
+/// Schedules a debounced background pass that fills in missing artwork for the
+/// given candidate track IDs. Browse handlers call this after building a page;
+/// it never blocks the request. At most one pass runs at a time — if one is
+/// already in flight the call is a no-op, and a later browse schedules the next.
+fn schedule_artwork_enrichment(context: &Arc<AppContext>, requested: Vec<String>) {
+    if requested.is_empty() {
+        return;
+    }
+    // Debounce via the one-permit semaphore: acquire before spawning and hold
+    // the permit for the whole pass.
+    let Ok(permit) = context.artwork_semaphore.clone().try_acquire_owned() else {
+        return;
+    };
+    let context = context.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        run_artwork_enrichment(context, requested).await;
+    });
+}
 
+/// One background artwork pass: pick the tracks that still need artwork (honoring
+/// the negative cache), fetch with bounded concurrency and no lock held, then
+/// apply the results onto the current state under a single write lock. Does not
+/// bump `library_version` — artwork is self-healing bookkeeping, not a user edit,
+/// so it must not trip a concurrent operation's edit detection.
+async fn run_artwork_enrichment(context: Arc<AppContext>, requested: Vec<String>) {
+    let targets = {
+        let state = context.library.read().await;
+        collect_artwork_targets(&context, &state, &requested)
+    };
     if targets.is_empty() {
-        return Ok(false);
+        return;
     }
 
-    let now = Utc::now();
-    let mut changed = false;
-
+    // Fetch artwork concurrently (bounded), never holding the library lock.
+    let permits = Arc::new(Semaphore::new(ARTWORK_FETCH_CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
     for (track_id, spotify_id, youtube_id) in targets {
-        if let Some(spotify_id) = spotify_id {
-            match fetch_spotify_oembed_artwork(client, &spotify_id).await {
-                Ok(Some((url, width, height))) => {
-                    state.upsert_track_artwork(
-                        &track_id,
-                        ProviderKind::Spotify,
-                        url,
-                        width,
-                        height,
-                        now,
-                    );
-                    changed = true;
+        let client = context.http_client.clone();
+        let permits = permits.clone();
+        tasks.spawn(async move {
+            let _permit = permits.acquire_owned().await.ok();
+            let artwork = resolve_track_artwork(&client, spotify_id, youtube_id).await;
+            (track_id, artwork)
+        });
+    }
+
+    let mut resolved: Vec<(String, ResolvedArtwork)> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((track_id, Some(artwork))) => resolved.push((track_id, artwork)),
+            Ok((track_id, None)) => misses.push(track_id),
+            Err(error) => eprintln!("Artwork enrichment task failed: {error}"),
+        }
+    }
+
+    if !resolved.is_empty() {
+        let now = Utc::now();
+        let mut state = context.library.write().await;
+        let mut changed = false;
+        for (track_id, (provider, url, width, height)) in &resolved {
+            let still_missing = state
+                .tracks
+                .iter()
+                .find(|track| track.id == *track_id)
+                .map(|track| preferred_artwork(track).is_none())
+                .unwrap_or(false);
+            if still_missing {
+                state.upsert_track_artwork(track_id, *provider, url.clone(), *width, *height, now);
+                changed = true;
+            }
+        }
+        if changed {
+            if let Err(error) = persist_library(&state).await {
+                eprintln!("Failed to persist enriched artwork: {}", error.message);
+            }
+        }
+    }
+
+    if !misses.is_empty() {
+        let now = Instant::now();
+        if let Ok(mut cache) = context.artwork_negative_cache.lock() {
+            for track_id in misses {
+                cache.insert(track_id, now);
+            }
+        }
+    }
+}
+
+/// Selects, from the requested track IDs, those that still lack artwork, have a
+/// provider link to fetch from, and are not in the negative cache. Bounded to
+/// [`ARTWORK_ENRICHMENT_BATCH`] so one browse request cannot schedule an
+/// unbounded run of external lookups.
+fn collect_artwork_targets(
+    context: &Arc<AppContext>,
+    state: &LibraryState,
+    requested: &[String],
+) -> Vec<(String, Option<String>, Option<String>)> {
+    let cache = context.artwork_negative_cache.lock().ok();
+    let now = Instant::now();
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for track_id in requested {
+        if targets.len() >= ARTWORK_ENRICHMENT_BATCH {
+            break;
+        }
+        if !seen.insert(track_id.as_str()) {
+            continue;
+        }
+        let Some(track) = state.tracks.iter().find(|track| track.id == *track_id) else {
+            continue;
+        };
+        if preferred_artwork(track).is_some() {
+            continue;
+        }
+        if let Some(cache) = cache.as_ref() {
+            if let Some(last) = cache.get(track_id) {
+                if negative_cache_is_fresh(*last, now) {
                     continue;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!(
-                        "Artwork lookup failed for Spotify track {spotify_id}: {}",
-                        error.message
-                    );
-                }
             }
         }
+        let spotify_id = track
+            .provider_links
+            .get(ProviderKind::Spotify.as_key())
+            .map(|link| link.provider_id.clone());
+        let youtube_id = track
+            .provider_links
+            .get(ProviderKind::YoutubeMusic.as_key())
+            .map(|link| link.provider_id.clone());
+        if spotify_id.is_none() && youtube_id.is_none() {
+            continue;
+        }
+        targets.push((track_id.clone(), spotify_id, youtube_id));
+    }
+    targets
+}
 
-        if let Some(youtube_id) = youtube_id {
-            state.upsert_track_artwork(
-                &track_id,
-                ProviderKind::YoutubeMusic,
-                youtube_thumbnail_url(&youtube_id),
-                Some(480),
-                Some(360),
-                now,
-            );
-            changed = true;
+/// Whether a negative-cache entry recorded at `last` is still fresh at `now`
+/// (younger than [`ARTWORK_NEGATIVE_CACHE_TTL`]), meaning the artwork-less track
+/// should be skipped this pass to avoid refetch storms.
+fn negative_cache_is_fresh(last: Instant, now: Instant) -> bool {
+    now.duration_since(last) < ARTWORK_NEGATIVE_CACHE_TTL
+}
+
+/// Resolves artwork for one track: prefers a Spotify oembed lookup (network),
+/// falling back to the deterministic YouTube thumbnail. Returns `None` only when
+/// there is no artwork to be had (no YouTube link and Spotify yielded nothing),
+/// which the caller records in the negative cache.
+async fn resolve_track_artwork(
+    client: &reqwest::Client,
+    spotify_id: Option<String>,
+    youtube_id: Option<String>,
+) -> Option<ResolvedArtwork> {
+    if let Some(spotify_id) = spotify_id {
+        match fetch_spotify_oembed_artwork(client, &spotify_id).await {
+            Ok(Some((url, width, height))) => {
+                return Some((ProviderKind::Spotify, url, width, height))
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "Artwork lookup failed for Spotify track {spotify_id}: {}",
+                error.message
+            ),
         }
     }
-
-    Ok(changed)
+    if let Some(youtube_id) = youtube_id {
+        return Some((
+            ProviderKind::YoutubeMusic,
+            youtube_thumbnail_url(&youtube_id),
+            Some(480),
+            Some(360),
+        ));
+    }
+    None
 }
 
 async fn fetch_spotify_oembed_artwork(
@@ -5368,12 +5741,15 @@ mod tests {
     };
 
     use super::{
-        bulk_merge_identity_conflict_rows, coverage_matches, identity_conflict_rows,
-        identity_conflict_rows_filtered, identity_gap_rows, is_request_origin_allowed,
-        normalize_manual_provider_track_id, provider_health_failed, provider_preflight_payload,
-        provider_push_plan_payload, raw_table_value_to_string, IdentityConflictFilters,
+        bulk_merge_identity_conflict_rows, compare_added_at_desc, coverage_matches,
+        identity_conflict_rows, identity_conflict_rows_filtered, identity_gap_rows,
+        is_request_origin_allowed, negative_cache_is_fresh, normalize_manual_provider_track_id,
+        provider_health_failed, provider_preflight_payload, provider_push_plan_payload,
+        raw_table_value_to_string, reapply_provider_sync, saved_track_rows,
+        IdentityConflictFilters,
     };
     use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method};
+    use std::time::{Duration, Instant};
 
     /// Builds a `HeaderMap` from `(name, value)` pairs for the guard tests.
     fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -6021,12 +6397,14 @@ mod tests {
             }),
         };
 
+        let identity_conflicts = identity_conflict_rows(&state, None).len();
         let preflight = provider_preflight_payload(
             &state,
             ProviderKind::Spotify,
             Some(&connection),
             None,
             None,
+            identity_conflicts,
         );
 
         assert!(preflight.can_push);
@@ -6056,6 +6434,7 @@ mod tests {
             Some(&connection),
             None,
             Some(&failed_health),
+            identity_conflicts,
         );
         assert!(!blocked.can_pull);
         assert!(!blocked.can_push);
@@ -6152,6 +6531,153 @@ mod tests {
         assert_eq!(plan.playlists.linked, 0);
         assert_eq!(plan.playlists.unlinked, 1);
         assert_eq!(plan.playlists.examples[0].missing_entries, 1);
+    }
+
+    #[test]
+    fn compare_added_at_desc_orders_chronologically_not_lexically() {
+        use std::cmp::Ordering;
+        // Lexically "2023-09..." > "2023-10..." ('9' > '1'); chronologically the
+        // October timestamp is newer and must sort first (newest-first).
+        assert_eq!(
+            compare_added_at_desc(Some("2023-10-01T00:00:00Z"), Some("2023-09-01T00:00:00Z")),
+            Ordering::Less
+        );
+        // Mixed formats (date-only vs RFC3339) still compare by instant.
+        assert_eq!(
+            compare_added_at_desc(Some("2024-01-02"), Some("2024-01-01T00:00:00Z")),
+            Ordering::Less
+        );
+        // Missing / unparseable dates sort after any real date.
+        assert_eq!(
+            compare_added_at_desc(Some("2024-01-01T00:00:00Z"), None),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_added_at_desc(None, Some("2024-01-01T00:00:00Z")),
+            Ordering::Greater
+        );
+        assert_eq!(compare_added_at_desc(None, None), Ordering::Equal);
+    }
+
+    #[test]
+    fn saved_track_rows_sort_newest_added_first_across_date_formats() {
+        let mut state = LibraryState::new();
+        state.tracks.push(test_track("track-a", "Alpha"));
+        state.tracks.push(test_track("track-b", "Bravo"));
+        state.tracks.push(test_track("track-c", "Charlie"));
+        // Out of order, mixed formats. Lexically "2023-09..." sorts after
+        // "2023-10...", so a string sort would put track-a before track-b.
+        state.saved_tracks.push(saved_entry(
+            "saved-a",
+            "track-a",
+            Some("2023-09-15T00:00:00Z"),
+        ));
+        state
+            .saved_tracks
+            .push(saved_entry("saved-b", "track-b", Some("2023-10-01")));
+        state
+            .saved_tracks
+            .push(saved_entry("saved-c", "track-c", None));
+
+        let rows = saved_track_rows(&state, None);
+        let ordered: Vec<&str> = rows.iter().map(|row| row.track_id.as_str()).collect();
+        // Newest real date first (October), then September, then the undated row.
+        assert_eq!(ordered, ["track-b", "track-a", "track-c"]);
+    }
+
+    #[test]
+    fn artwork_negative_cache_gate_skips_only_within_ttl() {
+        let last = Instant::now();
+        // A fresh miss (within the 1h TTL) is skipped.
+        assert!(negative_cache_is_fresh(
+            last,
+            last + Duration::from_secs(30)
+        ));
+        assert!(negative_cache_is_fresh(
+            last,
+            last + Duration::from_secs(60 * 59)
+        ));
+        // Once older than the TTL the track becomes eligible for a refetch.
+        assert!(!negative_cache_is_fresh(
+            last,
+            last + Duration::from_secs(60 * 60 + 1)
+        ));
+        assert!(!negative_cache_is_fresh(
+            last,
+            last + Duration::from_secs(3 * 60 * 60)
+        ));
+    }
+
+    #[test]
+    fn provider_sync_reapply_preserves_concurrent_user_edits() {
+        let now = Utc::now();
+        // Base track: linked to YouTube Music, no Spotify link yet.
+        let base_track =
+            test_track_with_link("track-1", "Song", ProviderKind::YoutubeMusic, "yt-1", now);
+
+        // The background push (run against a detached clone) resolves Spotify.
+        let mut working = LibraryState::new();
+        working.tracks.push(base_track.clone());
+        working.tracks[0].provider_links.insert(
+            ProviderKind::Spotify.as_key().to_string(),
+            ProviderTrackLink {
+                provider_id: "sp-1".to_string(),
+                source: LinkSource::Match,
+                confidence: Some(1.0),
+                linked_at: now,
+                last_seen_at: Some(now),
+            },
+        );
+
+        // Meanwhile the user edits the live state: renames the track.
+        let mut current = LibraryState::new();
+        current.tracks.push(base_track);
+        current.tracks[0].metadata.title = "Renamed by user".to_string();
+
+        reapply_provider_sync(&mut current, &working, ProviderKind::Spotify);
+
+        // The push result (Spotify link) landed,
+        assert!(current.tracks[0]
+            .provider_links
+            .contains_key(ProviderKind::Spotify.as_key()));
+        // the pre-existing YouTube link survived,
+        assert!(current.tracks[0]
+            .provider_links
+            .contains_key(ProviderKind::YoutubeMusic.as_key()));
+        // and the concurrent user rename was not clobbered.
+        assert_eq!(current.tracks[0].metadata.title, "Renamed by user");
+    }
+
+    #[test]
+    fn provider_sync_reapply_removes_links_dropped_by_a_reset() {
+        let now = Utc::now();
+        // Current state has a Spotify link; the reset clone dropped it (post-purge).
+        let mut current = LibraryState::new();
+        current.tracks.push(test_track_with_link(
+            "track-1",
+            "Song",
+            ProviderKind::Spotify,
+            "sp-1",
+            now,
+        ));
+        let mut working = current.clone();
+        working.tracks[0]
+            .provider_links
+            .remove(ProviderKind::Spotify.as_key());
+
+        reapply_provider_sync(&mut current, &working, ProviderKind::Spotify);
+        assert!(!current.tracks[0]
+            .provider_links
+            .contains_key(ProviderKind::Spotify.as_key()));
+    }
+
+    fn saved_entry(id: &str, track_id: &str, added_at: Option<&str>) -> SavedTrackEntry {
+        SavedTrackEntry {
+            id: id.to_string(),
+            track_id: track_id.to_string(),
+            added_at: added_at.map(str::to_string),
+            provider_state: BTreeMap::new(),
+        }
     }
 
     fn test_track(id: &str, title: &str) -> TrackEntity {

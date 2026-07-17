@@ -1089,7 +1089,7 @@ fn max_timestamp(
     }
 }
 
-fn parse_added_at(value: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_added_at(value: &str) -> Option<DateTime<Utc>> {
     if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
         return Some(parsed.with_timezone(&Utc));
     }
