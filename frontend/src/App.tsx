@@ -120,7 +120,6 @@ function App() {
               <Route path="/playlists" element={<PlaylistsPage />} />
               <Route path="/playlists/:playlistId" element={<PlaylistsPage />} />
               <Route path="/safety" element={<SafetyPage />} />
-              <Route path="/database" element={<Navigate replace to="/overview" />} />
             </Routes>
           </ErrorBoundary>
           <div className="dock">

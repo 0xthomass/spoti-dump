@@ -5,7 +5,7 @@ pub mod matching;
 pub mod provider;
 pub mod providers;
 pub mod storage;
-pub mod web_app;
+pub mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -261,7 +261,7 @@ pub async fn run() -> Result<()> {
                 }
             }
             Commands::Ui { port, no_open } => {
-                web_app::serve(*port, !*no_open).await?;
+                web::serve(*port, !*no_open).await?;
             }
             Commands::Purge { provider, force } => {
                 ensure_provider_supports_library_reset(*provider)?;
