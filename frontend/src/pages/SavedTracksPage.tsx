@@ -72,9 +72,7 @@ export function SavedTracksPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Saved Tracks"
-        title="The list you keep for life."
-        copy="New pulls add here. Nothing leaves until you remove it."
+        title="Saved tracks"
       >
         <HeroStat
           label="Showing"

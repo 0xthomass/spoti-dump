@@ -86,9 +86,8 @@ export function TracksPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Tracks"
-        title="Track coverage."
-        copy="See where each track resolves and fix the metadata used for matching."
+        title="Tracks"
+        subtitle="Where each track resolves across providers."
       >
         <HeroStat label="Coverage filter" value={coverageLabel(coverage)} />
       </PageHero>

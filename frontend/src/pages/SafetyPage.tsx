@@ -115,9 +115,8 @@ export function SafetyPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Safety"
-        title="Source-of-truth protection."
-        copy="Manual snapshots are never pruned by automatic backup retention."
+        title="Safety"
+        subtitle="Back up and restore your canonical library."
       >
         <HeroStat label="Database" value={health.integrity_check} />
         <HeroStat label="Manual backups" value={formatNumber(manualCount)} />

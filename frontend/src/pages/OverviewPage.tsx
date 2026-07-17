@@ -219,33 +219,29 @@ export function OverviewPage() {
   const gettingStartedSteps = [
     {
       title: 'Connect a provider',
-      copy: 'Link Spotify or YouTube Music below so the app can read and write your library.',
+      copy: 'Link Spotify or YouTube Music.',
       done: connectedProviderCount > 0,
     },
     {
       title: 'Pull your library',
-      copy: 'Import saved tracks and playlists into the canonical database.',
+      copy: 'Import saved tracks and playlists.',
       done: data.tracks > 0,
     },
     {
       title: 'Resolve track IDs',
-      copy: 'Match tracks across services so a push can cover every song.',
+      copy: 'Match tracks across services.',
       done: data.tracks > 0 && providerIdentityGaps === 0,
     },
     {
       title: 'Push to the other service',
-      copy: 'Mirror your canonical library out to the connected accounts.',
+      copy: 'Mirror your library out.',
       done: false,
     },
   ]
 
   return (
     <section className="page-stack">
-      <PageHero
-        eyebrow="Overview"
-        title="One library. Many providers."
-        copy="Pull from providers. Edit here. Push changes back out."
-      >
+      <PageHero title="Overview" subtitle="Your library across every provider.">
         <HeroStat label="Library updated" value={formatDateTime(data.library_updated_at)} />
         <HeroStat label="Tracks tracked" value={formatNumber(data.tracks)} />
       </PageHero>
@@ -254,8 +250,7 @@ export function OverviewPage() {
         <section className="panel getting-started">
           <div className="panel-head">
             <div>
-              <span className="eyebrow">Getting started</span>
-              <h2>Set up your first sync</h2>
+              <h2>Getting started</h2>
             </div>
           </div>
           <ol className="checklist">
@@ -278,33 +273,24 @@ export function OverviewPage() {
       ) : null}
 
       <div className="metric-grid">
-        <DashboardCard label="Saved Tracks" value={data.saved_tracks}>
-          Your kept songs.
-        </DashboardCard>
-        <DashboardCard label="Playlists" value={data.playlists}>
-          Canonical collections.
-        </DashboardCard>
+        <DashboardCard label="Saved tracks" value={data.saved_tracks} />
+        <DashboardCard label="Playlists" value={data.playlists} />
         {data.provider_only_counts.map((providerOnly) => (
-          <DashboardCard key={providerOnly.key} label={`${providerOnly.name} Only`} value={providerOnly.count}>
-            Seen only on {providerOnly.name}.
-          </DashboardCard>
+          <DashboardCard
+            key={providerOnly.key}
+            label={`${providerOnly.name} only`}
+            value={providerOnly.count}
+          />
         ))}
-        <DashboardCard label="Multi-provider" value={data.multi_provider}>
-          Resolved on more than one side.
-        </DashboardCard>
-        <DashboardCard label="Canonical Only" value={data.canonical_only}>
-          Local only for now.
-        </DashboardCard>
-        <DashboardCard label="Identity Conflicts" value={data.identity_conflicts}>
-          Rows needing explicit merge review.
-        </DashboardCard>
+        <DashboardCard label="Multi-provider" value={data.multi_provider} />
+        <DashboardCard label="Canonical only" value={data.canonical_only} />
+        <DashboardCard label="Identity conflicts" value={data.identity_conflicts} />
       </div>
 
       <section className="panel">
         <div className="panel-head">
           <div>
-            <span className="eyebrow">Identity Maintenance</span>
-            <h2>Resolve Missing IDs</h2>
+            <h2>Resolve missing IDs</h2>
           </div>
           <button
             className="btn btn--primary"
@@ -312,28 +298,15 @@ export function OverviewPage() {
             onClick={() => void runLibraryIdentity()}
             type="button"
           >
-            {pendingAction === 'library:identity-all' ? 'Resolving…' : 'Resolve Missing IDs'}
+            {pendingAction === 'library:identity-all' ? 'Resolving…' : 'Resolve missing IDs'}
           </button>
         </div>
         <div className="panel-body">
-          <p>
-            Run this before pushing to a new provider account. It searches linked provider
-            catalogs for missing Spotify and YouTube Music IDs, deduplicates safe matches, and
-            records unmatched rows for review.
-          </p>
           <div className="metric-grid">
-            <DashboardCard label="Linked Providers" value={connectedProviderCount}>
-              Spotify and YouTube Music only.
-            </DashboardCard>
-            <DashboardCard label="Provider ID Gaps" value={providerIdentityGaps}>
-              Missing IDs across both providers.
-            </DashboardCard>
-            <DashboardCard label="Conflict Queue" value={data.identity_conflicts}>
-              Explicit merge decisions left.
-            </DashboardCard>
-            <DashboardCard label="Blocked Providers" value={blockedConnectedProviderCount}>
-              Skipped until relinked, checked, or cooled down.
-            </DashboardCard>
+            <DashboardCard label="Linked providers" value={connectedProviderCount} />
+            <DashboardCard label="Provider ID gaps" value={providerIdentityGaps} />
+            <DashboardCard label="Conflict queue" value={data.identity_conflicts} />
+            <DashboardCard label="Blocked providers" value={blockedConnectedProviderCount} />
           </div>
           {data.identity_conflicts > 0 ? (
             <div className="provider-callout provider-callout--warning">
@@ -350,8 +323,7 @@ export function OverviewPage() {
       <section className="panel">
         <div className="panel-head">
           <div>
-            <span className="eyebrow">Providers</span>
-            <h2>Link, Pull, Push</h2>
+            <h2>Providers</h2>
           </div>
         </div>
         <div className="provider-grid">

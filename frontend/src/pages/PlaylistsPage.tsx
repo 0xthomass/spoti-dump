@@ -134,9 +134,7 @@ export function PlaylistsPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Playlists"
-        title="Canonical playlists."
-        copy="Edit the playlist here. Then push the result back out."
+        title="Playlists"
       >
         <HeroStat
           label="Selected"

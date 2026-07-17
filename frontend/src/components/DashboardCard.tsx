@@ -8,13 +8,13 @@ export function DashboardCard({
 }: {
   label: string
   value: number
-  children: ReactNode
+  children?: ReactNode
 }) {
   return (
     <div className="dashboard-card">
       <span className="eyebrow">{label}</span>
       <strong>{formatNumber(value)}</strong>
-      <p>{children}</p>
+      {children ? <p>{children}</p> : null}
     </div>
   )
 }

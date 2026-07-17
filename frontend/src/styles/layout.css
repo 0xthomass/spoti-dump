@@ -178,8 +178,8 @@
   display: flex;
   justify-content: space-between;
   gap: 24px;
-  align-items: end;
-  padding: 28px 30px;
+  align-items: center;
+  padding: 20px 24px;
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--gradient-hero);
@@ -189,12 +189,12 @@
 .hero-copy {
   max-width: 720px;
   display: grid;
-  gap: var(--space-3);
+  gap: var(--space-1);
 }
 
 .hero-copy h2 {
-  font-size: clamp(38px, 4vw, 62px);
-  line-height: 0.96;
+  font-size: clamp(24px, 2.2vw, 30px);
+  line-height: 1.1;
 }
 
 .hero-copy p {

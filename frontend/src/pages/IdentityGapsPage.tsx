@@ -60,9 +60,8 @@ export function IdentityGapsPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Provider ID Gaps"
-        title="Repair push coverage."
-        copy="Find canonical tracks that still need Spotify or YouTube Music IDs before a complete migration push."
+        title="Provider ID gaps"
+        subtitle="Tracks still missing a provider ID."
       >
         <HeroStat
           label="Showing"

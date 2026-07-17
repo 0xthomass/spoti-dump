@@ -1,24 +1,21 @@
 import type { ReactNode } from 'react'
 
 export function PageHero({
-  eyebrow,
   title,
-  copy,
+  subtitle,
   children,
 }: {
-  eyebrow: string
   title: string
-  copy: string
+  subtitle?: string
   children?: ReactNode
 }) {
   return (
     <section className="hero-panel">
       <div className="hero-copy">
-        <span className="eyebrow">{eyebrow}</span>
         <h2>{title}</h2>
-        <p>{copy}</p>
+        {subtitle ? <p>{subtitle}</p> : null}
       </div>
-      <div className="hero-aside">{children}</div>
+      {children ? <div className="hero-aside">{children}</div> : null}
     </section>
   )
 }

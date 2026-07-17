@@ -227,9 +227,8 @@ export function IdentityConflictsPage() {
   return (
     <section className="page-stack">
       <PageHero
-        eyebrow="Identity Conflicts"
-        title="Merge review queue."
-        copy="Resolve ambiguous Spotify and YouTube Music matches without touching provider accounts."
+        title="Identity conflicts"
+        subtitle="Review ambiguous matches before merging."
       >
         <HeroStat
           label="Queue"
