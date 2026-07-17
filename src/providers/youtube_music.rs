@@ -1,11 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::env;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 use tokio::time::sleep;
@@ -13,10 +15,10 @@ use ytmusicapi::{BrowserAuth, Privacy, YTMusicClient};
 
 use crate::domain::{
     LibraryState, LinkSource, ObservedArtwork, ObservedPlaylist, ObservedPlaylistTrack,
-    ObservedSavedTrack, ObservedTrack, ProviderKind, ProviderLibrarySnapshot, PurgeReport,
-    SyncStatusRecord, SyncSummary, TrackMetadata, YoutubeMusicConnectionConfig,
+    ObservedSavedTrack, ObservedTrack, PlaylistSyncTarget, ProviderKind, ProviderLibrarySnapshot,
+    PurgeReport, SyncStatusRecord, SyncSummary, TrackMetadata, YoutubeMusicConnectionConfig,
 };
-use crate::error::ProviderError;
+use crate::error::{provider_failure, ProviderError, ProviderFailure};
 use crate::matching::{best_candidate, cleaned_title, MatchCandidate};
 use crate::provider::{ProgressHandler, ProviderProgress, StreamingProvider};
 
@@ -32,6 +34,15 @@ const LIBRARY_LANDING_BROWSE_ID: &str = "FEmusic_library_landing";
 const LIBRARY_PLAYLISTS_BROWSE_ID: &str = "FEmusic_liked_playlists";
 const MAX_LIBRARY_PLAYLIST_PAGES: usize = 1_000;
 const UNBOUNDED_TRACK_LIMIT: u32 = u32::MAX;
+/// Maximum attempts (including the first) for a retryable `ytmusicapi` call.
+const MAX_YTM_RETRY_ATTEMPTS: u32 = 3;
+/// Ceiling on any single retry backoff, including an honored `Retry-After`.
+const YTM_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Consecutive per-item push failures tolerated before the run is aborted.
+const PUSH_FAILURE_CIRCUIT_BREAKER: u32 = 5;
+/// Maximum number of skipped-track labels listed in the aggregated export
+/// warning before it collapses the rest into an "and N more" tail.
+const MAX_DROPPED_TRACK_SAMPLE: usize = 10;
 const UNSUPPORTED_LIBRARY_RESET_MESSAGE: &str = "YouTube Music does not support account-wide library reset in this app. Normal pull, push, and targeted canonical deletes are supported.";
 
 #[derive(Clone)]
@@ -357,6 +368,70 @@ impl YoutubeMusicProvider {
 
         Ok(playlists)
     }
+
+    /// Creates a fresh private playlist and populates it with `video_ids` in
+    /// 100-item batches. Both the create and each add are retried on transient
+    /// failures. If any batch fails, the partially built playlist is deleted
+    /// (best effort) so a later retry does not accumulate orphans, and the
+    /// classified error is returned to the caller.
+    async fn create_and_populate_playlist(
+        &self,
+        name: &str,
+        description: Option<&str>,
+        video_ids: &[String],
+    ) -> Result<String> {
+        let created_id = retry_ytm_operation(move || async move {
+            self.client
+                .create_playlist(name, description, Privacy::Private)
+                .await
+                .map_err(ytmusic_client_error)
+        })
+        .await?
+        .playlist_id;
+
+        for chunk in video_ids.chunks(100) {
+            let created_ref = created_id.as_str();
+            if let Err(error) = retry_ytm_operation(move || async move {
+                self.client
+                    .add_playlist_items(created_ref, chunk, false)
+                    .await
+                    .map_err(ytmusic_client_error)
+            })
+            .await
+            {
+                let _ = self.client.delete_playlist(&created_id).await;
+                return Err(error);
+            }
+        }
+
+        Ok(created_id)
+    }
+
+    /// Performs the provider-side work of replacing a playlist: resolves the
+    /// existing playlist to replace (by stored link or name), then creates and
+    /// populates the replacement. Returns the new playlist ID plus the old
+    /// playlist ID to delete afterwards, or a classified error on failure.
+    async fn push_playlist_replacement(
+        &self,
+        playlist: &PlaylistSyncTarget,
+        resolved_video_ids: &[String],
+    ) -> Result<(String, Option<String>)> {
+        let playlist_to_replace = if let Some(provider_id) = &playlist.existing_provider_id {
+            Some(provider_id.clone())
+        } else {
+            self.find_playlist_by_name(&playlist.name).await?
+        };
+
+        let created_id = self
+            .create_and_populate_playlist(
+                &playlist.name,
+                playlist.description.as_deref(),
+                resolved_video_ids,
+            )
+            .await?;
+
+        Ok((created_id, playlist_to_replace))
+    }
 }
 
 fn emit_progress(progress: Option<&ProgressHandler>, update: ProviderProgress) {
@@ -373,6 +448,165 @@ fn youtube_music_cleanup_warning(
 ) -> String {
     format!(
         "Synced YouTube Music playlist '{playlist_name}' to replacement playlist {new_playlist_id}, but failed to delete old playlist {old_playlist_id}: {error}"
+    )
+}
+
+/// Runs a `ytmusicapi` operation with bounded retry.
+///
+/// The operation closure must classify its failure via [`ytmusic_client_error`]
+/// so the returned `anyhow::Error` carries a typed [`ProviderError`]. Only typed
+/// [`ProviderFailure::RateLimited`] (honoring a capped `Retry-After`) and
+/// transient [`ProviderFailure::Network`] failures are retried, up to
+/// [`MAX_YTM_RETRY_ATTEMPTS`] attempts with exponential backoff plus jitter.
+/// Auth, invalid-argument, blocked, and unclassified failures return at once.
+async fn retry_ytm_operation<T, F, Fut>(operation: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut attempt = 1u32;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(base_delay) = ytm_retry_delay(&error, attempt) else {
+                    return Err(error);
+                };
+                if attempt >= MAX_YTM_RETRY_ATTEMPTS {
+                    return Err(error);
+                }
+                sleep(apply_jitter(base_delay)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// The base backoff a retryable YouTube Music failure calls for on `attempt`
+/// (1-based), or `None` when the failure must not be retried.
+///
+/// Rate limits honor a provider-supplied `retry_after` (capped to
+/// [`YTM_RETRY_MAX_BACKOFF`]); rate limits without one, and transient network
+/// failures, fall back to exponential backoff. Auth, invalid-argument, blocked,
+/// and unclassified failures are never retried.
+fn ytm_retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    match provider_failure(error).map(ProviderError::failure) {
+        Some(ProviderFailure::RateLimited { retry_after }) => Some(
+            retry_after
+                .unwrap_or_else(|| ytm_backoff(attempt))
+                .min(YTM_RETRY_MAX_BACKOFF),
+        ),
+        Some(ProviderFailure::Network) => Some(ytm_backoff(attempt)),
+        _ => None,
+    }
+}
+
+/// Exponential backoff (base 2 seconds) for `attempt` (1-based), capped at
+/// [`YTM_RETRY_MAX_BACKOFF`]: 1s, 2s, 4s, ...
+fn ytm_backoff(attempt: u32) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(5);
+    Duration::from_secs(1u64 << exponent).min(YTM_RETRY_MAX_BACKOFF)
+}
+
+/// Adds up to +50% random jitter to a backoff delay to desynchronize retries,
+/// re-capped at [`YTM_RETRY_MAX_BACKOFF`].
+fn apply_jitter(delay: Duration) -> Duration {
+    let factor = 1.0 + rand::thread_rng().gen_range(0.0..=0.5);
+    delay.mul_f64(factor).min(YTM_RETRY_MAX_BACKOFF)
+}
+
+/// Whether a typed failure must abort a batch operation (push or export)
+/// immediately: rate limits and auth failures will not recover by continuing.
+fn is_unrecoverable_failure(error: &anyhow::Error) -> bool {
+    matches!(
+        provider_failure(error).map(ProviderError::failure),
+        Some(ProviderFailure::RateLimited { .. } | ProviderFailure::AuthFailed)
+    )
+}
+
+/// Whether a push run must abort after an item failed. Unrecoverable failures
+/// abort immediately; otherwise the run tolerates transient item failures until
+/// `consecutive_failures` reaches [`PUSH_FAILURE_CIRCUIT_BREAKER`].
+fn push_should_abort(error: &anyhow::Error, consecutive_failures: u32) -> bool {
+    is_unrecoverable_failure(error) || consecutive_failures >= PUSH_FAILURE_CIRCUIT_BREAKER
+}
+
+/// Annotates the error that aborts a push. Circuit-breaker aborts gain context
+/// naming the threshold; unrecoverable (rate-limit/auth) aborts are returned
+/// as-is so their typed classification stays recoverable for downstream policy.
+fn abort_push_error(error: anyhow::Error, consecutive_failures: u32) -> anyhow::Error {
+    if is_unrecoverable_failure(&error) {
+        error
+    } else {
+        error.context(format!(
+            "Aborted YouTube Music push after {consecutive_failures} consecutive item failures"
+        ))
+    }
+}
+
+/// Accumulates tracks skipped during export because they carry no playable
+/// `videoId`, keeping a bounded sample of human labels alongside the full count.
+#[derive(Default)]
+struct DroppedTrackTally {
+    total: usize,
+    sample: Vec<String>,
+}
+
+impl DroppedTrackTally {
+    fn record(&mut self, track: &ytmusicapi::PlaylistTrack) {
+        self.total += 1;
+        if self.sample.len() < MAX_DROPPED_TRACK_SAMPLE {
+            self.sample.push(describe_dropped_track(track));
+        }
+    }
+
+    /// One aggregated warning for all drops, or `None` when nothing was dropped.
+    fn into_warning(self) -> Option<String> {
+        if self.total == 0 {
+            None
+        } else {
+            Some(dropped_tracks_warning(self.total, &self.sample))
+        }
+    }
+}
+
+/// A human label ("Artist - Title") for a dropped track, for the export warning.
+fn describe_dropped_track(track: &ytmusicapi::PlaylistTrack) -> String {
+    let title = track
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "Unknown title".to_string());
+    let artists = track
+        .artists
+        .iter()
+        .map(|artist| artist.name.trim())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    if artists.is_empty() {
+        title
+    } else {
+        format!("{} - {}", artists.join(", "), title)
+    }
+}
+
+/// Builds one aggregated warning for tracks skipped during export because they
+/// had no playable `videoId` (podcasts, region-locked items, or personal
+/// uploads). `sample` holds up to [`MAX_DROPPED_TRACK_SAMPLE`] labels already
+/// collected; `total` is the full count across every drop site, with the
+/// remainder collapsed into an "and N more" tail.
+fn dropped_tracks_warning(total: usize, sample: &[String]) -> String {
+    let noun = if total == 1 { "track" } else { "tracks" };
+    let mut listed = sample.join(", ");
+    let remainder = total.saturating_sub(sample.len());
+    if remainder > 0 {
+        if !listed.is_empty() {
+            listed.push_str(", ");
+        }
+        listed.push_str(&format!("and {remainder} more"));
+    }
+    format!(
+        "Skipped {total} YouTube Music {noun} with no playable videoId (podcast, region-locked, or personal upload); not exported: {listed}"
     )
 }
 
@@ -400,10 +634,13 @@ impl StreamingProvider for YoutubeMusicProvider {
             },
         );
         let captured_at = Utc::now();
-        let liked = self
-            .client
-            .get_liked_songs(Some(UNBOUNDED_TRACK_LIMIT))
-            .await?;
+        let liked = retry_ytm_operation(|| async {
+            self.client
+                .get_liked_songs(Some(UNBOUNDED_TRACK_LIMIT))
+                .await
+                .map_err(ytmusic_client_error)
+        })
+        .await?;
         emit_progress(
             progress.as_ref(),
             ProviderProgress {
@@ -421,14 +658,19 @@ impl StreamingProvider for YoutubeMusicProvider {
             playlists: Vec::new(),
             warnings: Vec::new(),
         };
+        // Tracks with no playable `videoId` (podcasts, region-locked items, or
+        // personal uploads) cannot be represented; tally them across every drop
+        // site and surface one aggregated warning at the end of the export.
+        let mut dropped = DroppedTrackTally::default();
 
         let saved_total = liked.tracks.len();
         for (index, track) in liked.tracks.into_iter().enumerate() {
-            if let Some(observed_track) = playlist_track_to_observed(&track) {
-                snapshot.saved_tracks.push(ObservedSavedTrack {
+            match playlist_track_to_observed(&track) {
+                Some(observed_track) => snapshot.saved_tracks.push(ObservedSavedTrack {
                     added_at: None,
                     track: observed_track,
-                });
+                }),
+                None => dropped.record(&track),
             }
             emit_progress(
                 progress.as_ref(),
@@ -465,10 +707,29 @@ impl StreamingProvider for YoutubeMusicProvider {
                     ..Default::default()
                 },
             );
-            let full_playlist = self
-                .client
-                .get_playlist(&playlist.playlist_id, Some(UNBOUNDED_TRACK_LIMIT))
-                .await?;
+            let playlist_id = playlist.playlist_id.as_str();
+            let full_playlist = match retry_ytm_operation(|| async {
+                self.client
+                    .get_playlist(playlist_id, Some(UNBOUNDED_TRACK_LIMIT))
+                    .await
+                    .map_err(ytmusic_client_error)
+            })
+            .await
+            {
+                Ok(full_playlist) => full_playlist,
+                // A single failing playlist fetch must not sink the whole
+                // export: record a warning and move on. Only auth/rate-limit
+                // failures (which will not recover mid-run) abort.
+                Err(error) if is_unrecoverable_failure(&error) => return Err(error),
+                Err(error) => {
+                    snapshot.warnings.push(format!(
+                        "Skipped YouTube Music playlist '{}' ({}): {error}",
+                        playlist.title, playlist.playlist_id
+                    ));
+                    playlists_done += 1;
+                    continue;
+                }
+            };
             let item_count = full_playlist.tracks.len();
             let mut observed_playlist = ObservedPlaylist {
                 provider_id: Some(full_playlist.id),
@@ -478,11 +739,12 @@ impl StreamingProvider for YoutubeMusicProvider {
             };
 
             for track in full_playlist.tracks {
-                if let Some(observed_track) = playlist_track_to_observed(&track) {
-                    observed_playlist.tracks.push(ObservedPlaylistTrack {
+                match playlist_track_to_observed(&track) {
+                    Some(observed_track) => observed_playlist.tracks.push(ObservedPlaylistTrack {
                         added_at: None,
                         track: observed_track,
-                    });
+                    }),
+                    None => dropped.record(&track),
                 }
                 playlist_entries_done += 1;
             }
@@ -502,6 +764,10 @@ impl StreamingProvider for YoutubeMusicProvider {
                     ..Default::default()
                 },
             );
+        }
+
+        if let Some(warning) = dropped.into_warning() {
+            snapshot.warnings.push(warning);
         }
 
         Ok(snapshot)
@@ -551,63 +817,94 @@ impl StreamingProvider for YoutubeMusicProvider {
             },
         );
 
+        // Consecutive per-item mutation failures across the whole push run;
+        // reset on any success and used to trip the circuit breaker.
+        let mut consecutive_failures = 0u32;
         let mut saved_done = 0usize;
         for target in saved_targets {
-            let resolution = target
-                .existing_provider_id
-                .as_ref()
-                .map(|provider_id| (provider_id.clone(), 1.0));
-            match resolution {
-                Some((provider_id, confidence)) => {
-                    state.upsert_track_link(
-                        &target.track_id,
-                        ProviderKind::YoutubeMusic,
-                        provider_id.clone(),
-                        LinkSource::Match,
-                        Some(confidence),
-                        now,
-                    );
-                    state.set_track_status(
-                        &target.track_id,
-                        ProviderKind::YoutubeMusic,
-                        SyncStatusRecord::synced(
-                            Some(provider_id.clone()),
-                            Some(confidence),
-                            Some("Resolved on YouTube Music".to_string()),
-                            now,
-                        ),
-                    );
-                    if force {
-                        if let Err(error) = self.client.like_song(&provider_id).await {
-                            state.set_saved_track_status(
-                                &target.saved_track_id,
-                                ProviderKind::YoutubeMusic,
-                                SyncStatusRecord::error(
-                                    format!(
-                                        "Failed to like '{}' on YouTube Music: {error}",
-                                        target.metadata.display_label()
-                                    ),
-                                    now,
-                                ),
-                            );
-                            return Err(ytmusic_client_error(error));
+            match target.existing_provider_id.clone() {
+                Some(provider_id) => {
+                    let confidence = 1.0;
+                    // In apply mode, attempt the provider mutation FIRST and
+                    // only commit the canonical link + synced status once it
+                    // succeeds, so failed items never leave state claiming a
+                    // success that did not happen. Dry runs have no mutation
+                    // and commit the resolution directly.
+                    let committed = if force {
+                        let provider_id_ref = provider_id.as_str();
+                        match retry_ytm_operation(move || async move {
+                            self.client
+                                .like_song(provider_id_ref)
+                                .await
+                                .map_err(ytmusic_client_error)
+                        })
+                        .await
+                        {
+                            Ok(_) => {
+                                consecutive_failures = 0;
+                                true
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "Failed to like '{}' on YouTube Music: {error}",
+                                    target.metadata.display_label()
+                                );
+                                state.set_track_status(
+                                    &target.track_id,
+                                    ProviderKind::YoutubeMusic,
+                                    SyncStatusRecord::error(message.clone(), now),
+                                );
+                                state.set_saved_track_status(
+                                    &target.saved_track_id,
+                                    ProviderKind::YoutubeMusic,
+                                    SyncStatusRecord::error(message, now),
+                                );
+                                consecutive_failures += 1;
+                                if push_should_abort(&error, consecutive_failures) {
+                                    return Err(abort_push_error(error, consecutive_failures));
+                                }
+                                false
+                            }
                         }
-                    }
-                    summary.saved_tracks_synced += 1;
-                    state.set_saved_track_status(
-                        &target.saved_track_id,
-                        ProviderKind::YoutubeMusic,
-                        SyncStatusRecord::synced(
-                            Some(provider_id),
+                    } else {
+                        true
+                    };
+
+                    if committed {
+                        state.upsert_track_link(
+                            &target.track_id,
+                            ProviderKind::YoutubeMusic,
+                            provider_id.clone(),
+                            LinkSource::Match,
                             Some(confidence),
-                            Some(if force {
-                                "Synced to YouTube Music likes".to_string()
-                            } else {
-                                "Resolved for YouTube Music sync dry run".to_string()
-                            }),
                             now,
-                        ),
-                    );
+                        );
+                        state.set_track_status(
+                            &target.track_id,
+                            ProviderKind::YoutubeMusic,
+                            SyncStatusRecord::synced(
+                                Some(provider_id.clone()),
+                                Some(confidence),
+                                Some("Resolved on YouTube Music".to_string()),
+                                now,
+                            ),
+                        );
+                        summary.saved_tracks_synced += 1;
+                        state.set_saved_track_status(
+                            &target.saved_track_id,
+                            ProviderKind::YoutubeMusic,
+                            SyncStatusRecord::synced(
+                                Some(provider_id),
+                                Some(confidence),
+                                Some(if force {
+                                    "Synced to YouTube Music likes".to_string()
+                                } else {
+                                    "Resolved for YouTube Music sync dry run".to_string()
+                                }),
+                                now,
+                            ),
+                        );
+                    }
                 }
                 None => {
                     summary.saved_tracks_unmatched += 1;
@@ -651,32 +948,19 @@ impl StreamingProvider for YoutubeMusicProvider {
             let mut matched_entries = Vec::new();
 
             for entry in &playlist.entries {
-                let resolution = entry
-                    .existing_provider_id
-                    .as_ref()
-                    .map(|provider_id| (provider_id.clone(), 1.0));
-                match resolution {
-                    Some((provider_id, confidence)) => {
-                        state.upsert_track_link(
-                            &entry.track_id,
-                            ProviderKind::YoutubeMusic,
-                            provider_id.clone(),
-                            LinkSource::Match,
-                            Some(confidence),
-                            now,
-                        );
-                        state.set_track_status(
-                            &entry.track_id,
-                            ProviderKind::YoutubeMusic,
-                            SyncStatusRecord::synced(
-                                Some(provider_id.clone()),
-                                Some(confidence),
-                                Some("Resolved on YouTube Music".to_string()),
-                                now,
-                            ),
-                        );
+                match entry.existing_provider_id.clone() {
+                    // Only classify here; the canonical link + synced status are
+                    // committed after the playlist push succeeds (or immediately
+                    // for a dry run), never before the provider mutation.
+                    Some(provider_id) => {
+                        let confidence = 1.0;
                         resolved_video_ids.push(provider_id.clone());
-                        matched_entries.push((entry.entry_id.clone(), provider_id, confidence));
+                        matched_entries.push((
+                            entry.entry_id.clone(),
+                            entry.track_id.clone(),
+                            provider_id,
+                            confidence,
+                        ));
                     }
                     None => {
                         summary.playlist_entries_unmatched += 1;
@@ -720,78 +1004,79 @@ impl StreamingProvider for YoutubeMusicProvider {
                 );
             }
 
-            if force {
-                let playlist_to_replace = if let Some(provider_id) = &playlist.existing_provider_id
-                {
-                    Some(provider_id.clone())
-                } else {
-                    self.find_playlist_by_name(&playlist.name).await?
-                };
-
-                let created = self
-                    .client
-                    .create_playlist(
-                        &playlist.name,
-                        playlist.description.as_deref(),
-                        Privacy::Private,
-                    )
+            // `Some(message)` means the resolved entries should be committed as
+            // synced with `message`; `None` means the playlist push failed and
+            // its entries were already recorded as errors, so nothing is
+            // committed. The provider mutation always precedes any commit.
+            let synced_entry_message: Option<&str> = if force {
+                match self
+                    .push_playlist_replacement(&playlist, &resolved_video_ids)
                     .await
-                    .map_err(ytmusic_client_error)?;
-
-                for chunk in resolved_video_ids.chunks(100) {
-                    if let Err(error) = self
-                        .client
-                        .add_playlist_items(&created.playlist_id, chunk, false)
-                        .await
-                    {
-                        let _ = self.client.delete_playlist(&created.playlist_id).await;
+                {
+                    Ok((created_id, playlist_to_replace)) => {
+                        consecutive_failures = 0;
+                        state.upsert_playlist_link(
+                            &playlist.playlist_id,
+                            ProviderKind::YoutubeMusic,
+                            created_id.clone(),
+                            LinkSource::Create,
+                            Some(1.0),
+                            now,
+                        );
+                        if let Some(existing_playlist_id) = playlist_to_replace {
+                            if existing_playlist_id != created_id {
+                                if let Err(error) =
+                                    self.client.delete_playlist(&existing_playlist_id).await
+                                {
+                                    summary.warnings.push(youtube_music_cleanup_warning(
+                                        &playlist.name,
+                                        &existing_playlist_id,
+                                        &created_id,
+                                        &error.to_string(),
+                                    ));
+                                }
+                            }
+                        }
                         state.set_playlist_status(
                             &playlist.playlist_id,
                             ProviderKind::YoutubeMusic,
-                            SyncStatusRecord::error(
-                                format!(
-                                    "Failed to sync YouTube Music playlist '{}': {error}",
-                                    playlist.name
-                                ),
+                            SyncStatusRecord::synced(
+                                Some(created_id),
+                                Some(1.0),
+                                Some("Synced to YouTube Music".to_string()),
                                 now,
                             ),
                         );
-                        return Err(ytmusic_client_error(error));
+                        Some("Synced to YouTube Music")
                     }
-                }
-
-                state.upsert_playlist_link(
-                    &playlist.playlist_id,
-                    ProviderKind::YoutubeMusic,
-                    created.playlist_id.clone(),
-                    LinkSource::Create,
-                    Some(1.0),
-                    now,
-                );
-                if let Some(existing_playlist_id) = playlist_to_replace {
-                    if existing_playlist_id != created.playlist_id {
-                        if let Err(error) = self.client.delete_playlist(&existing_playlist_id).await
-                        {
-                            summary.warnings.push(youtube_music_cleanup_warning(
-                                &playlist.name,
-                                &existing_playlist_id,
-                                &created.playlist_id,
-                                &error.to_string(),
-                            ));
+                    Err(error) => {
+                        // Record the failure on the playlist and every resolved
+                        // entry, then continue with the next playlist unless the
+                        // failure is fatal or the circuit breaker trips.
+                        let message = format!(
+                            "Failed to sync YouTube Music playlist '{}': {error}",
+                            playlist.name
+                        );
+                        state.set_playlist_status(
+                            &playlist.playlist_id,
+                            ProviderKind::YoutubeMusic,
+                            SyncStatusRecord::error(message.clone(), now),
+                        );
+                        for (entry_id, _track_id, _provider_id, _confidence) in &matched_entries {
+                            state.set_playlist_entry_status(
+                                &playlist.playlist_id,
+                                entry_id,
+                                ProviderKind::YoutubeMusic,
+                                SyncStatusRecord::error(message.clone(), now),
+                            );
                         }
+                        consecutive_failures += 1;
+                        if push_should_abort(&error, consecutive_failures) {
+                            return Err(abort_push_error(error, consecutive_failures));
+                        }
+                        None
                     }
                 }
-
-                state.set_playlist_status(
-                    &playlist.playlist_id,
-                    ProviderKind::YoutubeMusic,
-                    SyncStatusRecord::synced(
-                        Some(created.playlist_id),
-                        Some(1.0),
-                        Some("Synced to YouTube Music".to_string()),
-                        now,
-                    ),
-                );
             } else {
                 state.set_playlist_status(
                     &playlist.playlist_id,
@@ -803,25 +1088,42 @@ impl StreamingProvider for YoutubeMusicProvider {
                         now,
                     ),
                 );
-            }
+                Some("Resolved for YouTube Music sync dry run")
+            };
 
-            for (entry_id, provider_id, confidence) in matched_entries {
-                summary.playlist_entries_synced += 1;
-                state.set_playlist_entry_status(
-                    &playlist.playlist_id,
-                    &entry_id,
-                    ProviderKind::YoutubeMusic,
-                    SyncStatusRecord::synced(
-                        Some(provider_id),
+            if let Some(entry_message) = synced_entry_message {
+                for (entry_id, track_id, provider_id, confidence) in matched_entries {
+                    state.upsert_track_link(
+                        &track_id,
+                        ProviderKind::YoutubeMusic,
+                        provider_id.clone(),
+                        LinkSource::Match,
                         Some(confidence),
-                        Some(if force {
-                            "Synced to YouTube Music".to_string()
-                        } else {
-                            "Resolved for YouTube Music sync dry run".to_string()
-                        }),
                         now,
-                    ),
-                );
+                    );
+                    state.set_track_status(
+                        &track_id,
+                        ProviderKind::YoutubeMusic,
+                        SyncStatusRecord::synced(
+                            Some(provider_id.clone()),
+                            Some(confidence),
+                            Some("Resolved on YouTube Music".to_string()),
+                            now,
+                        ),
+                    );
+                    summary.playlist_entries_synced += 1;
+                    state.set_playlist_entry_status(
+                        &playlist.playlist_id,
+                        &entry_id,
+                        ProviderKind::YoutubeMusic,
+                        SyncStatusRecord::synced(
+                            Some(provider_id),
+                            Some(confidence),
+                            Some(entry_message.to_string()),
+                            now,
+                        ),
+                    );
+                }
             }
             emit_progress(
                 progress.as_ref(),
@@ -852,19 +1154,25 @@ impl StreamingProvider for YoutubeMusicProvider {
 
     async fn remove_saved_track(&self, provider_track_id: &str) -> Result<()> {
         self.verify_connection().await?;
-        self.client
-            .unlike_song(provider_track_id)
-            .await
-            .map_err(ytmusic_client_error)?;
+        retry_ytm_operation(|| async {
+            self.client
+                .unlike_song(provider_track_id)
+                .await
+                .map_err(ytmusic_client_error)
+        })
+        .await?;
         Ok(())
     }
 
     async fn delete_playlist(&self, provider_playlist_id: &str) -> Result<()> {
         self.verify_connection().await?;
-        self.client
-            .delete_playlist(provider_playlist_id)
-            .await
-            .map_err(ytmusic_client_error)?;
+        retry_ytm_operation(|| async {
+            self.client
+                .delete_playlist(provider_playlist_id)
+                .await
+                .map_err(ytmusic_client_error)
+        })
+        .await?;
         Ok(())
     }
 }
@@ -1262,13 +1570,42 @@ fn parse_ytmusic_retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashSet, VecDeque};
+    use std::time::Duration;
 
     use serde_json::json;
 
     use super::{
-        collect_continuation_tokens, collect_library_playlists, contains_key_recursive,
-        youtube_music_cleanup_warning, UNSUPPORTED_LIBRARY_RESET_MESSAGE,
+        abort_push_error, apply_jitter, collect_continuation_tokens, collect_library_playlists,
+        contains_key_recursive, dropped_tracks_warning, is_unrecoverable_failure,
+        push_should_abort, youtube_music_cleanup_warning, ytm_backoff, ytm_retry_delay,
+        DroppedTrackTally, MAX_DROPPED_TRACK_SAMPLE, PUSH_FAILURE_CIRCUIT_BREAKER,
+        UNSUPPORTED_LIBRARY_RESET_MESSAGE, YTM_RETRY_MAX_BACKOFF,
     };
+    use crate::error::{provider_failure, ProviderError, ProviderFailure};
+
+    fn anyhow_error(provider_error: ProviderError) -> anyhow::Error {
+        anyhow::Error::new(provider_error)
+    }
+
+    fn dropped_track(title: Option<&str>, artists: &[&str]) -> ytmusicapi::PlaylistTrack {
+        serde_json::from_value(json!({
+            "video_id": null,
+            "title": title,
+            "artists": artists
+                .iter()
+                .map(|name| json!({ "name": name, "id": null }))
+                .collect::<Vec<_>>(),
+            "album": null,
+            "duration": null,
+            "duration_seconds": null,
+            "thumbnails": [],
+            "is_available": false,
+            "is_explicit": false,
+            "set_video_id": null,
+            "video_type": null,
+        }))
+        .expect("valid PlaylistTrack fixture")
+    }
 
     #[test]
     fn detects_youtube_music_sign_in_prompt_hidden_in_success_response() {
@@ -1359,5 +1696,200 @@ mod tests {
         assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("does not support"));
         assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("Normal pull, push"));
         assert!(UNSUPPORTED_LIBRARY_RESET_MESSAGE.contains("targeted canonical deletes"));
+    }
+
+    #[test]
+    fn dropped_tracks_warning_lists_every_sample_when_under_cap() {
+        let warning = dropped_tracks_warning(
+            2,
+            &["Joe Rogan - Episode".to_string(), "Serial - S1".to_string()],
+        );
+        assert!(warning.contains("Skipped 2 YouTube Music tracks"));
+        assert!(warning.contains("Joe Rogan - Episode"));
+        assert!(warning.contains("Serial - S1"));
+        assert!(!warning.contains("and "));
+    }
+
+    #[test]
+    fn dropped_tracks_warning_collapses_remainder_into_and_n_more() {
+        let sample = (0..MAX_DROPPED_TRACK_SAMPLE)
+            .map(|index| format!("Title {index}"))
+            .collect::<Vec<_>>();
+        let warning = dropped_tracks_warning(25, &sample);
+        assert!(warning.contains("Skipped 25 YouTube Music tracks"));
+        assert!(warning.contains("Title 0"));
+        assert!(warning.contains(&format!("and {} more", 25 - MAX_DROPPED_TRACK_SAMPLE)));
+    }
+
+    #[test]
+    fn dropped_tracks_warning_is_singular_for_one_track() {
+        let warning = dropped_tracks_warning(1, &["Solo - Track".to_string()]);
+        assert!(warning.contains("Skipped 1 YouTube Music track "));
+    }
+
+    #[test]
+    fn dropped_tally_counts_all_but_samples_only_up_to_cap() {
+        let mut tally = DroppedTrackTally::default();
+        assert!(DroppedTrackTally::default().into_warning().is_none());
+
+        for index in 0..(MAX_DROPPED_TRACK_SAMPLE + 5) {
+            tally.record(&dropped_track(Some(&format!("Title {index}")), &["Artist"]));
+        }
+        assert_eq!(tally.total, MAX_DROPPED_TRACK_SAMPLE + 5);
+        assert_eq!(tally.sample.len(), MAX_DROPPED_TRACK_SAMPLE);
+
+        let warning = tally.into_warning().expect("warning for recorded drops");
+        assert!(warning.contains(&format!("Skipped {} ", MAX_DROPPED_TRACK_SAMPLE + 5)));
+        assert!(warning.contains("Artist - Title 0"));
+        assert!(warning.contains("and 5 more"));
+    }
+
+    #[test]
+    fn describe_dropped_track_falls_back_when_metadata_missing() {
+        let mut tally = DroppedTrackTally::default();
+        tally.record(&dropped_track(None, &[]));
+        assert_eq!(tally.sample[0], "Unknown title");
+    }
+
+    #[test]
+    fn unrecoverable_failures_are_rate_limit_and_auth_only() {
+        assert!(is_unrecoverable_failure(&anyhow_error(
+            ProviderError::rate_limited("slow", None)
+        )));
+        assert!(is_unrecoverable_failure(&anyhow_error(
+            ProviderError::auth_failed("expired")
+        )));
+
+        assert!(!is_unrecoverable_failure(&anyhow_error(
+            ProviderError::network("timeout")
+        )));
+        assert!(!is_unrecoverable_failure(&anyhow_error(
+            ProviderError::blocked("automated queries")
+        )));
+        assert!(!is_unrecoverable_failure(&anyhow_error(
+            ProviderError::invalid_argument("bad")
+        )));
+        assert!(!is_unrecoverable_failure(&anyhow_error(
+            ProviderError::http("teapot", 418)
+        )));
+        assert!(!is_unrecoverable_failure(&anyhow::anyhow!("plain")));
+    }
+
+    #[test]
+    fn circuit_breaker_aborts_immediately_on_unrecoverable_failures() {
+        // Rate-limit and auth abort at the very first failure, ignoring count.
+        assert!(push_should_abort(
+            &anyhow_error(ProviderError::rate_limited("slow", None)),
+            1
+        ));
+        assert!(push_should_abort(
+            &anyhow_error(ProviderError::auth_failed("expired")),
+            1
+        ));
+    }
+
+    #[test]
+    fn circuit_breaker_tolerates_transient_failures_until_threshold() {
+        let transient = anyhow_error(ProviderError::network("blip"));
+        for count in 1..PUSH_FAILURE_CIRCUIT_BREAKER {
+            assert!(
+                !push_should_abort(&transient, count),
+                "should tolerate transient failure {count}"
+            );
+        }
+        assert!(push_should_abort(&transient, PUSH_FAILURE_CIRCUIT_BREAKER));
+
+        // An unclassified error also trips the breaker at the threshold.
+        let plain = anyhow::anyhow!("mystery");
+        assert!(!push_should_abort(&plain, PUSH_FAILURE_CIRCUIT_BREAKER - 1));
+        assert!(push_should_abort(&plain, PUSH_FAILURE_CIRCUIT_BREAKER));
+    }
+
+    #[test]
+    fn abort_push_error_annotates_only_circuit_breaker_aborts() {
+        // Circuit-breaker abort gains context but keeps the typed failure
+        // recoverable for downstream policy.
+        let annotated = abort_push_error(anyhow_error(ProviderError::network("blip")), 5);
+        assert!(annotated
+            .to_string()
+            .contains("5 consecutive item failures"));
+        assert!(matches!(
+            provider_failure(&annotated).map(ProviderError::failure),
+            Some(ProviderFailure::Network)
+        ));
+
+        // Unrecoverable abort is returned verbatim (no circuit-breaker context).
+        let verbatim = abort_push_error(anyhow_error(ProviderError::rate_limited("slow", None)), 1);
+        assert!(!verbatim.to_string().contains("consecutive item failures"));
+        assert!(matches!(
+            provider_failure(&verbatim).map(ProviderError::failure),
+            Some(ProviderFailure::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn retry_delay_only_covers_rate_limit_and_network() {
+        // Rate limit honors a capped Retry-After.
+        assert_eq!(
+            ytm_retry_delay(
+                &anyhow_error(ProviderError::rate_limited(
+                    "slow",
+                    Some(Duration::from_secs(7))
+                )),
+                1,
+            ),
+            Some(Duration::from_secs(7))
+        );
+        // Retry-After above the ceiling is clamped.
+        assert_eq!(
+            ytm_retry_delay(
+                &anyhow_error(ProviderError::rate_limited(
+                    "slow",
+                    Some(Duration::from_secs(10_000))
+                )),
+                1,
+            ),
+            Some(YTM_RETRY_MAX_BACKOFF)
+        );
+        // Rate limit without Retry-After, and network, fall back to backoff.
+        assert_eq!(
+            ytm_retry_delay(&anyhow_error(ProviderError::rate_limited("slow", None)), 2),
+            Some(ytm_backoff(2))
+        );
+        assert_eq!(
+            ytm_retry_delay(&anyhow_error(ProviderError::network("blip")), 3),
+            Some(ytm_backoff(3))
+        );
+
+        // Everything else is non-retryable.
+        for non_retryable in [
+            ProviderError::auth_failed("expired"),
+            ProviderError::invalid_argument("bad"),
+            ProviderError::blocked("automated queries"),
+            ProviderError::http("teapot", 418),
+        ] {
+            assert_eq!(ytm_retry_delay(&anyhow_error(non_retryable), 1), None);
+        }
+        assert_eq!(ytm_retry_delay(&anyhow::anyhow!("plain"), 1), None);
+    }
+
+    #[test]
+    fn backoff_is_exponential_and_capped() {
+        assert_eq!(ytm_backoff(1), Duration::from_secs(1));
+        assert_eq!(ytm_backoff(2), Duration::from_secs(2));
+        assert_eq!(ytm_backoff(3), Duration::from_secs(4));
+        assert_eq!(ytm_backoff(4), Duration::from_secs(8));
+        assert!(ytm_backoff(100) <= YTM_RETRY_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn jitter_stays_within_bounds() {
+        let base = Duration::from_secs(4);
+        for _ in 0..256 {
+            let jittered = apply_jitter(base);
+            assert!(jittered >= base, "jitter must not shorten the delay");
+            assert!(jittered <= base.mul_f64(1.5));
+            assert!(jittered <= YTM_RETRY_MAX_BACKOFF);
+        }
     }
 }
