@@ -39,7 +39,14 @@ use providers::spotify_callback;
 
 pub(crate) const PAGE_SIZE: usize = 50;
 
-pub(crate) struct AppContext {
+/// Shared application state passed to every handler.
+///
+/// The struct is `pub` (with `#[doc(hidden)]`) only so the test-support seam
+/// [`build_api_router`]/[`test_context`] can name it across the integration-test
+/// crate boundary; all fields stay `pub(crate)`, so it remains opaque and
+/// non-constructible outside this crate.
+#[doc(hidden)]
+pub struct AppContext {
     pub(crate) http_client: reqwest::Client,
     pub(crate) spotify_redirect_uri: String,
     pub(crate) pending_spotify_auth: Mutex<HashMap<String, PendingSpotifyAuth>>,
@@ -216,6 +223,28 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         println!("Open this URL manually in your browser: {ui_url}");
     }
 
+    let app = Router::new()
+        .route("/", get(root_redirect))
+        .route("/app", get(app_redirect))
+        .route("/app/", get(frontend_index))
+        .route("/app/*path", get(frontend_asset))
+        .route("/auth/spotify/callback", get(spotify_callback))
+        .nest_service("/api", build_api_router(Arc::clone(&shared)))
+        .with_state(shared);
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Assembles the `/api` router: every API route plus the [`cross_origin_guard`]
+/// layer, with `context` applied as state so the returned router is
+/// self-contained. [`serve`] mounts it under `/api` via `nest_service`; the
+/// HTTP-level integration tests drive the same router directly with
+/// `tower`'s `oneshot`, which is why this (and the `AppContext`/`test_context`
+/// seam) is exposed rather than kept private. It is `#[doc(hidden)]` and carries
+/// no stability guarantee — it is not part of the crate's supported API.
+#[doc(hidden)]
+pub fn build_api_router(context: Arc<AppContext>) -> Router {
     let api = Router::new()
         .route("/health", get(api_health))
         .route("/overview", get(api_overview))
@@ -309,17 +338,37 @@ pub async fn serve(port: u16, open_browser: bool) -> Result<()> {
         .route("/backups/restore", post(api_restore_backup))
         .layer(middleware::from_fn(cross_origin_guard));
 
-    let app = Router::new()
-        .route("/", get(root_redirect))
-        .route("/app", get(app_redirect))
-        .route("/app/", get(frontend_index))
-        .route("/app/*path", get(frontend_asset))
-        .route("/auth/spotify/callback", get(spotify_callback))
-        .nest("/api", api)
-        .with_state(shared);
+    api.with_state(context)
+}
 
-    axum::serve(listener, app).await?;
-    Ok(())
+/// Builds an [`AppContext`] whose canonical state is loaded from `root` (via the
+/// storage `_in(root)` seam), with a real HTTP client and empty
+/// operations/pending-auth/artwork caches at version 0. This is the seam the
+/// HTTP-level integration tests use to point the router at an isolated temp data
+/// root. Like [`build_api_router`], it is `#[doc(hidden)]` test-support surface
+/// with no stability guarantee.
+///
+/// Handlers that reach the storage layer directly (health, backups, and the
+/// write-through persist path) resolve their root from `SPOTI_DUMP_DATA_DIR`
+/// rather than from this context, so a test that exercises those must also set
+/// that variable to `root`.
+#[doc(hidden)]
+pub async fn test_context(root: &std::path::Path) -> Arc<AppContext> {
+    let library =
+        storage::read_library_state_in(root, true).expect("load test library state from root");
+    Arc::new(AppContext {
+        http_client: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build test HTTP client"),
+        spotify_redirect_uri: "http://127.0.0.1:7878/auth/spotify/callback".to_string(),
+        pending_spotify_auth: Mutex::new(HashMap::new()),
+        operations: StdMutex::new(HashMap::new()),
+        library: RwLock::new(library),
+        library_version: AtomicU64::new(0),
+        artwork_semaphore: Arc::new(Semaphore::new(1)),
+        artwork_negative_cache: StdMutex::new(HashMap::new()),
+    })
 }
 
 /// Frontend assets, embedded into the executable at compile time from

@@ -1885,6 +1885,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "tokio",
+ "tower 0.5.3",
  "url",
  "uuid",
  "ytmusicapi",

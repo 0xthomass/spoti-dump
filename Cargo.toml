@@ -29,3 +29,7 @@ ytmusicapi = "0.4.2"
 
 [dev-dependencies]
 tempfile = "3.23.0"
+# `ServiceExt::oneshot` drives the axum `Router` in the HTTP-level integration
+# tests without binding a TCP port. Response bodies are read with
+# `axum::body::to_bytes`, so no extra body-util dependency is needed.
+tower = { version = "0.5", features = ["util"] }
