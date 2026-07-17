@@ -19,7 +19,7 @@ use spoti_dump::storage::{
     read_library_state_in, read_provider_cooldown_in, read_provider_health_in,
     read_ui_operation_json_in, restore_library_backup_in, runtime_database_path_in,
     save_provider_cooldown_in, save_provider_health_in, save_ui_operation_json_in,
-    write_library_state_in,
+    write_library_state_in, LibraryDb,
 };
 
 #[test]
@@ -932,6 +932,73 @@ fn writing_existing_database_creates_point_in_time_backup() {
         .unwrap();
     assert_eq!(backups.len(), 1);
     assert!(backups[0].path().metadata().unwrap().len() > 0);
+}
+
+fn count_automatic_backups(root: &std::path::Path) -> usize {
+    let backup_dir = root.join("dump").join("backups");
+    fs::read_dir(&backup_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn library_handle_runs_in_wal_and_skips_unchanged_saves() {
+    let temp = tempdir().unwrap();
+    // A single handle is opened once and reused across saves; the process-wide
+    // path shares one such handle for the whole run.
+    let handle = LibraryDb::open(temp.path()).unwrap();
+
+    handle.save(&LibraryState::new()).unwrap();
+
+    // The connection opened the database in WAL journal mode, and the setting is
+    // persisted so a fresh connection also reports it.
+    let journal_mode: String = Connection::open(database_path_in(temp.path()))
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(journal_mode.to_lowercase(), "wal");
+
+    // Persist real content, then repeat the identical save on the same handle.
+    let mut populated = LibraryState::new();
+    populated.tracks.push(track_entity("track-1", "One"));
+    handle.save(&populated).unwrap();
+    let after_change = count_automatic_backups(temp.path());
+    assert_eq!(after_change, 1);
+
+    // The second, byte-identical save reuses the handle's recorded fingerprint
+    // and must skip both the write and the pre-write snapshot.
+    handle.save(&populated).unwrap();
+    assert_eq!(count_automatic_backups(temp.path()), after_change);
+}
+
+#[test]
+fn saves_are_change_guarded() {
+    let temp = tempdir().unwrap();
+    let handle = LibraryDb::open(temp.path()).unwrap();
+
+    let mut state = LibraryState::new();
+    state.tracks.push(track_entity("track-1", "One"));
+
+    // First write creates the database, so there is nothing to snapshot yet.
+    handle.save(&state).unwrap();
+    assert_eq!(count_automatic_backups(temp.path()), 0);
+
+    // Saving identical content is a no-op: still no backup.
+    handle.save(&state).unwrap();
+    assert_eq!(count_automatic_backups(temp.path()), 0);
+
+    // Mutating the state makes the next save fire a pre-write snapshot.
+    state.tracks.push(track_entity("track-2", "Two"));
+    handle.save(&state).unwrap();
+    assert_eq!(count_automatic_backups(temp.path()), 1);
+
+    // A subsequent identical save is skipped again; the backup count holds.
+    handle.save(&state).unwrap();
+    assert_eq!(count_automatic_backups(temp.path()), 1);
+
+    // The mutation is durable despite the skipped saves in between.
+    let reloaded = read_library_state_in(temp.path(), false).unwrap();
+    assert_eq!(reloaded.tracks.len(), 2);
 }
 
 #[test]
