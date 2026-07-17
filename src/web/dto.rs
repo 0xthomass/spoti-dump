@@ -471,7 +471,7 @@ pub(crate) struct BulkMergeIdentityConflictsResponse {
     pub(crate) resolved_provider_conflicts: usize,
     pub(crate) conflict_resolution: String,
     pub(crate) conflict_resolution_label: String,
-    pub(crate) pre_merge_backup_path: String,
+    pub(crate) pre_merge_backup_path: Option<String>,
     pub(crate) merged_examples: Vec<BulkMergedIdentityConflictDto>,
     pub(crate) warnings: Vec<String>,
 }

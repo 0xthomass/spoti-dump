@@ -105,10 +105,18 @@ pub(crate) async fn api_identity_conflicts_bulk_merge(
         .unwrap_or(BULK_IDENTITY_CONFLICT_MERGE_LIMIT)
         .min(BULK_IDENTITY_CONFLICT_MERGE_LIMIT);
     let resolution = track_merge_conflict_resolution(request.conflict_resolution);
-    let backup = tokio::task::spawn_blocking(storage::create_manual_library_backup)
-        .await
-        .context("Failed to join pre-merge backup task")?
-        .map_err(ApiError::from)?;
+    // Only snapshot when there is something to merge; an empty plan must not
+    // accumulate no-op backups in the manual-backups directory.
+    let backup = if eligible_count > 0 {
+        Some(
+            tokio::task::spawn_blocking(storage::create_manual_library_backup)
+                .await
+                .context("Failed to join pre-merge backup task")?
+                .map_err(ApiError::from)?,
+        )
+    } else {
+        None
+    };
 
     let mut merged_examples = Vec::new();
     let mut merged_count = 0_usize;
@@ -184,7 +192,7 @@ pub(crate) async fn api_identity_conflicts_bulk_merge(
         conflict_resolution: merge_conflict_resolution_key(request.conflict_resolution).to_string(),
         conflict_resolution_label: merge_conflict_resolution_label(request.conflict_resolution)
             .to_string(),
-        pre_merge_backup_path: backup.path.display().to_string(),
+        pre_merge_backup_path: backup.map(|backup| backup.path.display().to_string()),
         merged_examples,
         warnings,
     }))

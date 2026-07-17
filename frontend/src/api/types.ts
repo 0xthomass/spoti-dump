@@ -353,7 +353,7 @@ export type BulkMergeIdentityConflictsResponse = {
   resolved_provider_conflicts: number
   conflict_resolution: string
   conflict_resolution_label: string
-  pre_merge_backup_path: string
+  pre_merge_backup_path: string | null
   merged_examples: {
     source_track_id: string
     target_track_id: string

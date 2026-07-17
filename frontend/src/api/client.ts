@@ -45,11 +45,13 @@ export function actionMessage(payload: ActionResponse) {
 }
 
 export function bulkMergeMessage(payload: BulkMergeIdentityConflictsResponse) {
-  const lines = [
-    payload.message,
-    `Manual backup: ${payload.pre_merge_backup_path}`,
+  const lines = [payload.message]
+  if (payload.pre_merge_backup_path) {
+    lines.push(`Manual backup: ${payload.pre_merge_backup_path}`)
+  }
+  lines.push(
     `Resolved provider ID conflicts: ${formatNumber(payload.resolved_provider_conflicts)}`,
-  ]
+  )
   if (payload.skipped_count > 0) {
     lines.push(`Skipped stale or capped rows: ${formatNumber(payload.skipped_count)}`)
   }
