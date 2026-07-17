@@ -30,7 +30,10 @@ export function SpotifyConnectModal({
       )
       window.location.assign(payload.authorization_url)
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Spotify connection failed.')
+      notify(
+        error instanceof Error ? error.message : 'Spotify connection failed.',
+        { tone: 'error' },
+      )
       setSubmitting(false)
     }
   }

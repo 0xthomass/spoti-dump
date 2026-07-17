@@ -129,7 +129,9 @@ export function IdentityConflictsPage() {
       notify(payload.message)
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Merge failed.')
+      notify(error instanceof Error ? error.message : 'Merge failed.', {
+        tone: 'error',
+      })
     } finally {
       setMergingConflict(null)
     }
@@ -165,7 +167,9 @@ export function IdentityConflictsPage() {
       notify(actionMessage(payload))
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Reject failed.')
+      notify(error instanceof Error ? error.message : 'Reject failed.', {
+        tone: 'error',
+      })
     } finally {
       setRejectingConflict(null)
     }
@@ -212,7 +216,9 @@ export function IdentityConflictsPage() {
       notify(bulkMergeMessage(payload))
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Bulk merge failed.')
+      notify(error instanceof Error ? error.message : 'Bulk merge failed.', {
+        tone: 'error',
+      })
     } finally {
       setRunningBulkMerge(null)
     }
@@ -333,6 +339,7 @@ export function IdentityConflictsPage() {
           <ErrorState
             message={resource.error ?? 'Failed to load identity conflicts.'}
             compact
+            onRetry={resource.refetch}
           />
         ) : resource.data.items.length === 0 ? (
           <EmptyState

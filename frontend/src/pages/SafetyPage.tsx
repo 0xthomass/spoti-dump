@@ -34,7 +34,9 @@ export function SafetyPage() {
       notify(payload.message)
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Backup failed.')
+      notify(error instanceof Error ? error.message : 'Backup failed.', {
+        tone: 'error',
+      })
     } finally {
       setCreating(false)
     }
@@ -65,7 +67,9 @@ export function SafetyPage() {
       notify(payload.message)
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Restore failed.')
+      notify(error instanceof Error ? error.message : 'Restore failed.', {
+        tone: 'error',
+      })
     } finally {
       setRestoring(null)
     }
@@ -91,6 +95,10 @@ export function SafetyPage() {
           healthResource.error ??
           'Failed to load safety data.'
         }
+        onRetry={() => {
+          backupsResource.refetch()
+          healthResource.refetch()
+        }}
       />
     )
   }

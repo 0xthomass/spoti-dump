@@ -1,4 +1,8 @@
-import type { OperationKind, ProviderConnectionState } from '../api/types'
+import type {
+  OperationKind,
+  OperationSnapshot,
+  ProviderConnectionState,
+} from '../api/types'
 
 export function parsePage(raw: string | null) {
   if (!raw) {
@@ -264,4 +268,12 @@ export function operationTitle(kind: OperationKind) {
     case 'identity_all':
       return 'Resolving library identities'
   }
+}
+
+export function operationDisplayTitle(
+  operation: Pick<OperationSnapshot, 'kind' | 'provider_name'>,
+) {
+  return operation.kind === 'identity_all'
+    ? operationTitle(operation.kind)
+    : `${operationTitle(operation.kind)} ${operation.provider_name}`
 }

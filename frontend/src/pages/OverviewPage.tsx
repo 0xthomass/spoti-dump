@@ -113,7 +113,9 @@ export function OverviewPage() {
         openOperation(payload.operation_id)
       }
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Provider action failed.')
+      notify(error instanceof Error ? error.message : 'Provider action failed.', {
+        tone: 'error',
+      })
     } finally {
       if (action === 'disconnect') {
         setPendingAction(null)
@@ -145,7 +147,9 @@ export function OverviewPage() {
       })
       openOperation(payload.operation_id)
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Identity sync failed.')
+      notify(error instanceof Error ? error.message : 'Identity sync failed.', {
+        tone: 'error',
+      })
     } finally {
       setPendingAction(null)
     }
@@ -159,7 +163,9 @@ export function OverviewPage() {
       )
       setPushPlans((current) => ({ ...current, [provider.key]: payload }))
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Failed to load push plan.')
+      notify(error instanceof Error ? error.message : 'Failed to load push plan.', {
+        tone: 'error',
+      })
     } finally {
       setLoadingPushPlan(null)
     }
@@ -184,6 +190,10 @@ export function OverviewPage() {
           providersResource.error ??
           'Failed to load overview.'
         }
+        onRetry={() => {
+          overviewResource.refetch()
+          providersResource.refetch()
+        }}
       />
     )
   }

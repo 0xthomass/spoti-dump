@@ -24,8 +24,14 @@ export async function apiRequest<T>(path: string, init?: RequestInit): Promise<T
     const message =
       payload && typeof payload.error === 'string'
         ? payload.error
-        : `Request failed with status ${response.status}`
+        : `Request failed (${response.status})`
     throw new Error(message)
+  }
+
+  // A 2xx response whose body was not parseable JSON must not be handed back
+  // as a null "T" — callers rely on a typed payload. Fail loud instead.
+  if (payload === null) {
+    throw new Error(`Response was not valid JSON (${response.status})`)
   }
 
   return payload as T

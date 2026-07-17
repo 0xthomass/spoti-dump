@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { ActionResponse, PlaylistSummary } from '../../api/types'
 import { actionMessage, apiRequest } from '../../api/client'
-import { useRuntime } from '../../context/runtime'
+import { useConfirm, useRuntime } from '../../context/runtime'
 import { ModalFrame } from './ModalFrame'
 
 export function PlaylistEditorModal({
@@ -12,9 +12,29 @@ export function PlaylistEditorModal({
   onClose: () => void
 }) {
   const { notify, refresh } = useRuntime()
+  const confirm = useConfirm()
   const [name, setName] = useState(playlist.name)
   const [description, setDescription] = useState(playlist.description ?? '')
   const [saving, setSaving] = useState(false)
+
+  const dirty =
+    name !== playlist.name || description !== (playlist.description ?? '')
+
+  async function requestClose() {
+    if (dirty) {
+      const discard = await confirm({
+        title: 'Discard unsaved changes?',
+        message: 'You have edited this playlist but not saved those changes yet.',
+        details: 'Closing now will lose the edits. This does not touch providers.',
+        confirmLabel: 'Discard changes',
+        tone: 'danger',
+      })
+      if (!discard) {
+        return
+      }
+    }
+    onClose()
+  }
 
   async function save() {
     setSaving(true)
@@ -33,14 +53,16 @@ export function PlaylistEditorModal({
       refresh()
       onClose()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Save failed.')
+      notify(error instanceof Error ? error.message : 'Save failed.', {
+        tone: 'error',
+      })
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <ModalFrame title="Edit Playlist" onClose={onClose}>
+    <ModalFrame title="Edit Playlist" onClose={() => void requestClose()}>
       <div className="modal-stack">
         <label className="field">
           <span>Name</span>

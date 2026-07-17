@@ -88,7 +88,9 @@ export function PlaylistsPage() {
       notify(actionMessage(payload))
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Delete failed.')
+      notify(error instanceof Error ? error.message : 'Delete failed.', {
+        tone: 'error',
+      })
     }
   }
 
@@ -113,7 +115,9 @@ export function PlaylistsPage() {
       refresh()
       startTransition(() => navigate('/playlists'))
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Delete failed.')
+      notify(error instanceof Error ? error.message : 'Delete failed.', {
+        tone: 'error',
+      })
     }
   }
 
@@ -164,6 +168,7 @@ export function PlaylistsPage() {
               <ErrorState
                 message={listResource.error ?? 'Failed to load playlists.'}
                 compact
+                onRetry={listResource.refetch}
               />
             ) : listResource.data.items.length === 0 ? (
               <EmptyState
@@ -230,6 +235,7 @@ export function PlaylistsPage() {
                   ? detailResource.error ?? 'Failed to load playlist.'
                   : 'Choose a playlist from the left rail.'
               }
+              onRetry={activePlaylistId ? detailResource.refetch : undefined}
             />
           ) : (
             <>

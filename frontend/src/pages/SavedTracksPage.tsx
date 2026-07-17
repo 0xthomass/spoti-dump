@@ -53,7 +53,9 @@ export function SavedTracksPage() {
       notify(actionMessage(payload))
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Delete failed.')
+      notify(error instanceof Error ? error.message : 'Delete failed.', {
+        tone: 'error',
+      })
     }
   }
 
@@ -104,7 +106,11 @@ export function SavedTracksPage() {
         {resource.loading && !resource.data ? (
           <LoadingState label="Loading saved tracks" compact />
         ) : resource.error || !resource.data ? (
-          <ErrorState message={resource.error ?? 'Failed to load saved tracks.'} compact />
+          <ErrorState
+            message={resource.error ?? 'Failed to load saved tracks.'}
+            compact
+            onRetry={resource.refetch}
+          />
         ) : resource.data.items.length === 0 ? (
           <EmptyState
             title="Nothing matched"

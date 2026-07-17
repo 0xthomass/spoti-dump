@@ -31,6 +31,7 @@ export function YoutubeMusicConnectModal({ onClose }: { onClose: () => void }) {
     } catch (error) {
       notify(
         error instanceof Error ? error.message : 'YouTube Music connection failed.',
+        { tone: 'error' },
       )
     } finally {
       setSubmitting(false)

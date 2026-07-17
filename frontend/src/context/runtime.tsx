@@ -1,9 +1,21 @@
 import { createContext, useContext } from 'react'
 
+export type NoticeTone = 'success' | 'error' | 'info'
+
+export type NotifyOptions = {
+  tone?: NoticeTone
+}
+
+export type Notice = {
+  id: number
+  message: string
+  tone: NoticeTone
+}
+
 export type Runtime = {
   revision: number
   refresh: () => void
-  notify: (message: string) => void
+  notify: (message: string, options?: NotifyOptions) => void
   openOperation: (operationId: string) => void
 }
 

@@ -111,7 +111,11 @@ export function IdentityGapsPage() {
         {resource.loading && !resource.data ? (
           <LoadingState label="Loading provider ID gaps" compact />
         ) : resource.error || !resource.data ? (
-          <ErrorState message={resource.error ?? 'Failed to load ID gaps.'} compact />
+          <ErrorState
+            message={resource.error ?? 'Failed to load ID gaps.'}
+            compact
+            onRetry={resource.refetch}
+          />
         ) : resource.data.items.length === 0 ? (
           <EmptyState
             title="No ID gaps matched"

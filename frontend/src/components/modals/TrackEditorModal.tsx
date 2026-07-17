@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   ActionResponse,
   ApplyIdentityResponse,
@@ -17,6 +17,14 @@ import { LoadingState } from '../LoadingState'
 import { ProviderChipRow } from '../ProviderChipRow'
 import { ModalFrame } from './ModalFrame'
 
+type EditorSnapshot = {
+  title: string
+  artists: string[]
+  album: string
+  duration: string
+  isrc: string
+}
+
 export function TrackEditorModal({
   trackId,
   onClose,
@@ -28,7 +36,7 @@ export function TrackEditorModal({
   const confirm = useConfirm()
   const resource = useApiQuery<TrackDetail>(`/tracks/${trackId}`, revision)
   const [title, setTitle] = useState('')
-  const [artists, setArtists] = useState('')
+  const [artists, setArtists] = useState<string[]>([])
   const [album, setAlbum] = useState('')
   const [duration, setDuration] = useState('')
   const [isrc, setIsrc] = useState('')
@@ -39,18 +47,78 @@ export function TrackEditorModal({
   const [mergingConflict, setMergingConflict] = useState<string | null>(null)
   const [rejectingConflict, setRejectingConflict] = useState<string | null>(null)
 
+  // Track which entity the form was seeded from. Re-seeding only happens when a
+  // genuinely different track loads — a background refetch of the same track
+  // (revision bump) must not clobber in-progress edits.
+  const loadedTrackIdRef = useRef<string | null>(null)
+  const initialRef = useRef<EditorSnapshot>({
+    title: '',
+    artists: [],
+    album: '',
+    duration: '',
+    isrc: '',
+  })
+
   useEffect(() => {
-    if (!resource.data) {
+    const data = resource.data
+    if (!data || loadedTrackIdRef.current === data.track_id) {
       return
     }
-    setTitle(resource.data.title)
-    setArtists(resource.data.artists.join('\n'))
-    setAlbum(resource.data.album ?? '')
-    setDuration(
-      resource.data.duration_seconds ? String(resource.data.duration_seconds) : '',
-    )
-    setIsrc(resource.data.isrc ?? '')
+    loadedTrackIdRef.current = data.track_id
+    const snapshot: EditorSnapshot = {
+      title: data.title,
+      artists: data.artists,
+      album: data.album ?? '',
+      duration: data.duration_seconds ? String(data.duration_seconds) : '',
+      isrc: data.isrc ?? '',
+    }
+    initialRef.current = snapshot
+    setTitle(snapshot.title)
+    setArtists(snapshot.artists)
+    setAlbum(snapshot.album)
+    setDuration(snapshot.duration)
+    setIsrc(snapshot.isrc)
   }, [resource.data])
+
+  const initial = initialRef.current
+  const dirty =
+    loadedTrackIdRef.current !== null &&
+    (title !== initial.title ||
+      album !== initial.album ||
+      duration !== initial.duration ||
+      isrc !== initial.isrc ||
+      artists.length !== initial.artists.length ||
+      artists.some((artist, index) => artist !== initial.artists[index]))
+
+  async function requestClose() {
+    if (dirty) {
+      const discard = await confirm({
+        title: 'Discard unsaved changes?',
+        message: 'You have edited this track but not saved those changes yet.',
+        details: 'Closing now will lose the edits. This does not touch providers.',
+        confirmLabel: 'Discard changes',
+        tone: 'danger',
+      })
+      if (!discard) {
+        return
+      }
+    }
+    onClose()
+  }
+
+  function updateArtist(index: number, value: string) {
+    setArtists((current) =>
+      current.map((artist, position) => (position === index ? value : artist)),
+    )
+  }
+
+  function addArtist() {
+    setArtists((current) => [...current, ''])
+  }
+
+  function removeArtist(index: number) {
+    setArtists((current) => current.filter((_, position) => position !== index))
+  }
 
   async function save() {
     if (!resource.data) {
@@ -63,7 +131,6 @@ export function TrackEditorModal({
         body: JSON.stringify({
           title,
           artists: artists
-            .split(/\n|,/)
             .map((artist) => artist.trim())
             .filter(Boolean),
           album: album || null,
@@ -75,7 +142,9 @@ export function TrackEditorModal({
       refresh()
       onClose()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Save failed.')
+      notify(error instanceof Error ? error.message : 'Save failed.', {
+        tone: 'error',
+      })
     } finally {
       setSaving(false)
     }
@@ -119,7 +188,9 @@ export function TrackEditorModal({
         onClose()
       }
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Identity link failed.')
+      notify(error instanceof Error ? error.message : 'Identity link failed.', {
+        tone: 'error',
+      })
     } finally {
       setLinkingIdentity(false)
     }
@@ -160,7 +231,9 @@ export function TrackEditorModal({
       refresh()
       onClose()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Merge failed.')
+      notify(error instanceof Error ? error.message : 'Merge failed.', {
+        tone: 'error',
+      })
     } finally {
       setMergingConflict(null)
     }
@@ -200,18 +273,24 @@ export function TrackEditorModal({
       notify(actionMessage(payload))
       refresh()
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Reject failed.')
+      notify(error instanceof Error ? error.message : 'Reject failed.', {
+        tone: 'error',
+      })
     } finally {
       setRejectingConflict(null)
     }
   }
 
   return (
-    <ModalFrame title="Edit Track" onClose={onClose}>
+    <ModalFrame title="Edit Track" onClose={() => void requestClose()}>
       {resource.loading && !resource.data ? (
         <LoadingState label="Loading track detail" compact />
       ) : resource.error || !resource.data ? (
-        <ErrorState message={resource.error ?? 'Track detail unavailable.'} compact />
+        <ErrorState
+          message={resource.error ?? 'Track detail unavailable.'}
+          compact
+          onRetry={resource.refetch}
+        />
       ) : (
         <div className="modal-stack">
           <div className="modal-track-head">
@@ -236,14 +315,37 @@ export function TrackEditorModal({
             <span>Title</span>
             <input onChange={(event) => setTitle(event.target.value)} value={title} />
           </label>
-          <label className="field">
+          <div className="field">
             <span>Artists</span>
-            <textarea
-              onChange={(event) => setArtists(event.target.value)}
-              rows={4}
-              value={artists}
-            />
-          </label>
+            <div className="artist-editor">
+              {artists.map((artist, index) => (
+                <div className="artist-row" key={index}>
+                  <input
+                    aria-label={`Artist ${index + 1}`}
+                    onChange={(event) => updateArtist(index, event.target.value)}
+                    value={artist}
+                  />
+                  <button
+                    aria-label={`Remove artist ${index + 1}`}
+                    className="btn btn--ghost btn--sm"
+                    onClick={() => removeArtist(index)}
+                    type="button"
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+              <div className="artist-editor-actions">
+                <button
+                  className="btn btn--ghost btn--sm"
+                  onClick={addArtist}
+                  type="button"
+                >
+                  Add artist
+                </button>
+              </div>
+            </div>
+          </div>
           <div className="field-grid">
             <label className="field">
               <span>Album</span>

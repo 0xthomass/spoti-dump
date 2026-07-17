@@ -1,142 +1,98 @@
-import { useEffect, useRef, useState } from 'react'
-import type { OperationSnapshot } from '../../api/types'
-import { actionMessage, apiRequest } from '../../api/client'
-import { useRuntime } from '../../context/runtime'
-import { operationTitle } from '../../lib/format'
+import type { TrackedOperation } from '../../hooks/useOperationTracker'
+import { operationDisplayTitle } from '../../lib/format'
 import { ErrorState } from '../ErrorState'
 import { LoadingState } from '../LoadingState'
 import { ProgressCard } from '../ProgressCard'
 import { ModalFrame } from './ModalFrame'
 
 export function OperationModal({
-  operationId,
+  operation,
   onClose,
 }: {
-  operationId: string
+  operation: TrackedOperation | undefined
   onClose: () => void
 }) {
-  const { notify, refresh } = useRuntime()
-  const [operation, setOperation] = useState<OperationSnapshot | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const announcedRef = useRef(false)
-
-  useEffect(() => {
-    let active = true
-    let timeoutId: number | null = null
-
-    async function load() {
-      try {
-        const payload = await apiRequest<OperationSnapshot>(`/operations/${operationId}`)
-        if (!active) {
-          return
-        }
-        setOperation(payload)
-        setError(null)
-        if (payload.status === 'running') {
-          timeoutId = window.setTimeout(() => void load(), 600)
-        }
-      } catch (caughtError) {
-        if (!active) {
-          return
-        }
-        setError(caughtError instanceof Error ? caughtError.message : 'Operation failed.')
-      }
-    }
-
-    void load()
-
-    return () => {
-      active = false
-      if (timeoutId) {
-        window.clearTimeout(timeoutId)
-      }
-    }
-  }, [operationId])
-
-  useEffect(() => {
-    if (!operation || operation.status === 'running' || announcedRef.current) {
-      return
-    }
-    announcedRef.current = true
-    if (operation.status === 'succeeded') {
-      notify(
-        actionMessage({
-          message: operation.message ?? 'Operation complete.',
-          warnings: operation.warnings,
-        }),
-      )
-      refresh()
-    } else if (operation.error) {
-      notify(operation.error)
-    }
-  }, [operation, notify, refresh])
-
-  const title = operation
-    ? operation.kind === 'identity_all'
-      ? operationTitle(operation.kind)
-      : `${operationTitle(operation.kind)} ${operation.provider_name}`
-    : 'Working'
+  const snapshot = operation?.snapshot ?? null
+  const running = !snapshot || snapshot.status === 'running'
+  const title = snapshot ? operationDisplayTitle(snapshot) : 'Working'
   const primaryProgressLabel =
-    operation?.kind === 'identity' || operation?.kind === 'identity_all'
+    snapshot?.kind === 'identity' || snapshot?.kind === 'identity_all'
       ? 'Tracks'
       : 'Saved tracks'
 
   return (
     <ModalFrame title={title} onClose={onClose}>
-      {error ? (
-        <ErrorState message={error} compact />
-      ) : !operation ? (
-        <LoadingState label="Starting operation" compact />
+      {operation?.error ? (
+        <div className="modal-stack">
+          <ErrorState message={operation.error} compact />
+          <div className="modal-actions">
+            <button className="btn btn--primary" onClick={onClose} type="button">
+              Close
+            </button>
+          </div>
+        </div>
+      ) : !snapshot ? (
+        <div className="modal-stack">
+          <LoadingState label="Starting operation" compact />
+          <div className="modal-actions">
+            <button className="btn btn--ghost" onClick={onClose} type="button">
+              Run in background
+            </button>
+          </div>
+        </div>
       ) : (
         <div className="modal-stack">
           <div className="operation-head">
             <span className="eyebrow">
-              {operation.status === 'running'
+              {snapshot.status === 'running'
                 ? 'In progress'
-                : operation.status === 'succeeded'
+                : snapshot.status === 'succeeded'
                   ? 'Complete'
                   : 'Failed'}
             </span>
-            <strong>{operation.stage}</strong>
-            {operation.detail ? <p>{operation.detail}</p> : null}
+            <strong>{snapshot.stage}</strong>
+            {snapshot.detail ? <p>{snapshot.detail}</p> : null}
           </div>
 
           <div className="operation-grid">
             <ProgressCard
               label={primaryProgressLabel}
-              done={operation.saved_tracks_done}
-              total={operation.saved_tracks_total}
+              done={snapshot.saved_tracks_done}
+              total={snapshot.saved_tracks_total}
+              running={running}
             />
             <ProgressCard
               label="Playlists"
-              done={operation.playlists_done}
-              total={operation.playlists_total}
+              done={snapshot.playlists_done}
+              total={snapshot.playlists_total}
+              running={running}
             />
             <ProgressCard
               label="Playlist tracks"
-              done={operation.playlist_entries_done}
-              total={operation.playlist_entries_total}
+              done={snapshot.playlist_entries_done}
+              total={snapshot.playlist_entries_total}
+              running={running}
             />
           </div>
 
-          {operation.message ? (
+          {snapshot.message ? (
             <div className="confirm-copy">
-              <p>{operation.message}</p>
+              <p>{snapshot.message}</p>
             </div>
           ) : null}
 
-          {operation.error ? (
+          {snapshot.error ? (
             <div className="confirm-warning confirm-warning--danger">
               <strong>Operation failed</strong>
-              <span>{operation.error}</span>
+              <span>{snapshot.error}</span>
             </div>
           ) : null}
 
-          {operation.warnings.length ? (
+          {snapshot.warnings.length ? (
             <div className="confirm-warning confirm-warning--warning">
               <strong>Warnings</strong>
               <ul className="operation-warning-list">
-                {operation.warnings.map((warning) => (
+                {snapshot.warnings.map((warning) => (
                   <li key={warning}>{warning}</li>
                 ))}
               </ul>
@@ -144,13 +100,13 @@ export function OperationModal({
           ) : null}
 
           <div className="modal-actions">
-            {operation.status === 'running' ? (
+            {running ? (
               <button className="btn btn--ghost" onClick={onClose} type="button">
-                Hide
+                Run in background
               </button>
             ) : (
               <button className="btn btn--primary" onClick={onClose} type="button">
-                Done
+                Close
               </button>
             )}
           </div>
