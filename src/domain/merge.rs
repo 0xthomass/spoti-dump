@@ -5,7 +5,10 @@ use chrono::{DateTime, Utc};
 use crate::matching::metadata_similarity;
 
 use super::library::{LibraryState, SavedTrackEntry};
-use super::mutate::{merge_metadata, new_canonical_id, preferred_dimension, upsert_provider_link};
+use super::mutate::{
+    merge_artwork_observation, merge_metadata, new_canonical_id, sanitize_track_metadata,
+    upsert_provider_link,
+};
 use super::playlist::{PlaylistEntity, PlaylistEntry};
 use super::provider::ProviderKind;
 use super::snapshot::{ObservedPlaylist, ObservedTrack, ProviderLibrarySnapshot};
@@ -41,11 +44,18 @@ pub fn merge_provider_snapshot(
     let mut indexes = MergeIndexes::build(state, provider);
 
     for saved_track in snapshot.saved_tracks {
+        let observed = match sanitize_observed_track(&saved_track.track) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                push_skipped_track_warning(&mut summary, provider, &saved_track.track, &reason);
+                continue;
+            }
+        };
         let outcome = upsert_track_from_observation(
             state,
             &mut indexes,
             provider,
-            &saved_track.track,
+            &observed,
             LinkSource::Export,
             Some(1.0),
             observed_at,
@@ -60,7 +70,7 @@ pub fn merge_provider_snapshot(
             push_conflict_warning(&mut summary, state, provider, &outcome);
         } else {
             let status = SyncStatusRecord::synced(
-                saved_track.track.provider_id.clone(),
+                observed.provider_id.clone(),
                 Some(1.0),
                 Some("Observed in provider export".to_string()),
                 observed_at,
@@ -168,6 +178,40 @@ fn push_conflict_warning(
     ));
 }
 
+/// Applies the same metadata sanitation manual edits enforce
+/// (`sanitize_track_metadata`) to an observed track. On success the returned
+/// track carries the cleaned metadata (trimmed title, empty artists dropped,
+/// blank optionals normalized, ISRC upper-cased) so merged rows match the
+/// invariants edited rows uphold. On failure the item must be skipped.
+fn sanitize_observed_track(observed: &ObservedTrack) -> anyhow::Result<ObservedTrack> {
+    Ok(ObservedTrack {
+        metadata: sanitize_track_metadata(observed.metadata.clone())?,
+        provider_id: observed.provider_id.clone(),
+        artwork: observed.artwork.clone(),
+    })
+}
+
+/// Records that a snapshot item was skipped because its metadata failed
+/// sanitation. The merge continues; the item (and any playlist entry that would
+/// have referenced it) is simply left out.
+fn push_skipped_track_warning(
+    summary: &mut MergeSummary,
+    provider: ProviderKind,
+    observed: &ObservedTrack,
+    reason: &anyhow::Error,
+) {
+    let identity = match &observed.provider_id {
+        Some(provider_id) => format!("'{}' ({})", observed.metadata.display_label(), provider_id),
+        None => format!("'{}'", observed.metadata.display_label()),
+    };
+    summary.warnings.push(format!(
+        "Skipped {} track {} because its metadata failed validation: {}",
+        provider.display_name(),
+        identity,
+        reason
+    ));
+}
+
 fn collect_playlist_observations(
     state: &mut LibraryState,
     indexes: &mut MergeIndexes,
@@ -178,11 +222,18 @@ fn collect_playlist_observations(
 ) -> Vec<(String, Option<String>, Option<String>)> {
     let mut observations = Vec::with_capacity(playlist.tracks.len());
     for track in &playlist.tracks {
+        let observed = match sanitize_observed_track(&track.track) {
+            Ok(observed) => observed,
+            Err(reason) => {
+                push_skipped_track_warning(summary, provider, &track.track, &reason);
+                continue;
+            }
+        };
         let outcome = upsert_track_from_observation(
             state,
             indexes,
             provider,
-            &track.track,
+            &observed,
             LinkSource::Export,
             Some(1.0),
             observed_at,
@@ -194,13 +245,13 @@ fn collect_playlist_observations(
             state.tracks[outcome.index].provider_state.insert(
                 provider.as_key().to_string(),
                 SyncStatusRecord::synced(
-                    track.track.provider_id.clone(),
+                    observed.provider_id.clone(),
                     Some(1.0),
                     Some("Observed in provider export".to_string()),
                     observed_at,
                 ),
             );
-            track.track.provider_id.clone()
+            observed.provider_id.clone()
         };
         observations.push((outcome.track_id, track.added_at.clone(), provider_item_id));
     }
@@ -420,21 +471,17 @@ fn merge_observed_artwork(
     };
 
     let key = provider.as_key().to_string();
-    if let Some(existing) = track.provider_artwork.get_mut(&key) {
-        existing.url = artwork.url.clone();
-        existing.width = preferred_dimension(existing.width, artwork.width);
-        existing.height = preferred_dimension(existing.height, artwork.height);
-        existing.last_seen_at = Some(seen_at);
-    } else {
-        track.provider_artwork.insert(
-            key,
-            ProviderTrackArtwork {
-                url: artwork.url.clone(),
-                width: artwork.width,
-                height: artwork.height,
-                last_seen_at: Some(seen_at),
-            },
-        );
+    let candidate = ProviderTrackArtwork {
+        url: artwork.url.clone(),
+        width: artwork.width,
+        height: artwork.height,
+        last_seen_at: Some(seen_at),
+    };
+    match track.provider_artwork.get_mut(&key) {
+        Some(existing) => merge_artwork_observation(existing, candidate),
+        None => {
+            track.provider_artwork.insert(key, candidate);
+        }
     }
 }
 

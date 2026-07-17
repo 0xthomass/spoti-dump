@@ -476,23 +476,18 @@ impl LibraryState {
         seen_at: DateTime<Utc>,
     ) {
         if let Some(track) = self.tracks.iter_mut().find(|track| track.id == track_id) {
-            let url = url.into();
             let key = provider.as_key().to_string();
-            if let Some(existing) = track.provider_artwork.get_mut(&key) {
-                existing.url = url;
-                existing.width = preferred_dimension(existing.width, width);
-                existing.height = preferred_dimension(existing.height, height);
-                existing.last_seen_at = Some(seen_at);
-            } else {
-                track.provider_artwork.insert(
-                    key,
-                    ProviderTrackArtwork {
-                        url,
-                        width,
-                        height,
-                        last_seen_at: Some(seen_at),
-                    },
-                );
+            let candidate = ProviderTrackArtwork {
+                url: url.into(),
+                width,
+                height,
+                last_seen_at: Some(seen_at),
+            };
+            match track.provider_artwork.get_mut(&key) {
+                Some(existing) => merge_artwork_observation(existing, candidate),
+                None => {
+                    track.provider_artwork.insert(key, candidate);
+                }
             }
             self.touch();
         }
@@ -1025,50 +1020,41 @@ fn merge_provider_artwork(
     source: BTreeMap<String, ProviderTrackArtwork>,
 ) {
     for (provider, source_artwork) in source {
-        if let Some(target_artwork) = target.get_mut(&provider) {
-            target_artwork.width = preferred_dimension(target_artwork.width, source_artwork.width);
-            target_artwork.height =
-                preferred_dimension(target_artwork.height, source_artwork.height);
-            target_artwork.last_seen_at =
-                target_artwork.last_seen_at.or(source_artwork.last_seen_at);
-            if target_artwork.url.trim().is_empty() {
-                target_artwork.url = source_artwork.url;
+        match target.get_mut(&provider) {
+            Some(target_artwork) => merge_artwork_observation(target_artwork, source_artwork),
+            None => {
+                target.insert(provider, source_artwork);
             }
-        } else {
-            target.insert(provider, source_artwork);
         }
     }
 }
 
+/// Merges two provider status maps, keeping the higher-ranked record for each
+/// provider (see [`status_rank`]).
+///
+/// A status record's timestamps (`last_attempt_at`/`last_success_at`/
+/// `last_seen_at`) describe that specific record's own history — e.g. an
+/// `Unmatched` record has no `last_success_at`, a `Synced` record's
+/// `last_seen_at` is when the item was last confirmed present. So the kept
+/// record keeps ONLY its own timestamps: the discarded record's timestamps are
+/// discarded along with it, never merged in. This prevents incoherent rows such
+/// as an `Unmatched` record that claims a success timestamp borrowed from a
+/// dropped `Synced` record, or a kept record whose "last attempt" was actually
+/// the discarded record's attempt.
 pub(super) fn merge_status_maps(
     target: &mut BTreeMap<String, SyncStatusRecord>,
     source: BTreeMap<String, SyncStatusRecord>,
 ) {
     for (provider, source_status) in source {
-        if let Some(target_status) = target.get_mut(&provider) {
-            if status_rank(source_status.state) > status_rank(target_status.state) {
-                let last_attempt_at =
-                    max_timestamp(target_status.last_attempt_at, source_status.last_attempt_at);
-                let last_success_at =
-                    max_timestamp(target_status.last_success_at, source_status.last_success_at);
-                let last_seen_at =
-                    max_timestamp(target_status.last_seen_at, source_status.last_seen_at);
-                *target_status = source_status;
-                target_status.last_attempt_at = last_attempt_at;
-                target_status.last_success_at = last_success_at;
-                target_status.last_seen_at = last_seen_at;
-            } else {
-                target_status.last_attempt_at = target_status
-                    .last_attempt_at
-                    .or(source_status.last_attempt_at);
-                target_status.last_success_at = target_status
-                    .last_success_at
-                    .or(source_status.last_success_at);
-                target_status.last_seen_at =
-                    target_status.last_seen_at.or(source_status.last_seen_at);
+        match target.get_mut(&provider) {
+            Some(target_status) => {
+                if status_rank(source_status.state) > status_rank(target_status.state) {
+                    *target_status = source_status;
+                }
             }
-        } else {
-            target.insert(provider, source_status);
+            None => {
+                target.insert(provider, source_status);
+            }
         }
     }
 }
@@ -1133,12 +1119,42 @@ pub(super) fn merge_added_at(target: &mut Option<String>, source: Option<String>
     }
 }
 
-pub(super) fn preferred_dimension(existing: Option<u32>, observed: Option<u32>) -> Option<u32> {
-    match (existing, observed) {
-        (Some(existing), Some(observed)) => Some(existing.max(observed)),
-        (Some(existing), None) => Some(existing),
-        (None, Some(observed)) => Some(observed),
-        (None, None) => None,
+/// The single rule for reconciling a stored provider-artwork record with a
+/// newer observation of the same provider's artwork.
+///
+/// `(url, width, height)` is treated as ONE unit: the stored record always
+/// describes a single real image, never one image's URL glued to another
+/// image's dimensions. The candidate replaces the stored record as a whole when
+/// it is at least as large (by [`artwork_dimension_score`], so any real
+/// observation outranks a dimensionless record); otherwise the stored record is
+/// kept whole. Either way `last_seen_at` advances to the newer timestamp, so
+/// freshness reflects every observation regardless of which image won.
+pub(super) fn merge_artwork_observation(
+    existing: &mut ProviderTrackArtwork,
+    candidate: ProviderTrackArtwork,
+) {
+    let last_seen_at = max_timestamp(existing.last_seen_at, candidate.last_seen_at);
+    if artwork_dimension_score(candidate.width, candidate.height)
+        >= artwork_dimension_score(existing.width, existing.height)
+    {
+        existing.url = candidate.url;
+        existing.width = candidate.width;
+        existing.height = candidate.height;
+    }
+    existing.last_seen_at = last_seen_at;
+}
+
+/// Ranks an artwork's dimensions so two observations can be compared as whole
+/// images. A fully-known image is ranked by pixel area; a partially-known one
+/// by its larger side (so it still outranks a dimensionless record); a
+/// dimensionless record ranks lowest, at zero.
+fn artwork_dimension_score(width: Option<u32>, height: Option<u32>) -> u64 {
+    let width = width.unwrap_or(0) as u64;
+    let height = height.unwrap_or(0) as u64;
+    if width > 0 && height > 0 {
+        width * height
+    } else {
+        width.max(height)
     }
 }
 
@@ -1166,7 +1182,9 @@ fn prune_track_if_unreferenced(state: &mut LibraryState, track_id: &str) -> bool
     }
 }
 
-fn sanitize_track_metadata(mut metadata: TrackMetadata) -> anyhow::Result<TrackMetadata> {
+pub(super) fn sanitize_track_metadata(
+    mut metadata: TrackMetadata,
+) -> anyhow::Result<TrackMetadata> {
     metadata.title = sanitize_required_text(metadata.title, "Track title")?;
     metadata.artists = sanitize_artists(metadata.artists);
     metadata.album = normalize_optional_text(metadata.album);

@@ -1,10 +1,10 @@
 //! Characterization tests for the canonical mutation engine in `src/domain/`.
 //!
 //! These lock in the behavior of `merge_provider_snapshot` and the related
-//! public `LibraryState` mutators. Where the behavior is surprising (URL
-//! always overwritten, merge path skips sanitization, appended-not-inserted
-//! playlist order) the assertions and their comments document exactly what
-//! happens rather than what is ideal.
+//! public `LibraryState` mutators. Where the behavior is surprising
+//! (appended-not-inserted playlist order, a coherent artwork record treated as
+//! one unit, sanitation-driven skips) the assertions and their comments
+//! document exactly what happens rather than what is ideal.
 
 use std::collections::BTreeMap;
 
@@ -171,62 +171,99 @@ fn merging_tracks_keeps_the_highest_ranked_sync_state() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Artwork dimension precedence (preferred_dimension) via merge_provider_snapshot.
+// 2. Artwork (url, width, height) is ONE unit; the larger whole image wins.
 // ---------------------------------------------------------------------------
 
+fn merge_spotify_artwork(
+    library: &mut LibraryState,
+    url: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) {
+    let base = metadata(
+        "Sirius",
+        &["The Alan Parsons Project"],
+        Some("Eye In The Sky"),
+        None,
+        None,
+    );
+    merge_provider_snapshot(
+        library,
+        provider_snapshot(
+            ProviderKind::Spotify,
+            vec![saved(
+                None,
+                observed_with_artwork(Some("s1"), base, url, width, height),
+            )],
+            Vec::new(),
+        ),
+    );
+}
+
 #[test]
-fn observed_artwork_keeps_largest_dimensions_but_always_takes_latest_url() {
+fn observed_artwork_keeps_url_and_dimensions_as_one_coherent_unit() {
     let key = ProviderKind::Spotify.as_key();
-    let base = || {
-        metadata(
-            "Sirius",
-            &["The Alan Parsons Project"],
-            Some("Eye In The Sky"),
-            None,
-            None,
-        )
-    };
-    let merge_artwork = |library: &mut LibraryState, url: &str, w: Option<u32>, h: Option<u32>| {
-        merge_provider_snapshot(
-            library,
-            provider_snapshot(
-                ProviderKind::Spotify,
-                vec![saved(
-                    None,
-                    observed_with_artwork(Some("s1"), base(), url, w, h),
-                )],
-                Vec::new(),
-            ),
-        );
-    };
 
     let mut library = LibraryState::new();
-    merge_artwork(&mut library, "url-small", Some(300), Some(300));
+    merge_spotify_artwork(&mut library, "url-small", Some(300), Some(300));
 
-    // A larger later observation upgrades the stored dimensions.
-    merge_artwork(&mut library, "url-large", Some(640), Some(640));
+    // A larger later observation replaces the whole record: url AND dimensions.
+    merge_spotify_artwork(&mut library, "url-large", Some(640), Some(640));
     assert_eq!(library.tracks.len(), 1);
     let art = library.tracks[0].provider_artwork.get(key).unwrap();
-    assert_eq!(art.width, Some(640));
-    assert_eq!(art.height, Some(640));
-    assert_eq!(art.url, "url-large");
+    assert_eq!(
+        (art.width, art.height, art.url.as_str()),
+        (Some(640), Some(640), "url-large")
+    );
 
-    // A SMALLER later observation does not shrink the dimensions...
-    merge_artwork(&mut library, "url-tiny", Some(100), Some(100));
+    // A SMALLER later observation is rejected WHOLE: neither the dimensions nor
+    // the URL move, so the stored url still describes the stored dimensions
+    // (the desync where a smaller image's url landed on the larger dimensions
+    // is gone).
+    merge_spotify_artwork(&mut library, "url-tiny", Some(100), Some(100));
     let art = library.tracks[0].provider_artwork.get(key).unwrap();
-    assert_eq!(art.width, Some(640));
-    assert_eq!(art.height, Some(640));
-    // ...but the URL is STILL overwritten with the smaller image's URL. This is a
-    // documented quirk: `upsert_track_artwork` keeps max(width/height) yet always
-    // replaces `url`, so the stored dimensions can describe a different image.
-    assert_eq!(art.url, "url-tiny");
+    assert_eq!(
+        (art.width, art.height, art.url.as_str()),
+        (Some(640), Some(640), "url-large")
+    );
 
-    // A `None` dimension likewise never clobbers a known dimension.
-    merge_artwork(&mut library, "url-none", None, None);
+    // A dimensionless observation likewise cannot displace a known-size image.
+    merge_spotify_artwork(&mut library, "url-none", None, None);
     let art = library.tracks[0].provider_artwork.get(key).unwrap();
-    assert_eq!(art.width, Some(640));
-    assert_eq!(art.height, Some(640));
-    assert_eq!(art.url, "url-none");
+    assert_eq!(
+        (art.width, art.height, art.url.as_str()),
+        (Some(640), Some(640), "url-large")
+    );
+}
+
+#[test]
+fn observed_artwork_replaces_a_dimensionless_record_and_only_advances_last_seen() {
+    let key = ProviderKind::Spotify.as_key();
+
+    let mut library = LibraryState::new();
+    // The first observation carries no dimensions at all (score 0).
+    merge_spotify_artwork(&mut library, "url-unknown", None, None);
+    let first_seen = library.tracks[0]
+        .provider_artwork
+        .get(key)
+        .unwrap()
+        .last_seen_at;
+    assert!(first_seen.is_some());
+
+    // Any sized observation outranks a dimensionless record and takes over whole.
+    merge_spotify_artwork(&mut library, "url-sized", Some(300), Some(300));
+    let art = library.tracks[0].provider_artwork.get(key).unwrap();
+    assert_eq!(
+        (art.width, art.height, art.url.as_str()),
+        (Some(300), Some(300), "url-sized")
+    );
+
+    // An equally-large observation still replaces the record (>= wins), so the
+    // freshest URL is kept and last_seen_at only ever advances.
+    merge_spotify_artwork(&mut library, "url-sized-newer", Some(300), Some(300));
+    let art = library.tracks[0].provider_artwork.get(key).unwrap();
+    assert_eq!(art.url, "url-sized-newer");
+    assert!(art.last_seen_at >= first_seen);
 }
 
 // ---------------------------------------------------------------------------
@@ -538,11 +575,11 @@ fn removing_saved_track_keeps_track_still_referenced_by_a_playlist() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Merge path does NOT sanitize metadata.
+// 8. Merge path sanitizes observed metadata, skipping items that fail it.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn merge_stores_blank_metadata_verbatim_without_sanitizing_or_skipping() {
+fn merge_skips_snapshot_items_whose_metadata_fails_sanitation() {
     let mut library = LibraryState::new();
     let summary = merge_provider_snapshot(
         &mut library,
@@ -559,25 +596,107 @@ fn merge_stores_blank_metadata_verbatim_without_sanitizing_or_skipping() {
         ),
     );
 
-    // `sanitize_track_metadata` is only reached from `update_track_metadata`, NOT
-    // from the snapshot merge path. So a whitespace-only title and an empty artist
-    // entry are neither rejected nor skipped nor warned about: they are stored as-is.
-    assert_eq!(summary.tracks_created, 1);
-    assert!(summary.warnings.is_empty());
-    assert_eq!(library.tracks.len(), 1);
-    assert_eq!(library.tracks[0].metadata.title, "   ");
-    assert_eq!(
-        library.tracks[0].metadata.artists,
-        vec!["".to_string(), "Real Artist".to_string()]
+    // The snapshot merge path now runs the SAME sanitation `update_track_metadata`
+    // enforces. A whitespace-only title fails the "non-blank title" rule, so the
+    // item is skipped with a warning (the merge is not aborted) rather than stored
+    // verbatim.
+    assert_eq!(summary.tracks_created, 0);
+    assert_eq!(summary.saved_tracks_seen, 0);
+    assert_eq!(summary.warnings.len(), 1);
+    assert!(summary.warnings[0].contains("metadata failed validation"));
+    assert!(library.tracks.is_empty());
+    assert!(library.saved_tracks.is_empty());
+}
+
+#[test]
+fn merge_skips_playlist_entries_referencing_unsanitizable_tracks() {
+    let mut library = LibraryState::new();
+    let summary = merge_provider_snapshot(
+        &mut library,
+        provider_snapshot(
+            ProviderKind::Spotify,
+            Vec::new(),
+            vec![observed_playlist(
+                Some("p1"),
+                "Mix",
+                vec![
+                    playlist_track(
+                        None,
+                        observed(
+                            Some("ok"),
+                            metadata("Good Song", &["Artist"], None, None, None),
+                        ),
+                    ),
+                    playlist_track(
+                        None,
+                        observed(Some("bad"), metadata("   ", &["Artist"], None, None, None)),
+                    ),
+                ],
+            )],
+        ),
     );
+
+    // The blank-title entry is dropped with the same warning; the playlist keeps
+    // only the valid track, and no entry references a track that was never stored.
+    assert_eq!(library.tracks.len(), 1);
+    assert_eq!(library.playlists.len(), 1);
+    assert_eq!(library.playlists[0].entries.len(), 1);
+    let stored_track_id = library.playlists[0].entries[0].track_id.clone();
+    assert!(library
+        .tracks
+        .iter()
+        .any(|track| track.id == stored_track_id));
+    assert!(summary
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("metadata failed validation")));
+    library.validate().unwrap();
+}
+
+#[test]
+fn merge_applies_metadata_sanitation_to_stored_tracks() {
+    let mut library = LibraryState::new();
+    merge_provider_snapshot(
+        &mut library,
+        provider_snapshot(
+            ProviderKind::Spotify,
+            vec![saved(
+                None,
+                observed(
+                    Some("s1"),
+                    // Padded title, blank/duplicate/whitespace artists, a blank
+                    // album, a zero duration and a lower-case ISRC: sanitation
+                    // cleans them all, exactly as a manual edit would.
+                    metadata(
+                        "  Real Song  ",
+                        &["", "Real Artist", "  ", "real artist"],
+                        Some("   "),
+                        Some(0),
+                        Some("usabc1234567"),
+                    ),
+                ),
+            )],
+            Vec::new(),
+        ),
+    );
+
+    assert_eq!(library.tracks.len(), 1);
+    let track = &library.tracks[0];
+    assert_eq!(track.metadata.title, "Real Song");
+    assert_eq!(track.metadata.artists, vec!["Real Artist".to_string()]);
+    assert_eq!(track.metadata.album, None);
+    assert_eq!(track.metadata.duration_seconds, None);
+    assert_eq!(track.metadata.isrc.as_deref(), Some("USABC1234567"));
+    library.validate().unwrap();
 }
 
 // ---------------------------------------------------------------------------
-// 9. Status merges preserve timestamps; added_at merges compare instants.
+// 9. Status merges keep only the winning record's own timestamps; added_at
+//    merges compare instants.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn winning_status_record_keeps_the_other_sides_timestamps() {
+fn winning_status_record_carries_only_its_own_timestamps() {
     let key = ProviderKind::Spotify.as_key().to_string();
     let seen_at = Utc::now();
     let mut target = track_entity("target", metadata("Song", &["Artist"], None, None, None));
@@ -600,13 +719,49 @@ fn winning_status_record_keeps_the_other_sides_timestamps() {
 
     library.merge_track_into("source", "target").unwrap();
 
-    // Error outranks Missing so the source record wins, but the target's
-    // timestamps survive the replacement instead of being discarded.
+    // Error outranks Missing, so the source record wins WHOLE. It keeps its own
+    // (empty) timestamps and does NOT absorb the discarded Missing record's
+    // `seen_at`: a discarded record never advances the kept record's timeline.
     let status = library.tracks[0].provider_state.get(&key).unwrap();
     assert_eq!(status.state, SyncState::Error);
     assert_eq!(status.message.as_deref(), Some("Push failed"));
-    assert_eq!(status.last_seen_at, Some(seen_at));
-    assert_eq!(status.last_attempt_at, Some(seen_at));
+    assert_eq!(status.last_seen_at, None);
+    assert_eq!(status.last_attempt_at, None);
+    assert_eq!(status.last_success_at, None);
+}
+
+#[test]
+fn kept_status_record_does_not_inherit_a_discarded_records_timestamps() {
+    let key = ProviderKind::Spotify.as_key().to_string();
+    let at = Utc::now();
+    // Target is Unmatched: it has never synced, so it holds no last_success_at.
+    let mut target = track_entity("target", metadata("Song", &["Artist"], None, None, None));
+    target
+        .provider_state
+        .insert(key.clone(), SyncStatusRecord::unmatched("No match", at));
+    // Source is a lower-ranked Skipped record that nonetheless carries a stale
+    // success timestamp from an earlier life.
+    let mut source = track_entity("source", metadata("Song", &["Artist"], None, None, None));
+    source.provider_state.insert(
+        key.clone(),
+        SyncStatusRecord {
+            state: SyncState::Skipped,
+            last_success_at: Some(at),
+            ..Default::default()
+        },
+    );
+    let mut library = LibraryState::new();
+    library.tracks.push(target);
+    library.tracks.push(source);
+
+    library.merge_track_into("source", "target").unwrap();
+
+    // Unmatched outranks Skipped, so the Unmatched record is kept. It must NOT
+    // pick up the discarded record's last_success_at: an unmatched item has
+    // never synced, so a success timestamp would be incoherent.
+    let status = library.tracks[0].provider_state.get(&key).unwrap();
+    assert_eq!(status.state, SyncState::Unmatched);
+    assert_eq!(status.last_success_at, None);
 }
 
 #[test]
