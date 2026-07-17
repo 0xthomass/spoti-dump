@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
@@ -15,5 +15,14 @@ export default defineConfig({
         changeOrigin: false,
       },
     },
+  },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: './src/test/setup.ts',
+    // Test files are colocated in src; keep the app entry out of the run.
+    include: ['src/**/*.test.{ts,tsx}'],
+    css: false,
+    restoreMocks: true,
   },
 })

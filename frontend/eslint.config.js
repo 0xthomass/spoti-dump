@@ -20,4 +20,14 @@ export default defineConfig([
       globals: globals.browser,
     },
   },
+  {
+    // Vitest injects its API as globals (globals: true), so make the linter
+    // aware of them in test files and the shared setup module.
+    files: ['**/*.test.{ts,tsx}', 'src/test/**/*.{ts,tsx}'],
+    languageOptions: {
+      globals: {
+        ...globals.vitest,
+      },
+    },
+  },
 ])
