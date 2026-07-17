@@ -115,13 +115,27 @@ pub(crate) fn is_loopback_http_origin(origin: &str) -> bool {
 
 /// Decides whether a request is allowed through the cross-origin guard.
 ///
-/// Safe methods (GET/HEAD/OPTIONS) always pass. For any state-changing method
-/// the request must satisfy every check that applies to it:
+/// The `Host` header, if present, must name a loopback authority for **every**
+/// request — including GET. This is the DNS-rebinding defense: a malicious page
+/// whose hostname has been repointed at `127.0.0.1` still sends `Host: evil.com`,
+/// so rejecting a non-loopback `Host` stops it from reading library data, not
+/// just from mutating it.
+///
+/// Safe methods (GET/HEAD/OPTIONS) need no further scrutiny once the `Host`
+/// check passes. State-changing methods additionally require:
 /// - `Sec-Fetch-Site`, if present, must be `same-origin`, `same-site` or `none`.
-/// - `Host`, if present, must be a loopback host.
 /// - `Origin`, if present, must be an `http` loopback origin. A missing `Origin`
 ///   is allowed (curl, some same-origin browser fetches, other CLI tools).
 pub(crate) fn is_request_origin_allowed(method: &Method, headers: &HeaderMap) -> bool {
+    if let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !is_loopback_host(host) {
+            return false;
+        }
+    }
+
     if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
         return true;
     }
@@ -131,15 +145,6 @@ pub(crate) fn is_request_origin_allowed(method: &Method, headers: &HeaderMap) ->
         .and_then(|value| value.to_str().ok())
     {
         if !matches!(site, "same-origin" | "same-site" | "none") {
-            return false;
-        }
-    }
-
-    if let Some(host) = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-    {
-        if !is_loopback_host(host) {
             return false;
         }
     }
@@ -683,16 +688,23 @@ mod tests {
     }
 
     #[test]
-    fn cross_origin_guard_allows_safe_methods_regardless_of_headers() {
-        // GET must stay reachable even from a cross-site context (e.g. the
-        // Spotify OAuth callback redirect).
-        let headers = header_map(&[
-            (header::HOST.as_str(), "evil.example.com"),
-            (header::ORIGIN.as_str(), "https://evil.example.com"),
-        ]);
+    fn cross_origin_guard_allows_safe_methods_from_loopback_host() {
+        // A same-origin GET (loopback Host) needs no further scrutiny.
+        let headers = header_map(&[(header::HOST.as_str(), "127.0.0.1:7878")]);
         assert!(is_request_origin_allowed(&Method::GET, &headers));
         assert!(is_request_origin_allowed(&Method::HEAD, &headers));
         assert!(is_request_origin_allowed(&Method::OPTIONS, &headers));
+        // A request with no Host at all (curl/CLI) is still allowed.
+        assert!(is_request_origin_allowed(&Method::GET, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn cross_origin_guard_rejects_safe_methods_with_non_loopback_host() {
+        // DNS rebinding: a repointed evil.example.com still sends its own Host,
+        // so even a GET must be blocked to prevent reading library data.
+        let headers = header_map(&[(header::HOST.as_str(), "evil.example.com")]);
+        assert!(!is_request_origin_allowed(&Method::GET, &headers));
+        assert!(!is_request_origin_allowed(&Method::HEAD, &headers));
     }
 
     #[test]

@@ -218,7 +218,31 @@ fn harden_runtime_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn harden_runtime_file_permissions(path: &Path) -> Result<()> {
+    // No std API for Windows ACLs, so shell out to icacls: drop inherited ACEs
+    // and grant only the current user, mirroring the Unix 0600 intent. Best
+    // effort — if the user can't be resolved or icacls is unavailable, the file
+    // keeps the (owner+admins) ACLs it inherits from the profile directory,
+    // which is no worse than before. Never fatal.
+    let Ok(user) = std::env::var("USERNAME") else {
+        return Ok(());
+    };
+    if user.is_empty() {
+        return Ok(());
+    }
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
 fn harden_runtime_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -353,16 +377,19 @@ fn migrate_legacy_runtime_state(root: &Path, runtime: &Connection) -> Result<()>
     transaction.commit()?;
 
     if migrated {
-        // Flush the library WAL before the raw-file snapshot, then strip the
-        // migrated tables from the canonical database.
-        checkpoint(&library)?;
-        backups::snapshot_existing_database(root, &library_path)?;
+        // Strip the migrated tables from the canonical database BEFORE taking the
+        // safety snapshot, so the pre-migration backup in dump/backups/ never
+        // retains cleartext provider credentials. The credentials were already
+        // copied into runtime.db above, so the scrubbed snapshot still backs up
+        // all canonical library data without leaking secrets at rest.
         if has_connections {
             library.execute("DELETE FROM provider_connections", [])?;
         }
         if has_operations {
             library.execute("DELETE FROM ui_operations", [])?;
         }
+        checkpoint(&library)?;
+        backups::snapshot_existing_database(root, &library_path)?;
     }
     mark_legacy_runtime_migration_complete(runtime)?;
     Ok(())

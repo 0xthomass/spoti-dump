@@ -1470,11 +1470,23 @@ fn legacy_provider_credentials_move_out_of_canonical_database() {
         .unwrap();
     assert_eq!(remaining, 0);
     assert!(runtime_database_path_in(temp.path()).exists());
+    let backup_dir = temp.path().join("dump").join("backups");
+    let backups: Vec<_> = fs::read_dir(&backup_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1);
+    // The pre-migration snapshot must NOT retain the cleartext credentials that
+    // were relocated into runtime.db — otherwise a shared backup leaks secrets.
+    let snapshot = Connection::open(&backups[0]).unwrap();
+    let secrets_in_backup: i64 = snapshot
+        .query_row("SELECT COUNT(*) FROM provider_connections", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
     assert_eq!(
-        fs::read_dir(temp.path().join("dump").join("backups"))
-            .unwrap()
-            .count(),
-        1
+        secrets_in_backup, 0,
+        "legacy-migration backup must not contain provider credentials"
     );
 }
 
