@@ -124,9 +124,8 @@ describe('formatDateTime', () => {
     expect(actual).toContain('2026')
   })
 
-  it('throws on an unparseable date (documents current behavior)', () => {
-    // The helper has no invalid-date guard; Intl throws on Invalid Date.
-    expect(() => formatDateTime('not-a-date')).toThrow()
+  it('returns the raw value for an unparseable date', () => {
+    expect(formatDateTime('not-a-date')).toBe('not-a-date')
   })
 })
 

@@ -80,10 +80,14 @@ export function recommendationClassName(key: string) {
 }
 
 export function formatDateTime(value: string) {
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return value
+  }
   return new Intl.DateTimeFormat(undefined, {
     dateStyle: 'medium',
     timeStyle: 'short',
-  }).format(new Date(value))
+  }).format(parsed)
 }
 
 export function cooldownRemainingMs(cooldownUntil: string | null) {
