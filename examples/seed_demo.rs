@@ -79,7 +79,9 @@ fn main() -> anyhow::Result<()> {
             spotify_id: Some("6K4t31amVTZDgR3sKmwUJJ"),
             youtube_id: None,
             gap_provider: None,
-            conflict_candidate: Some("sVi9zeAyF1E"),
+            // Candidate deliberately collides with "Instant Crush"'s YouTube
+            // link so the conflict has a real owner and surfaces in the queue.
+            conflict_candidate: Some("a5uQMwRMHcs"),
         },
         SeedTrack {
             title: "Weird Fishes / Arpeggi",
