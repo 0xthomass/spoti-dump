@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type {
   ActionResponse,
   PageResponse,
@@ -171,11 +171,24 @@ export function PlaylistsPage() {
                 onRetry={listResource.refetch}
               />
             ) : listResource.data.items.length === 0 ? (
-              <EmptyState
-                title="No playlists found"
-                copy="Try another filter or import more provider state."
-                compact
-              />
+              !query && listResource.data.total === 0 ? (
+                <EmptyState
+                  title="No playlists yet"
+                  copy="Connect a provider and pull your library to import playlists here."
+                  compact
+                  action={
+                    <Link className="btn btn--primary" to="/overview">
+                      Connect a provider
+                    </Link>
+                  }
+                />
+              ) : (
+                <EmptyState
+                  title="No playlists found"
+                  copy="Try another filter or import more provider state."
+                  compact
+                />
+              )
             ) : (
               <>
                 <div className="playlist-list">

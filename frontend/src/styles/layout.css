@@ -115,6 +115,52 @@
   letter-spacing: 0.12em;
 }
 
+/* ---- Library stats disclosure (mobile only; after main content) ---- */
+.library-stats {
+  margin-top: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+  box-shadow: var(--shadow-1);
+  overflow: hidden;
+}
+
+.library-stats > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 18px;
+  font-weight: 800;
+  cursor: pointer;
+  list-style: none;
+}
+
+.library-stats > summary::-webkit-details-marker {
+  display: none;
+}
+
+.library-stats > summary::after {
+  content: '▾';
+  color: var(--text-muted-3);
+  transition: transform 140ms ease;
+}
+
+.library-stats[open] > summary::after {
+  transform: rotate(180deg);
+}
+
+.library-stats__body {
+  display: grid;
+  gap: var(--space-3);
+  padding: 0 16px 16px;
+}
+
+.library-stats__body .sidebar-card,
+.library-stats__body .sidebar-stats {
+  margin-top: 0;
+}
+
 /* ---- Stage / page ---- */
 .stage {
   padding: 24px;
@@ -235,11 +281,54 @@
     grid-template-columns: 1fr;
   }
 
+  /* Sidebar collapses into a top bar: brand row + scrollable nav pills. */
   .sidebar {
     position: relative;
     min-height: auto;
+    padding: 16px 16px 12px;
     border-right: 0;
     border-bottom: 1px solid var(--border);
+    backdrop-filter: none;
+  }
+
+  .brand-lockup {
+    margin-bottom: 14px;
+    gap: 2px;
+  }
+
+  .brand-lockup h1 {
+    font-size: 22px;
+  }
+
+  .brand-lockup p {
+    display: none;
+  }
+
+  .sidebar-nav {
+    display: flex;
+    gap: var(--space-2);
+    /* Full-bleed horizontal scroll contained inside the bar — never the page. */
+    margin: 0 -16px;
+    padding: 4px 16px 8px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .sidebar-link {
+    flex: 0 0 auto;
+    padding: 9px 14px;
+    border-radius: var(--radius-full);
+    background: var(--surface-2);
+    border-color: var(--border);
+    white-space: nowrap;
+  }
+
+  .sidebar-link strong {
+    font-size: 13px;
+  }
+
+  .sidebar-link span {
+    display: none;
   }
 
   .hero-panel {

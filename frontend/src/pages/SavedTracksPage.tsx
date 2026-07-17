@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import type { ActionResponse, PageResponse, SavedTrackItem } from '../api/types'
 import { actionMessage, apiRequest } from '../api/client'
 import { useConfirm, useRuntime } from '../context/runtime'
@@ -112,10 +112,22 @@ export function SavedTracksPage() {
             onRetry={resource.refetch}
           />
         ) : resource.data.items.length === 0 ? (
-          <EmptyState
-            title="Nothing matched"
-            copy="Try a broader search or import another provider export into the canonical database."
-          />
+          !query && resource.data.total === 0 ? (
+            <EmptyState
+              title="Your library is empty"
+              copy="Pull your saved tracks from a connected provider to fill the canonical library."
+              action={
+                <Link className="btn btn--primary" to="/overview">
+                  Connect a provider
+                </Link>
+              }
+            />
+          ) : (
+            <EmptyState
+              title="Nothing matched"
+              copy="Try a broader search or import another provider export into the canonical database."
+            />
+          )
         ) : (
           <>
             <TrackList

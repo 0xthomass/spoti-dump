@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import type { ActionResponse, PageResponse, TrackItem } from '../api/types'
 import { actionMessage, apiRequest } from '../api/client'
 import { useConfirm, useRuntime } from '../context/runtime'
@@ -142,10 +142,22 @@ export function TracksPage() {
             onRetry={resource.refetch}
           />
         ) : resource.data.items.length === 0 ? (
-          <EmptyState
-            title="No tracks matched"
-            copy="Try a broader filter or drop the coverage constraint."
-          />
+          !query && !coverage && resource.data.total === 0 ? (
+            <EmptyState
+              title="Your library is empty"
+              copy="Once you pull a provider library, every track shows up here with its coverage."
+              action={
+                <Link className="btn btn--primary" to="/overview">
+                  Connect a provider
+                </Link>
+              }
+            />
+          ) : (
+            <EmptyState
+              title="No tracks matched"
+              copy="Try a broader filter or drop the coverage constraint."
+            />
+          )
         ) : (
           <>
             <TrackList

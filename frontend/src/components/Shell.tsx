@@ -3,6 +3,7 @@ import { useLocation } from 'react-router-dom'
 import type { Overview } from '../api/types'
 import { useRuntime } from '../context/runtime'
 import { useApiQuery } from '../hooks/useApiQuery'
+import { useMediaQuery } from '../hooks/useMediaQuery'
 import { SidebarLink } from './SidebarLink'
 import { SidebarMetric } from './SidebarMetric'
 
@@ -10,6 +11,7 @@ export function Shell({ children }: { children: ReactNode }) {
   const location = useLocation()
   const { revision } = useRuntime()
   const { data: overview } = useApiQuery<Overview>('/overview', revision)
+  const isCompact = useMediaQuery('(max-width: 980px)')
 
   const heroMetric =
     location.pathname.indexOf('/playlists') >= 0
@@ -22,6 +24,24 @@ export function Shell({ children }: { children: ReactNode }) {
         ? `${overview?.tracks ?? 0} tracks`
         : `${overview?.saved_tracks ?? 0} saved tracks`
 
+  // Focus card + library metrics. On desktop they sit in the sidebar; on mobile
+  // they move into a collapsible disclosure rendered AFTER the main content.
+  const stats = overview ? (
+    <>
+      <div className="sidebar-card">
+        <span className="eyebrow">Focus</span>
+        <strong>{heroMetric}</strong>
+        <p>Pull. Edit. Push.</p>
+      </div>
+      <div className="sidebar-stats">
+        <SidebarMetric label="Multi-provider" value={overview.multi_provider} />
+        <SidebarMetric label="Canonical only" value={overview.canonical_only} />
+        <SidebarMetric label="Unmatched" value={overview.unmatched_tracks} />
+        <SidebarMetric label="Conflicts" value={overview.identity_conflicts} />
+      </div>
+    </>
+  ) : null
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -31,7 +51,7 @@ export function Shell({ children }: { children: ReactNode }) {
           <p>Edit once. Sync everywhere.</p>
         </div>
 
-        <nav className="sidebar-nav">
+        <nav aria-label="Primary" className="sidebar-nav">
           <SidebarLink
             to="/saved-tracks"
             label="Saved Tracks"
@@ -69,23 +89,17 @@ export function Shell({ children }: { children: ReactNode }) {
           />
         </nav>
 
-        <div className="sidebar-card">
-          <span className="eyebrow">Focus</span>
-          <strong>{heroMetric}</strong>
-          <p>Pull. Edit. Push.</p>
-        </div>
-
-        {overview ? (
-          <div className="sidebar-stats">
-            <SidebarMetric label="Multi-provider" value={overview.multi_provider} />
-            <SidebarMetric label="Canonical only" value={overview.canonical_only} />
-            <SidebarMetric label="Unmatched" value={overview.unmatched_tracks} />
-            <SidebarMetric label="Conflicts" value={overview.identity_conflicts} />
-          </div>
-        ) : null}
+        {!isCompact ? stats : null}
       </aside>
 
       <main className="stage">{children}</main>
+
+      {isCompact && stats ? (
+        <details className="library-stats">
+          <summary>Library stats</summary>
+          <div className="library-stats__body">{stats}</div>
+        </details>
+      ) : null}
     </div>
   )
 }

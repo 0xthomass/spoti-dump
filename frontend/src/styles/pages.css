@@ -45,6 +45,110 @@
   gap: 10px;
 }
 
+/* Provider card control hierarchy: primary row, hint, danger cluster, CTA */
+.provider-controls {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-controls .provider-action-hint {
+  margin: 0;
+  color: var(--warning-text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.provider-connect-cta {
+  display: grid;
+  gap: 12px;
+  justify-items: start;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+}
+
+.provider-connect-cta p {
+  margin: 0;
+  color: var(--text-muted-2);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.provider-danger {
+  display: grid;
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.provider-danger__caption {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--danger-text);
+}
+
+.provider-danger__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Getting-started checklist (overview first-run) */
+.getting-started .checklist {
+  list-style: none;
+  margin: 0;
+  padding: 20px 24px 24px;
+  display: grid;
+  gap: 12px;
+}
+
+.checklist__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  border: 1px solid var(--border-soft);
+}
+
+.checklist__marker {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-full);
+  background: var(--surface-3);
+  color: var(--text-muted-1);
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.checklist__step--done .checklist__marker {
+  background: var(--success-soft);
+  border: 1px solid var(--success-line);
+  color: var(--success-text);
+}
+
+.checklist__copy {
+  display: grid;
+  gap: 3px;
+}
+
+.checklist__copy strong {
+  font-size: 15px;
+}
+
+.checklist__copy span {
+  color: var(--text-muted-3);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .provider-readout {
   display: flex;
   flex-wrap: wrap;
@@ -411,6 +515,36 @@
   color: var(--text-muted-2);
   font-size: 13px;
   line-height: 1.5;
+}
+
+/* Merge decision (directional buttons + recommended tag + per-option hint) */
+.merge-decision {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.merge-option {
+  display: grid;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.merge-option-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.merge-recommend {
+  flex: 0 0 auto;
+}
+
+.merge-option-hint {
+  color: var(--text-muted-3);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 /* ---- Playlists ---- */

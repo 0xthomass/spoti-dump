@@ -4,20 +4,47 @@ import { actionMessage, apiRequest } from '../../api/client'
 import { useRuntime } from '../../context/runtime'
 import { ModalFrame } from './ModalFrame'
 
-const YOUTUBE_HEADERS_SAMPLE = `{
-  "cookie": "SAPISID=your_cookie_here; __Secure-3PAPISID=your_cookie_here; SID=your_cookie_here",
-  "x-goog-authuser": "paste_from_request",
-  "origin": "https://music.youtube.com"
-}`
-
 export function YoutubeMusicConnectModal({ onClose }: { onClose: () => void }) {
   const { notify, refresh } = useRuntime()
-  const [headersJson, setHeadersJson] = useState(YOUTUBE_HEADERS_SAMPLE)
+  const [cookie, setCookie] = useState('')
+  const [authuser, setAuthuser] = useState('')
+  const [cookieError, setCookieError] = useState<string | null>(null)
+  const [authuserError, setAuthuserError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
 
+  function validate() {
+    let ok = true
+    if (!cookie.trim()) {
+      setCookieError('Paste the cookie header value.')
+      ok = false
+    } else if (!/SAPISID/.test(cookie)) {
+      setCookieError(
+        'That cookie is missing SAPISID — copy the full cookie header value.',
+      )
+      ok = false
+    } else {
+      setCookieError(null)
+    }
+    if (authuser.trim() && !/^\d+$/.test(authuser.trim())) {
+      setAuthuserError('x-goog-authuser must be a number (for example 0).')
+      ok = false
+    } else {
+      setAuthuserError(null)
+    }
+    return ok
+  }
+
   async function connect() {
+    if (!validate()) {
+      return
+    }
     setSubmitting(true)
     try {
+      const headersJson = JSON.stringify({
+        cookie: cookie.trim(),
+        ...(authuser.trim() ? { 'x-goog-authuser': authuser.trim() } : {}),
+        origin: 'https://music.youtube.com',
+      })
       const payload = await apiRequest<ActionResponse>(
         '/providers/youtube-music/connect',
         {
@@ -42,18 +69,52 @@ export function YoutubeMusicConnectModal({ onClose }: { onClose: () => void }) {
     <ModalFrame title="Link YouTube Music" onClose={onClose}>
       <div className="modal-stack">
         <div className="confirm-copy">
-          <p>
-            Paste the signed-in browser headers JSON from YouTube Music.
-          </p>
+          <p>Grab the signed-in request headers from your browser:</p>
         </div>
+        <ol className="setup-steps">
+          <li>
+            Open <code>music.youtube.com</code> while logged in.
+          </li>
+          <li>Open your browser DevTools and switch to the Network tab.</li>
+          <li>
+            Click any request to <code>music.youtube.com</code>.
+          </li>
+          <li>
+            Copy the <code>cookie</code> request header value (plus{' '}
+            <code>x-goog-authuser</code> if present) and paste it below.
+          </li>
+        </ol>
         <label className="field">
-          <span>Headers JSON</span>
+          <span>Cookie header value</span>
           <textarea
-            onChange={(event) => setHeadersJson(event.target.value)}
-            placeholder={YOUTUBE_HEADERS_SAMPLE}
-            rows={10}
-            value={headersJson}
+            aria-describedby={cookieError ? 'ytm-cookie-error' : undefined}
+            aria-invalid={cookieError ? true : undefined}
+            onChange={(event) => setCookie(event.target.value)}
+            placeholder="VISITOR_INFO1_LIVE=…; SAPISID=…; __Secure-3PAPISID=…; SID=…"
+            rows={6}
+            value={cookie}
           />
+          {cookieError ? (
+            <span className="field-error" id="ytm-cookie-error" role="alert">
+              {cookieError}
+            </span>
+          ) : null}
+        </label>
+        <label className="field">
+          <span>x-goog-authuser (optional)</span>
+          <input
+            aria-describedby={authuserError ? 'ytm-authuser-error' : undefined}
+            aria-invalid={authuserError ? true : undefined}
+            inputMode="numeric"
+            onChange={(event) => setAuthuser(event.target.value)}
+            placeholder="0"
+            value={authuser}
+          />
+          {authuserError ? (
+            <span className="field-error" id="ytm-authuser-error" role="alert">
+              {authuserError}
+            </span>
+          ) : null}
         </label>
         <div className="modal-actions">
           <button className="btn btn--ghost" onClick={onClose} type="button">
@@ -61,7 +122,7 @@ export function YoutubeMusicConnectModal({ onClose }: { onClose: () => void }) {
           </button>
           <button
             className="btn btn--primary"
-            disabled={!headersJson.trim() || submitting}
+            disabled={submitting}
             onClick={() => void connect()}
             type="button"
           >

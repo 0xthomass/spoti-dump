@@ -19,6 +19,7 @@ import {
   providerCooldownCopy,
 } from '../lib/format'
 import { DashboardCard } from '../components/DashboardCard'
+import { DropdownMenu } from '../components/DropdownMenu'
 import { ErrorState } from '../components/ErrorState'
 import { HeroStat } from '../components/HeroStat'
 import { LoadingState } from '../components/LoadingState'
@@ -213,6 +214,30 @@ export function OverviewPage() {
     (sum, provider) => sum + provider.preflight.track_ids_missing,
     0,
   )
+  // Live first-run checklist. Each step derives its done-state from the current
+  // payloads (no persistence); the card only renders while nothing is connected.
+  const gettingStartedSteps = [
+    {
+      title: 'Connect a provider',
+      copy: 'Link Spotify or YouTube Music below so the app can read and write your library.',
+      done: connectedProviderCount > 0,
+    },
+    {
+      title: 'Pull your library',
+      copy: 'Import saved tracks and playlists into the canonical database.',
+      done: data.tracks > 0,
+    },
+    {
+      title: 'Resolve track IDs',
+      copy: 'Match tracks across services so a push can cover every song.',
+      done: data.tracks > 0 && providerIdentityGaps === 0,
+    },
+    {
+      title: 'Push to the other service',
+      copy: 'Mirror your canonical library out to the connected accounts.',
+      done: false,
+    },
+  ]
 
   return (
     <section className="page-stack">
@@ -224,6 +249,33 @@ export function OverviewPage() {
         <HeroStat label="Library updated" value={formatDateTime(data.library_updated_at)} />
         <HeroStat label="Tracks tracked" value={formatNumber(data.tracks)} />
       </PageHero>
+
+      {connectedProviderCount === 0 ? (
+        <section className="panel getting-started">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Getting started</span>
+              <h2>Set up your first sync</h2>
+            </div>
+          </div>
+          <ol className="checklist">
+            {gettingStartedSteps.map((step, index) => (
+              <li
+                className={`checklist__step${step.done ? ' checklist__step--done' : ''}`}
+                key={step.title}
+              >
+                <span aria-hidden="true" className="checklist__marker">
+                  {step.done ? '✓' : index + 1}
+                </span>
+                <div className="checklist__copy">
+                  <strong>{step.title}</strong>
+                  <span>{step.copy}</span>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
+      ) : null}
 
       <div className="metric-grid">
         <DashboardCard label="Saved Tracks" value={data.saved_tracks}>
@@ -393,14 +445,20 @@ export function OverviewPage() {
                     </span>
                   ) : null}
                   <span
+                    aria-label={
+                      provider.health_message
+                        ? `${healthCopy} — ${provider.health_message}`
+                        : undefined
+                    }
                     className={`mini-chip ${
                       provider.health_ok === false
                         ? 'mini-chip--warning'
                         : provider.health_ok
                           ? 'mini-chip--good'
                           : ''
-                    }`}
-                    title={provider.health_message ?? undefined}
+                    }${provider.health_message ? ' has-tip' : ''}`}
+                    data-tip={provider.health_message ?? undefined}
+                    tabIndex={provider.health_message ? 0 : undefined}
                   >
                     {healthCopy}
                   </span>
@@ -471,95 +529,119 @@ export function OverviewPage() {
                   ) : null}
                   {pushPlan ? <PushPlanSummary plan={pushPlan} /> : null}
                 </div>
-                <div className="provider-actions">
-                  <button
-                    className="btn btn--primary"
-                    disabled={pendingAction !== null}
-                    onClick={() => {
-                      if (provider.key === 'spotify') {
-                        setSpotifyModalOpen(true)
-                        return
-                      }
-                      setYoutubeModalOpen(true)
-                    }}
-                    type="button"
-                  >
-                    {provider.connected ? 'Relink' : 'Link'}
-                  </button>
-                  <button
-                    className="btn btn--secondary"
-                    disabled={!provider.connected || pendingAction !== null || cooldownActive}
-                    onClick={() => void runProviderAction(provider, 'verify')}
-                    type="button"
-                    title={provider.cooldown_reason ?? undefined}
-                  >
-                    {pendingAction === `${provider.key}:verify`
-                      ? 'Checking…'
-                      : 'Check Connection'}
-                  </button>
-                  <button
-                    className="btn btn--secondary"
-                    disabled={providerActionDisabled || !provider.preflight.can_pull}
-                    onClick={() => void runProviderAction(provider, 'export')}
-                    type="button"
-                    title={preflightTitle}
-                  >
-                    {pendingAction === `${provider.key}:export` ? 'Pulling…' : 'Pull Library'}
-                  </button>
-                  <button
-                    className="btn btn--secondary"
-                    disabled={providerActionDisabled || !provider.preflight.can_pull}
-                    onClick={() => void runProviderAction(provider, 'identity')}
-                    type="button"
-                    title={preflightTitle}
-                  >
-                    {pendingAction === `${provider.key}:identity`
-                      ? 'Resolving…'
-                      : 'Resolve IDs'}
-                  </button>
-                  <button
-                    className="btn btn--secondary"
-                    disabled={providerActionDisabled || !provider.preflight.can_push}
-                    onClick={() => void runProviderAction(provider, 'sync')}
-                    type="button"
-                    title={preflightTitle}
-                  >
-                    {pendingAction === `${provider.key}:sync` ? 'Pushing…' : 'Push Changes'}
-                  </button>
-                  <button
-                    className="btn btn--secondary"
-                    disabled={loadingPushPlan !== null}
-                    onClick={() => void loadPushPlan(provider)}
-                    type="button"
-                  >
-                    {loadingPushPlan === provider.key ? 'Planning…' : 'Push Plan'}
-                  </button>
-                  {provider.key === 'spotify' ? (
+                {provider.connected ? (
+                  <div className="provider-controls">
+                    <div className="provider-actions">
+                      <button
+                        className="btn btn--secondary"
+                        disabled={providerActionDisabled || !provider.preflight.can_pull}
+                        onClick={() => void runProviderAction(provider, 'export')}
+                        title={preflightTitle}
+                        type="button"
+                      >
+                        {pendingAction === `${provider.key}:export`
+                          ? 'Pulling…'
+                          : 'Pull library'}
+                      </button>
+                      <button
+                        className="btn btn--primary"
+                        disabled={providerActionDisabled || !provider.preflight.can_push}
+                        onClick={() => void runProviderAction(provider, 'sync')}
+                        title={preflightTitle}
+                        type="button"
+                      >
+                        {pendingAction === `${provider.key}:sync`
+                          ? 'Pushing…'
+                          : 'Push changes'}
+                      </button>
+                      <DropdownMenu
+                        label="More ⋯"
+                        items={[
+                          {
+                            label: 'Check connection',
+                            disabled: cooldownActive || pendingAction !== null,
+                            onSelect: () => void runProviderAction(provider, 'verify'),
+                          },
+                          {
+                            label: 'Resolve track IDs',
+                            disabled:
+                              providerActionDisabled || !provider.preflight.can_pull,
+                            onSelect: () => void runProviderAction(provider, 'identity'),
+                          },
+                          {
+                            label: 'Preview push plan',
+                            disabled: loadingPushPlan !== null,
+                            onSelect: () => void loadPushPlan(provider),
+                          },
+                          {
+                            label: `Relink ${provider.name}`,
+                            disabled: pendingAction !== null,
+                            onSelect: () => {
+                              if (provider.key === 'spotify') {
+                                setSpotifyModalOpen(true)
+                                return
+                              }
+                              setYoutubeModalOpen(true)
+                            },
+                          },
+                        ]}
+                      />
+                    </div>
+                    {preflightTitle ? (
+                      <p className="provider-action-hint">{preflightTitle}</p>
+                    ) : null}
+                    <div className="provider-danger">
+                      <span className="provider-danger__caption">Danger zone</span>
+                      <div className="provider-danger__actions">
+                        {provider.key === 'spotify' ? (
+                          <button
+                            className="btn btn--danger btn--sm"
+                            disabled={
+                              providerActionDisabled || !provider.preflight.can_reset_push
+                            }
+                            onClick={() => void runProviderAction(provider, 'reset-sync')}
+                            title={resetPreflightTitle}
+                            type="button"
+                          >
+                            {pendingAction === `${provider.key}:reset-sync`
+                              ? 'Resetting…'
+                              : 'Reset & push'}
+                          </button>
+                        ) : null}
+                        <button
+                          className="btn btn--ghost btn--sm"
+                          disabled={pendingAction !== null}
+                          onClick={() => void runProviderAction(provider, 'disconnect')}
+                          type="button"
+                        >
+                          {pendingAction === `${provider.key}:disconnect`
+                            ? 'Disconnecting…'
+                            : 'Disconnect'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="provider-connect-cta">
+                    <p>
+                      Not linked yet. Connect {provider.name} to pull and push your library.
+                    </p>
                     <button
-                      className="btn btn--danger"
-                      disabled={providerActionDisabled || !provider.preflight.can_reset_push}
-                      onClick={() => void runProviderAction(provider, 'reset-sync')}
-                      type="button"
-                      title={resetPreflightTitle}
-                    >
-                      {pendingAction === `${provider.key}:reset-sync`
-                        ? 'Resetting…'
-                        : 'Reset & Push'}
-                    </button>
-                  ) : null}
-                  {provider.connected ? (
-                    <button
-                      className="btn btn--ghost"
+                      className="btn btn--primary"
                       disabled={pendingAction !== null}
-                      onClick={() => void runProviderAction(provider, 'disconnect')}
+                      onClick={() => {
+                        if (provider.key === 'spotify') {
+                          setSpotifyModalOpen(true)
+                          return
+                        }
+                        setYoutubeModalOpen(true)
+                      }}
                       type="button"
                     >
-                      {pendingAction === `${provider.key}:disconnect`
-                        ? 'Disconnecting…'
-                        : 'Disconnect'}
+                      Link {provider.name}
                     </button>
-                  ) : null}
-                </div>
+                  </div>
+                )}
                 <div className="provider-metric-grid">
                   <StatTile label="Tracks" value={metrics?.linked_tracks ?? 0} />
                   <StatTile label="Missing IDs" value={metrics?.missing_track_ids ?? 0} />

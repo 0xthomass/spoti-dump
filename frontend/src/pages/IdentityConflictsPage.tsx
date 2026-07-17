@@ -261,57 +261,87 @@ export function IdentityConflictsPage() {
             />
             <button className="btn btn--primary" type="submit">Search</button>
           </form>
-          <div className="filter-row">
-            {[
-              ['', 'All providers'],
-              ['spotify', 'Spotify candidate'],
-              ['youtube-music', 'YouTube candidate'],
-            ].map(([value, label]) => (
-              <button
-                className={`filter-pill${provider === value ? ' filter-pill--active' : ''}`}
-                key={value || 'all-providers'}
-                onClick={() => changeConflictFilter('provider', value)}
-                type="button"
-              >
-                {label}
-              </button>
-            ))}
+          <div className="filter-group">
+            <span className="filter-caption" id="conflict-filter-provider">
+              Provider
+            </span>
+            <div
+              aria-labelledby="conflict-filter-provider"
+              className="filter-row"
+              role="group"
+            >
+              {[
+                ['', 'All providers'],
+                ['spotify', 'Spotify candidate'],
+                ['youtube-music', 'YouTube candidate'],
+              ].map(([value, label]) => (
+                <button
+                  aria-pressed={provider === value}
+                  className={`filter-pill${provider === value ? ' filter-pill--active' : ''}`}
+                  key={value || 'all-providers'}
+                  onClick={() => changeConflictFilter('provider', value)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="filter-row">
-            {[
-              ['', 'All recommendations'],
-              ['likely_same_recording', 'Likely same'],
-              ['needs_manual_review', 'Manual review'],
-              ['likely_different_recording', 'Likely different'],
-            ].map(([value, label]) => (
-              <button
-                className={`filter-pill${
-                  recommendation === value ? ' filter-pill--active' : ''
-                }`}
-                key={value || 'all-recommendations'}
-                onClick={() => changeConflictFilter('recommendation', value)}
-                type="button"
-              >
-                {label}
-              </button>
-            ))}
+          <div className="filter-group">
+            <span className="filter-caption" id="conflict-filter-recommendation">
+              Recommendation
+            </span>
+            <div
+              aria-labelledby="conflict-filter-recommendation"
+              className="filter-row"
+              role="group"
+            >
+              {[
+                ['', 'All recommendations'],
+                ['likely_same_recording', 'Likely same'],
+                ['needs_manual_review', 'Manual review'],
+                ['likely_different_recording', 'Likely different'],
+              ].map(([value, label]) => (
+                <button
+                  aria-pressed={recommendation === value}
+                  className={`filter-pill${
+                    recommendation === value ? ' filter-pill--active' : ''
+                  }`}
+                  key={value || 'all-recommendations'}
+                  onClick={() => changeConflictFilter('recommendation', value)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="filter-row">
-            {[
-              ['', 'All impact'],
-              ['library_impact', 'Affects saved/playlists'],
-              ['source_impact', 'Source row impact'],
-              ['candidate_impact', 'Candidate row impact'],
-            ].map(([value, label]) => (
-              <button
-                className={`filter-pill${impact === value ? ' filter-pill--active' : ''}`}
-                key={value || 'all-impact'}
-                onClick={() => changeConflictFilter('impact', value)}
-                type="button"
-              >
-                {label}
-              </button>
-            ))}
+          <div className="filter-group">
+            <span className="filter-caption" id="conflict-filter-impact">
+              Impact
+            </span>
+            <div
+              aria-labelledby="conflict-filter-impact"
+              className="filter-row"
+              role="group"
+            >
+              {[
+                ['', 'All impact'],
+                ['library_impact', 'Affects saved/playlists'],
+                ['source_impact', 'Source row impact'],
+                ['candidate_impact', 'Candidate row impact'],
+              ].map(([value, label]) => (
+                <button
+                  aria-pressed={impact === value}
+                  className={`filter-pill${impact === value ? ' filter-pill--active' : ''}`}
+                  key={value || 'all-impact'}
+                  onClick={() => changeConflictFilter('impact', value)}
+                  type="button"
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
           {canBulkMergeRecommendation ? (
             <BulkMergeConflictPanel
@@ -351,6 +381,23 @@ export function IdentityConflictsPage() {
             <div className="conflict-list">
               {resource.data.items.map((item) => {
                 const mergeKey = `${item.source_track.track_id}:${item.conflict.provider}:${item.conflict.provider_id}`
+                const evidence = item.conflict.evidence
+                // Recommended direction = keep the IDs of the row carrying more
+                // library weight (saved tracks + playlist refs); ties favour the
+                // candidate owner. We only surface it as "Recommended" when the
+                // evidence classifies the pair as the same recording.
+                const sourceWeight =
+                  evidence.source_saved_tracks + evidence.source_playlist_entries
+                const candidateWeight =
+                  evidence.candidate_saved_tracks + evidence.candidate_playlist_entries
+                const recommendedResolution: 'keep_source' | 'keep_target' =
+                  sourceWeight > candidateWeight ? 'keep_source' : 'keep_target'
+                const promoteMerge =
+                  evidence.recommendation.key === 'likely_same_recording'
+                const conflictProviderNames =
+                  item.conflict.conflicting_provider_links
+                    .map((link) => link.provider_name)
+                    .join(', ') || item.conflict.provider_name
                 return (
                   <article className="conflict-card" key={mergeKey}>
                     <div className="conflict-card-head">
@@ -390,37 +437,78 @@ export function IdentityConflictsPage() {
                       ))}
                     </div>
 
-                    <div className="modal-actions modal-actions--inline">
-                      <button
-                        className="btn btn--secondary"
-                        disabled={mergingConflict !== null || rejectingConflict !== null}
-                        onClick={() => void mergeConflict(item, 'keep_source')}
-                        type="button"
-                      >
-                        {mergingConflict === `${mergeKey}:keep_source`
-                          ? 'Merging…'
-                          : 'Merge, keep source IDs'}
-                      </button>
-                      <button
-                        className="btn btn--secondary"
-                        disabled={mergingConflict !== null || rejectingConflict !== null}
-                        onClick={() => void mergeConflict(item, 'keep_target')}
-                        type="button"
-                      >
-                        {mergingConflict === `${mergeKey}:keep_target`
-                          ? 'Merging…'
-                          : 'Merge, keep candidate IDs'}
-                      </button>
-                      <button
-                        className="btn btn--ghost"
-                        disabled={mergingConflict !== null || rejectingConflict !== null}
-                        onClick={() => void rejectConflict(item)}
-                        type="button"
-                      >
-                        {rejectingConflict === `${mergeKey}:reject`
-                          ? 'Marking…'
-                          : 'Mark not same track'}
-                      </button>
+                    <div className="merge-decision">
+                      <div className="merge-option">
+                        <div className="merge-option-head">
+                          <button
+                            className={`btn ${
+                              promoteMerge && recommendedResolution === 'keep_source'
+                                ? 'btn--primary'
+                                : 'btn--secondary'
+                            }`}
+                            disabled={
+                              mergingConflict !== null || rejectingConflict !== null
+                            }
+                            onClick={() => void mergeConflict(item, 'keep_source')}
+                            type="button"
+                          >
+                            {mergingConflict === `${mergeKey}:keep_source`
+                              ? 'Merging…'
+                              : "Keep this track's IDs"}
+                          </button>
+                          {promoteMerge && recommendedResolution === 'keep_source' ? (
+                            <span className="status-chip status-chip--good merge-recommend">
+                              Recommended
+                            </span>
+                          ) : null}
+                        </div>
+                        <span className="merge-option-hint">
+                          {conflictProviderNames} ID from this track wins on conflicts.
+                        </span>
+                      </div>
+                      <div className="merge-option">
+                        <div className="merge-option-head">
+                          <button
+                            className={`btn ${
+                              promoteMerge && recommendedResolution === 'keep_target'
+                                ? 'btn--primary'
+                                : 'btn--secondary'
+                            }`}
+                            disabled={
+                              mergingConflict !== null || rejectingConflict !== null
+                            }
+                            onClick={() => void mergeConflict(item, 'keep_target')}
+                            type="button"
+                          >
+                            {mergingConflict === `${mergeKey}:keep_target`
+                              ? 'Merging…'
+                              : "Use candidate's IDs"}
+                          </button>
+                          {promoteMerge && recommendedResolution === 'keep_target' ? (
+                            <span className="status-chip status-chip--good merge-recommend">
+                              Recommended
+                            </span>
+                          ) : null}
+                        </div>
+                        <span className="merge-option-hint">
+                          {conflictProviderNames} ID from the candidate wins on conflicts.
+                        </span>
+                      </div>
+                      <div className="merge-option merge-option--reject">
+                        <button
+                          className="btn btn--ghost"
+                          disabled={mergingConflict !== null || rejectingConflict !== null}
+                          onClick={() => void rejectConflict(item)}
+                          type="button"
+                        >
+                          {rejectingConflict === `${mergeKey}:reject`
+                            ? 'Marking…'
+                            : 'Mark not same track'}
+                        </button>
+                        <span className="merge-option-hint">
+                          Keep both rows separate; no provider IDs change.
+                        </span>
+                      </div>
                     </div>
                   </article>
                 )

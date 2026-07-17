@@ -6,15 +6,20 @@ export function ProviderChipRow({ providers }: { providers: ProviderBadge[] }) {
   }
   return (
     <div className="chip-row">
-      {providers.map((provider) => (
-        <span
-          className="status-chip status-chip--provider"
-          key={`${provider.key}-${provider.provider_id}`}
-          title={`${provider.label} · ${provider.source} · ${provider.provider_id}`}
-        >
-          {provider.label}
-        </span>
-      ))}
+      {providers.map((provider) => {
+        const tip = `${provider.label} · ${provider.source} · ${provider.provider_id}`
+        return (
+          <span
+            aria-label={tip}
+            className="status-chip status-chip--provider has-tip"
+            data-tip={tip}
+            key={`${provider.key}-${provider.provider_id}`}
+            tabIndex={0}
+          >
+            {provider.label}
+          </span>
+        )
+      })}
     </div>
   )
 }
